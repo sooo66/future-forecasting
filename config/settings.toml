@@ -38,7 +38,7 @@ proxy_sources = [
 use_proxy = true
 
 # 是否使用浏览器模式（需要 JS 渲染的页面）
-use_browser = false
+use_browser = true
 
 # 浏览器配置
 [browser]
@@ -55,9 +55,9 @@ log_dir = "logs"
 # 是否启用 LLM 提取（基于 Crawl4AI 的 LLMExtractionStrategy）
 use_llm_extraction = true
 # 模式: "always" 全量使用 LLM；"fallback" 仅在正文为空/过短时使用
-mode = "always"
+mode = "fallback"
 # LiteLLM provider 标识（包含模型），如 openai/gpt-4o-mini 或 ollama/llama3
-provider = "openai/gpt-4o-mini"
+provider = "ollama/olmo-3:7b-instruct"
 # 存放 API Key 的环境变量名
 api_key_env = "OPENAI_API_KEY"
 # LLM 提取指令
@@ -70,7 +70,7 @@ apply_chunking = true
 input_format = "fit_markdown"
 # 采样与输出长度
 temperature = 0.0
-max_output_tokens = 1200
+max_output_tokens = 2048
 
 [whitelist]
 # 媒体域名白名单（格式：域名 -> 媒体名称）
