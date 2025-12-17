@@ -365,7 +365,7 @@ class NewsCrawler:
             if self.use_browser:
                 browser_config = BrowserConfig(
                     headless=self.config.browser_headless,
-                    timeout=self.config.browser_timeout * 1000  # 转换为毫秒
+                    user_agent_mode="random"
                 )
             
             # 配置内容过滤器 - 使用 PruningContentFilter 移除导航、侧边栏等
@@ -534,6 +534,7 @@ class NewsCrawler:
                             if not content or word_count < self.extractor.min_word_threshold:
                                 last_error = f"content_too_short ({word_count} words)"
                                 logger.info(f"内容过短，标记为失败: {url} ({word_count} words)")
+                                logger.info(f"content: {content}")
                                 self.url_pool_builder.update_status(url_id, "failed", last_error)
                                 self.stats["failed"] += 1
                                 return None

@@ -55,7 +55,7 @@ log_dir = "logs"
 # 是否启用 LLM 提取（基于 Crawl4AI 的 LLMExtractionStrategy）
 use_llm_extraction = true
 # 模式: "always" 全量使用 LLM；"fallback" 仅在正文为空/过短时使用
-mode = "fallback"
+mode = "always"
 # LiteLLM provider 标识（包含模型），如 openai/gpt-4o-mini 或 ollama/llama3
 provider = "ollama/olmo-3:7b-instruct"
 # 存放 API Key 的环境变量名
