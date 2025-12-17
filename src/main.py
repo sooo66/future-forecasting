@@ -70,6 +70,7 @@ def crawl(args):
     
     # 运行异步爬取
     records = asyncio.run(crawler.crawl(limit=limit))
+    records = records or []  # 保底避免 None
     
     logger.info(f"爬取完成，共获得 {len(records)} 条记录")
     return records
@@ -201,4 +202,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

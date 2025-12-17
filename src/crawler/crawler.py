@@ -615,7 +615,7 @@ class NewsCrawler:
         
         if not urls:
             logger.warning("没有待爬取的 URL")
-            return
+            return []
         
         # 测试模式限制（仅在明确启用且没有指定limit时）
         # 注意：如果 limit 已指定，则使用 limit，不再应用 test_url_limit
