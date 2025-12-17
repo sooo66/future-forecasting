@@ -29,11 +29,11 @@ from .extractor import ContentExtractor
 
 
 class ArticleLLMOutput(BaseModel):
-    """用于 LLMExtractionStrategy 的结构化输出定义"""
+    """用于 LLMExtractionStrategy 的结构化输出定义（只强制 content）"""
     
-    title: str = Field(..., description="Headline of the article")
-    summary: str = Field(..., description="Concise 1-3 sentence summary")
-    content: str = Field(..., description="Full clean article body text without navigation or ads")
+    title: Optional[str] = Field(None, description="Headline of the article (optional, keep original wording if present)")
+    summary: Optional[str] = Field(None, description="Leave empty/null; no summarization needed")
+    content: str = Field(..., description="Full article body text, verbatim, no paraphrasing or summarization")
     published_at: Optional[str] = Field(None, description="ISO8601 publish datetime if available, else null")
     language: Optional[str] = Field(None, description="Primary language code, e.g., en")
     tags: Optional[List[str]] = Field(None, description="Optional topical tags/keywords")
@@ -561,18 +561,14 @@ class NewsCrawler:
                                 llm_payload = await self._run_llm_extraction(url, base_run_config_kwargs, browser_config)
                             
                             if llm_payload:
-                                extracted["content"] = llm_payload.get("content") or extracted["content"]
-                                extracted["title"] = llm_payload.get("title") or extracted["title"]
-                                extracted["summary"] = llm_payload.get("summary") or extracted["summary"]
-                                extracted["published_at"] = llm_payload.get("published_at") or extracted["published_at"]
-                                extracted["language"] = llm_payload.get("language") or extracted["language"]
-                                tags = llm_payload.get("tags")
-                                if isinstance(tags, str):
-                                    tags = [t.strip() for t in tags.split(",") if t.strip()]
-                                if isinstance(tags, list):
-                                    extracted["tags"] = tags
-                                content = extracted["content"]
-                                word_count = len(re.findall(r"[A-Za-z]+", content or ""))
+                                # 仅使用 LLM 提供的正文，避免任何摘要/改写被写入其它字段
+                                content_from_llm = llm_payload.get("content") or ""
+                                if isinstance(content_from_llm, list):
+                                    content_from_llm = " ".join([str(x) for x in content_from_llm])
+                                if content_from_llm:
+                                    extracted["content"] = content_from_llm
+                                    content = extracted["content"]
+                                    word_count = len(re.findall(r"[A-Za-z]+", content or ""))
                             
                             if not content or word_count < self.extractor.min_word_threshold:
                                 last_error = f"content_too_short ({word_count} words)"

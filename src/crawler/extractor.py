@@ -6,12 +6,6 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from loguru import logger
 
-try:
-    import trafilatura
-except ImportError:
-    trafilatura = None
-
-
 class ContentExtractor:
     """从 HTML 中提取新闻内容的提取器"""
     
@@ -101,8 +95,7 @@ class ContentExtractor:
     def extract_content(self, html: str, markdown: Optional[str] = None, domain: Optional[str] = None, url: Optional[str] = None) -> str:
         """提取正文内容
         
-        优先利用 Crawl4AI 生成的 markdown，并结合 trafilatura/readability 作为兜底。
-        多个候选内容会按照质量打分后择优返回，避免导航/广告噪声或内容缺失。
+        优先利用 Crawl4AI 生成的 markdown；多个候选内容会按质量打分后择优返回，避免导航/广告噪声或内容缺失。
         """
         candidates: List[Tuple[str, str]] = []
         
@@ -119,35 +112,11 @@ class ContentExtractor:
         if html_content:
             candidates.append(("html", html_content))
         
-        trafilatura_content = self._extract_with_trafilatura(html)
-        if trafilatura_content:
-            candidates.append(("trafilatura", trafilatura_content))
-        
         best_content, chosen_source = self._select_best_content(candidates)
         if chosen_source:
             logger.debug(f"内容提取使用 {chosen_source} 源，字数 {len(best_content.split())}")
         
         return best_content
-
-    def _extract_with_trafilatura(self, html: str) -> str:
-        """使用 trafilatura 提取正文，作为 Crawl4AI markdown 的兜底"""
-        if not trafilatura or not html:
-            return ""
-        
-        try:
-            # favor_precision 能够减少广告和导航，include_links=False 去掉链接噪声
-            text = trafilatura.extract(
-                html,
-                favor_precision=True,
-                include_comments=False,
-                include_images=False,
-                include_links=False,
-                output_format="txt",
-            )
-            return text.strip() if text else ""
-        except Exception as e:
-            logger.debug(f"trafilatura 提取失败: {e}")
-            return ""
 
     def _score_content(self, text: str) -> float:
         """为候选正文打分，兼顾长度、重复度和导航噪声占比"""
@@ -592,38 +561,54 @@ class ContentExtractor:
         return 'en'
     
     def extract_tags(self, themes: Optional[str], url: str) -> Optional[list]:
-        """提取标签
+        """提取粗粒度分类标签（限定类别，避免生成细碎标签）"""
+        categories = {
+            "politics": [
+                "politics", "election", "government", "policy", "geopolitics", "diplomacy"
+            ],
+            "business_finance": [
+                "economy", "economic", "econ", "finance", "business", "market", "markets",
+                "banking", "investment", "stock", "trade"
+            ],
+            "technology": [
+                "technology", "tech", "ai", "cyber", "software", "hardware", "internet", "it"
+            ],
+            "science": [
+                "science", "research", "space", "nasa", "astronomy", "physics", "climate"
+            ],
+            "health": [
+                "health", "medical", "medicine", "covid", "virus", "disease", "vaccine"
+            ],
+            "sports": [
+                "sports", "sport", "football", "soccer", "nba", "nfl", "mlb", "olympic"
+            ],
+            "entertainment": [
+                "entertainment", "culture", "movie", "film", "music", "tv", "showbiz", "celebrity"
+            ],
+            "world": [
+                "world", "international", "global", "foreign"
+            ],
+        }
         
-        优先级：
-        1. GKG 的 Themes 字段
-        2. 从 URL 路径提取关键词（如果网站有固定模板）
-        3. 返回 None
-        """
-        tags = []
+        selected = set()
         
-        # 从 GKG Themes 中提取
+        def match_keyword_list(text: str):
+            text_lower = text.lower()
+            for cat, keywords in categories.items():
+                for kw in keywords:
+                    if kw in text_lower:
+                        selected.add(cat)
+        
+        # 1) 从 GKG themes 里匹配关键词
         if themes:
             theme_list = [t.strip() for t in themes.split(';') if t.strip()]
-            # 过滤掉太长的主题（可能是噪声）
-            theme_list = [t for t in theme_list if len(t) < 50]
-            tags.extend(theme_list[:10])  # 最多取前 10 个
+            for t in theme_list:
+                match_keyword_list(t)
         
-        # 从 URL 路径提取关键词（某些网站有固定模板）
-        # 例如：/politics/, /sports/, /business/ 等
-        url_lower = url.lower()
-        common_categories = [
-            'politics', 'sports', 'business', 'technology', 'science',
-            'health', 'entertainment', 'world', 'national', 'local',
-            'opinion', 'editorial', 'news'
-        ]
+        # 2) URL 路径匹配
+        match_keyword_list(url)
         
-        for category in common_categories:
-            if f'/{category}/' in url_lower or url_lower.endswith(f'/{category}'):
-                if category not in tags:
-                    tags.append(category)
-                break
-        
-        return tags if tags else None
+        return list(selected) if selected else None
     
     def extract(self, html: str, markdown: Optional[str], url: str, 
                 source_name: str, gkg_date: Optional[str] = None,

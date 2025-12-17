@@ -99,19 +99,21 @@ def test_extract_content_prefers_main_body_over_nav():
 
 
 def test_extract_tags():
-    """测试标签提取"""
+    """测试分类标签提取"""
     extractor = ContentExtractor()
     
-    # 测试从 themes 提取
+    # themes 分类
     tags1 = extractor.extract_tags("ECON;POLITICS;SPORTS", "https://www.example.com/article")
     assert tags1 is not None
-    assert "ECON" in tags1 or "POLITICS" in tags1
+    assert "business_finance" in tags1
+    assert "politics" in tags1
+    assert "sports" in tags1
     
-    # 测试从 URL 提取
-    tags2 = extractor.extract_tags(None, "https://www.example.com/politics/article")
+    # URL 分类
+    tags2 = extractor.extract_tags(None, "https://www.example.com/technology/article")
     assert tags2 is not None
-    assert "politics" in tags2
+    assert "technology" in tags2
     
-    # 测试无标签
+    # 无匹配
     tags3 = extractor.extract_tags(None, "https://www.example.com/article")
     assert tags3 is None or len(tags3) == 0

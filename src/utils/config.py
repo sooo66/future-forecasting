@@ -157,7 +157,13 @@ class Config:
     def llm_instruction(self) -> str:
         return self.get(
             "llm.instruction",
-            "Extract the news article body as clean plain text, a concise summary, ISO 8601 publish time if present, primary language code, and relevant tags. Return a single JSON object with keys: title, summary, content, published_at, language, tags (array of strings).",
+            (
+                "Return a single JSON object with fields: title (optional), summary (null), content (required), "
+                "published_at (optional), language (optional), tags (optional array). "
+                "Copy the main article body VERBATIM into content — no summarization, paraphrasing, translation, "
+                "or rewriting. Preserve original wording and order; omit navigation/ads. "
+                "If any field is unavailable, set it to null; do not fabricate."
+            ),
         )
 
     @property

@@ -11,7 +11,6 @@ aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 pyarrow>=14.0.0  # Parquet 支持
-trafilatura>=1.6.0  # HTML 主体抽取兜底方案
 pydantic>=2.8.2  # LLM 提取 schema 支持
 
 # URL 处理

@@ -76,13 +76,7 @@ exclude_selectors = [
 - 确保即使 content 为空也保存记录
 - 修复了 markdown 对象处理逻辑（支持 Crawl4AI 的 markdown 对象）
 
-### 7. 主体提取质量评分 + trafilatura 兜底
-
-- Crawl4AI markdown/HTML/trafilatura 三路候选，按长度、重复度、导航噪声打分择优
-- 通过 trafilatura 提供的正文抽取减少导航/广告残留，并在 markdown 为空时兜底
-- 低于阈值的正文会标记为失败，避免写入空或过短的内容
-
-### 8. 可选的 LLM 提取（Crawl4AI LLMExtractionStrategy）
+### 7. 可选的 LLM 提取（Crawl4AI LLMExtractionStrategy）
 
 - 配置项 `[llm]` 支持 always/fallback 两种模式；默认关闭，fallback 模式仅在正文过短时触发
 - 使用 `LLMExtractionStrategy` + Pydantic schema 让模型输出标准化 JSON（title/summary/content/published_at/language/tags）
