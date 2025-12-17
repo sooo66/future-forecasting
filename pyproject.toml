@@ -26,6 +26,7 @@ dependencies = [
     "tomli-w>=1.0.0",
     "tqdm>=4.66.0",
     "urllib3>=2.0.0",
+    "httpx[socks]>=0.28.1",
 ]
 
 [[tool.uv.index]]
