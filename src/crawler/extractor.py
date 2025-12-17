@@ -1,19 +1,23 @@
 """内容提取模块"""
 import re
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, List
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from utils.models import Record
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
 
 
 class ContentExtractor:
     """从 HTML 中提取新闻内容的提取器"""
     
-    def __init__(self):
-        pass
+    def __init__(self, min_word_threshold: int = 80):
+        # min_word_threshold 用于评估内容质量，低于该值会尝试其他提取策略
+        self.min_word_threshold = min_word_threshold
     
     def extract_title(self, html: str, url: str) -> str:
         """提取标题
@@ -97,21 +101,120 @@ class ContentExtractor:
     def extract_content(self, html: str, markdown: Optional[str] = None, domain: Optional[str] = None, url: Optional[str] = None) -> str:
         """提取正文内容
         
-        如果提供了 markdown，优先使用 markdown（Crawl4AI 可能已经提取了正文）
-        否则从 HTML 中提取
-        
-        会清理掉导航链接、标签、URL 等不相关内容
+        优先利用 Crawl4AI 生成的 markdown，并结合 trafilatura/readability 作为兜底。
+        多个候选内容会按照质量打分后择优返回，避免导航/广告噪声或内容缺失。
         """
-        if markdown:
-            # 如果没有传入domain，尝试从url中提取
-            if not domain and url:
-                domain = self._extract_domain_from_url(url)
-            content = self._clean_markdown_content(markdown, domain)
-            return content
+        candidates: List[Tuple[str, str]] = []
         
-        # 从 HTML 中提取
-        content = self._extract_from_html(html)
-        return content
+        # 如果没有传入 domain，尝试从 URL 中提取
+        if not domain and url:
+            domain = self._extract_domain_from_url(url)
+        
+        if markdown:
+            cleaned_markdown = self._clean_markdown_content(markdown, domain)
+            if cleaned_markdown:
+                candidates.append(("markdown", cleaned_markdown))
+        
+        html_content = self._extract_from_html(html)
+        if html_content:
+            candidates.append(("html", html_content))
+        
+        trafilatura_content = self._extract_with_trafilatura(html)
+        if trafilatura_content:
+            candidates.append(("trafilatura", trafilatura_content))
+        
+        best_content, chosen_source = self._select_best_content(candidates)
+        if chosen_source:
+            logger.debug(f"内容提取使用 {chosen_source} 源，字数 {len(best_content.split())}")
+        
+        return best_content
+
+    def _extract_with_trafilatura(self, html: str) -> str:
+        """使用 trafilatura 提取正文，作为 Crawl4AI markdown 的兜底"""
+        if not trafilatura or not html:
+            return ""
+        
+        try:
+            # favor_precision 能够减少广告和导航，include_links=False 去掉链接噪声
+            text = trafilatura.extract(
+                html,
+                favor_precision=True,
+                include_comments=False,
+                include_images=False,
+                include_links=False,
+                output_format="txt",
+            )
+            return text.strip() if text else ""
+        except Exception as e:
+            logger.debug(f"trafilatura 提取失败: {e}")
+            return ""
+
+    def _score_content(self, text: str) -> float:
+        """为候选正文打分，兼顾长度、重复度和导航噪声占比"""
+        if not text:
+            return 0.0
+        
+        cleaned = text.strip()
+        words = re.findall(r"[A-Za-z]+", cleaned)
+        word_count = len(words)
+        if word_count == 0:
+            return 0.0
+        
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        nav_keywords = [
+            "subscribe", "menu", "login", "sign up", "sign in", "newsletter",
+            "advertisement", "cookie", "privacy", "terms", "related stories",
+            "most read", "trending", "sponsor", "promo", "share",
+        ]
+        text_lower = cleaned.lower()
+        nav_hits = sum(text_lower.count(k) for k in nav_keywords)
+        nav_penalty = nav_hits / max(len(lines), 1)
+        
+        unique_lines = len(set(lines))
+        unique_ratio = unique_lines / max(len(lines), 1)
+        avg_line_length = sum(len(line) for line in lines) / max(len(lines), 1)
+        long_line_bonus = min(avg_line_length / 80, 1.0)
+        
+        # 评分偏向：字数越多越好，行重复率越低越好，导航占比越低越好
+        base_score = word_count * (0.6 + 0.4 * long_line_bonus)
+        diversity_bonus = base_score * (0.3 * unique_ratio)
+        penalty = nav_penalty * 50
+        
+        score = base_score + diversity_bonus - penalty
+        if word_count < self.min_word_threshold:
+            score *= 0.6  # 字数过少的内容降权
+        
+        return max(score, 0.0)
+
+    def _select_best_content(self, candidates: List[Tuple[str, str]]) -> Tuple[str, str]:
+        """从多个候选内容中选择质量最高的"""
+        best_content = ""
+        best_source = ""
+        best_score = 0.0
+        
+        for source, content in candidates:
+            deduped = self._deduplicate_lines(content)
+            score = self._score_content(deduped)
+            if score > best_score:
+                best_score = score
+                best_content = deduped
+                best_source = source
+        
+        return best_content, best_source
+
+    def _deduplicate_lines(self, text: str) -> str:
+        """合并重复行，移除明显的噪声行"""
+        seen = set()
+        cleaned_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+            cleaned_lines.append(stripped)
+        return "\n".join(cleaned_lines)
     
     def _clean_markdown_for_domain(self, markdown: str, domain: str) -> str:
         """针对特定域名的清理规则"""
@@ -323,6 +426,7 @@ class ContentExtractor:
         # 移除行首和行尾的多余空格
         lines = content.split('\n')
         content = '\n'.join(line.strip() for line in lines if line.strip())
+        content = self._deduplicate_lines(content)
         
         return content.strip()
     
@@ -332,13 +436,18 @@ class ContentExtractor:
         
         # 移除脚本、样式、导航等
         for element in soup(["script", "style", "nav", "header", "footer", "aside", 
-                            "noscript", "iframe", "form", "button"]):
+                            "noscript", "iframe", "form", "button", "svg"]):
             element.decompose()
         
         # 移除常见的导航和侧边栏类
-        for element in soup.select('.nav, .navigation, .navbar, .menu, .sidebar, '
-                                  '.aside, .header, .footer, .breadcrumb, .tags, '
-                                  '.related, .comments, .social, .share, .subscribe'):
+        removal_selectors = [
+            '.nav', '.navigation', '.navbar', '.menu', '.sidebar', '.aside', '.header', '.footer',
+            '.breadcrumb', '.tags', '.related', '.comments', '.social', '.share', '.subscribe',
+            '.advertisement', '.ad', '.ads', '.promo', '.sponsor', '.newsletter', '.signup',
+            '.cookie', '.consent', '.gdpr', '.modal', '.overlay', '[role="navigation"]',
+            '[aria-label*="breadcrumb"]', '[aria-label*="navigation"]'
+        ]
+        for element in soup.select(', '.join(removal_selectors)):
             element.decompose()
         
         # 尝试找到文章主体
@@ -398,7 +507,7 @@ class ContentExtractor:
             text = '\n'.join(cleaned_lines)
             # 清理多余的空白
             text = re.sub(r'\n{3,}', '\n\n', text)
-            return text.strip()
+            return self._deduplicate_lines(text.strip())
         
         return ""
     
@@ -552,4 +661,3 @@ class ContentExtractor:
             return parsed.netloc.lower()
         except:
             return None
-

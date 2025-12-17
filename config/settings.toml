@@ -51,6 +51,27 @@ processed_data_dir = "data/processed/records"
 url_pool_db = "data/url_pool/url_pool.db"
 log_dir = "logs"
 
+[llm]
+# 是否启用 LLM 提取（基于 Crawl4AI 的 LLMExtractionStrategy）
+use_llm_extraction = true
+# 模式: "always" 全量使用 LLM；"fallback" 仅在正文为空/过短时使用
+mode = "always"
+# LiteLLM provider 标识（包含模型），如 openai/gpt-4o-mini 或 ollama/llama3
+provider = "openai/gpt-4o-mini"
+# 存放 API Key 的环境变量名
+api_key_env = "OPENAI_API_KEY"
+# LLM 提取指令
+instruction = "Extract the news article body as clean plain text, a concise summary, ISO 8601 publish time if present, primary language code, and relevant tags. Return a single JSON object with keys: title, summary, content, published_at, language, tags (array of strings)."
+# 长文分块相关参数
+chunk_token_threshold = 1200
+overlap_rate = 0.1
+apply_chunking = true
+# 输入格式: markdown / fit_markdown / html
+input_format = "fit_markdown"
+# 采样与输出长度
+temperature = 0.0
+max_output_tokens = 1200
+
 [whitelist]
 # 媒体域名白名单（格式：域名 -> 媒体名称）
 media_domains = [
@@ -98,4 +119,3 @@ media_domains = [
     { name = "The Washington Times", domain = "washingtontimes.com" },
     { name = "ZeroHedge", domain = "zerohedge.com" }
 ]
-

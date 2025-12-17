@@ -77,6 +77,26 @@ def test_extract_language(sample_html):
     
     assert language == "en"
 
+def test_extract_content_prefers_main_body_over_nav():
+    """markdown 只有导航时应回退到 HTML 主体"""
+    extractor = ContentExtractor()
+    noisy_markdown = "[Home](/home) [Subscribe](/subscribe)"
+    html = """
+    <html>
+        <body>
+            <nav>Home Subscribe</nav>
+            <article>
+                <p>Main body text is here with enough words to be selected as meaningful content.</p>
+                <p>Second paragraph adds more context for the article body.</p>
+            </article>
+        </body>
+    </html>
+    """
+    content = extractor.extract_content(html, markdown=noisy_markdown, url="https://example.com/news")
+    
+    assert "Main body text" in content
+    assert "Subscribe" not in content
+
 
 def test_extract_tags():
     """测试标签提取"""
@@ -95,4 +115,3 @@ def test_extract_tags():
     # 测试无标签
     tags3 = extractor.extract_tags(None, "https://www.example.com/article")
     assert tags3 is None or len(tags3) == 0
-

@@ -135,3 +135,51 @@ class Config:
     def browser_timeout(self) -> int:
         return self.get("browser.timeout", 30)
 
+    # LLM 提取相关配置
+    @property
+    def use_llm_extraction(self) -> bool:
+        return self.get("llm.use_llm_extraction", False)
+
+    @property
+    def llm_mode(self) -> str:
+        # 可选: always / fallback
+        return self.get("llm.mode", "fallback")
+
+    @property
+    def llm_provider(self) -> str:
+        return self.get("llm.provider", "openai/gpt-4o-mini")
+
+    @property
+    def llm_api_key_env(self) -> str:
+        return self.get("llm.api_key_env", "OPENAI_API_KEY")
+
+    @property
+    def llm_instruction(self) -> str:
+        return self.get(
+            "llm.instruction",
+            "Extract the news article body as clean plain text, a concise summary, ISO 8601 publish time if present, primary language code, and relevant tags. Return a single JSON object with keys: title, summary, content, published_at, language, tags (array of strings).",
+        )
+
+    @property
+    def llm_chunk_token_threshold(self) -> int:
+        return self.get("llm.chunk_token_threshold", 1200)
+
+    @property
+    def llm_overlap_rate(self) -> float:
+        return self.get("llm.overlap_rate", 0.1)
+
+    @property
+    def llm_apply_chunking(self) -> bool:
+        return self.get("llm.apply_chunking", True)
+
+    @property
+    def llm_input_format(self) -> str:
+        return self.get("llm.input_format", "fit_markdown")
+
+    @property
+    def llm_temperature(self) -> float:
+        return self.get("llm.temperature", 0.0)
+
+    @property
+    def llm_max_output_tokens(self) -> int:
+        return self.get("llm.max_output_tokens", 1200)

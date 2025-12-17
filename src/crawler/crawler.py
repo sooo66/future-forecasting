@@ -1,19 +1,24 @@
 """Crawl4AI 爬虫模块"""
 import asyncio
+import json
+import os
 import random
-from typing import List, Dict, Optional
+import re
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import uuid
 from pathlib import Path
 from loguru import logger
 
 try:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, LLMConfig
     from crawl4ai.content_filter_strategy import PruningContentFilter
     from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+    from crawl4ai.extraction_strategy import LLMExtractionStrategy
 except ImportError:
     logger.error("Crawl4AI 未安装，请运行: pip install crawl4ai")
     raise
+from pydantic import BaseModel, Field
 
 from freeproxy import freeproxy
 
@@ -21,6 +26,17 @@ from utils.config import Config
 from utils.models import Record
 from url_pool_builder.builder import URLPoolBuilder
 from .extractor import ContentExtractor
+
+
+class ArticleLLMOutput(BaseModel):
+    """用于 LLMExtractionStrategy 的结构化输出定义"""
+    
+    title: str = Field(..., description="Headline of the article")
+    summary: str = Field(..., description="Concise 1-3 sentence summary")
+    content: str = Field(..., description="Full clean article body text without navigation or ads")
+    published_at: Optional[str] = Field(None, description="ISO8601 publish datetime if available, else null")
+    language: Optional[str] = Field(None, description="Primary language code, e.g., en")
+    tags: Optional[List[str]] = Field(None, description="Optional topical tags/keywords")
 
 
 class NewsCrawler:
@@ -50,6 +66,8 @@ class NewsCrawler:
         self.user_agents = config.user_agents
         self.use_proxy = config.use_proxy
         self.use_browser = config.use_browser
+        self.use_llm_extraction = config.use_llm_extraction
+        self.llm_mode = config.llm_mode
         
         # 输出目录
         self.output_dir = config.processed_data_dir
@@ -96,6 +114,9 @@ class NewsCrawler:
             "failed": 0,
             "retries": 0
         }
+
+        # LLM 提取策略（可选）
+        self.llm_strategy = self._build_llm_strategy()
     
     def _get_proxy(self) -> Optional[str]:
         """获取随机代理"""
@@ -134,6 +155,44 @@ class NewsCrawler:
         if domain not in self.domain_semaphores:
             self.domain_semaphores[domain] = asyncio.Semaphore(self.per_domain_concurrency)
         return self.domain_semaphores[domain]
+
+    def _build_llm_strategy(self) -> Optional[LLMExtractionStrategy]:
+        """初始化 LLMExtractionStrategy（可选）"""
+        if not self.use_llm_extraction:
+            return None
+        
+        api_token = os.getenv(self.config.llm_api_key_env)
+        if not api_token and not self.config.llm_provider.startswith("ollama"):
+            logger.warning(f"未找到环境变量 {self.config.llm_api_key_env}，LLM 提取已禁用")
+            return None
+        
+        try:
+            llm_config = LLMConfig(
+                provider=self.config.llm_provider,
+                api_token=api_token,
+            )
+            
+            strategy = LLMExtractionStrategy(
+                llm_config=llm_config,
+                schema=ArticleLLMOutput.model_json_schema(),
+                extraction_type="schema",
+                instruction=self.config.llm_instruction,
+                chunk_token_threshold=self.config.llm_chunk_token_threshold,
+                overlap_rate=self.config.llm_overlap_rate,
+                apply_chunking=self.config.llm_apply_chunking,
+                input_format=self.config.llm_input_format,
+                extra_args={
+                    "temperature": self.config.llm_temperature,
+                    "max_tokens": self.config.llm_max_output_tokens,
+                },
+                verbose=False,
+            )
+            
+            logger.info(f"已启用 LLM 提取，provider={self.config.llm_provider}, mode={self.llm_mode}")
+            return strategy
+        except Exception as e:
+            logger.warning(f"初始化 LLMExtractionStrategy 失败，回退到规则提取: {e}")
+            return None
     
     async def _random_delay(self):
         """随机延迟"""
@@ -238,6 +297,45 @@ class NewsCrawler:
             logger.debug(f"尝试 archive.is 失败 {original_url}: {e}")
         
         return None
+
+    async def _run_llm_extraction(self, url: str, base_run_config_kwargs: Dict, browser_config) -> Optional[Dict]:
+        """在需要时触发 LLM 提取（重用同一套反爬配置）"""
+        if not self.llm_strategy:
+            return None
+        
+        llm_run_kwargs = dict(base_run_config_kwargs)
+        llm_run_kwargs["extraction_strategy"] = self.llm_strategy
+        run_config_llm = CrawlerRunConfig(**llm_run_kwargs)
+        
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                llm_result = await crawler.arun(url=url, config=run_config_llm)
+            
+            if llm_result.success and getattr(llm_result, "extracted_content", None):
+                parsed = self._parse_llm_content(llm_result.extracted_content)
+                if parsed:
+                    logger.info(f"LLM 提取成功: {url}")
+                    return parsed
+            else:
+                logger.warning(f"LLM 提取失败: {getattr(llm_result, 'error_message', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"LLM 提取异常，忽略: {e}")
+        
+        return None
+
+    def _parse_llm_content(self, content: str) -> Optional[Dict]:
+        """解析 LLM 返回的 JSON 内容"""
+        if not content:
+            return None
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, list) and parsed:
+                parsed = parsed[0]
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as e:
+            logger.debug(f"解析 LLM JSON 失败: {e}")
+        return None
     
     async def _crawl_url(self, url_info: Dict) -> Optional[Record]:
         """爬取单个 URL"""
@@ -282,11 +380,19 @@ class NewsCrawler:
                     '.breadcrumb', '.tags', '.related', '.comments', '.trending'
                 ]
                 
-                # 尝试使用 exclude_selectors 参数（如果支持）
+                pruning_kwargs = {
+                    "threshold": 0.52,
+                    "threshold_type": "fixed",
+                    "min_word_threshold": self.extractor.min_word_threshold,
+                    "exclude_selectors": exclude_selectors,
+                }
+
+                # 尝试使用增强的参数（如 threshold/min_word_threshold）
                 try:
-                    content_filter = PruningContentFilter(exclude_selectors=exclude_selectors)
+                    content_filter = PruningContentFilter(**pruning_kwargs)
                 except TypeError:
-                    # 如果不支持 exclude_selectors，使用默认配置
+                    # 如果当前版本不支持这些参数，降级为默认配置
+                    logger.debug("PruningContentFilter 参数不兼容，使用默认配置")
                     content_filter = PruningContentFilter()
             except Exception as e:
                 logger.debug(f"无法创建 PruningContentFilter: {e}")
@@ -333,6 +439,11 @@ class NewsCrawler:
             except Exception as e:
                 logger.debug(f"无法设置内容选择器: {e}")
             
+            base_run_config_kwargs = dict(run_config_kwargs)
+
+            if self.llm_strategy and self.llm_mode == "always":
+                run_config_kwargs["extraction_strategy"] = self.llm_strategy
+            
             run_config = CrawlerRunConfig(**run_config_kwargs) if run_config_kwargs else None
             
             # 重试逻辑
@@ -371,7 +482,7 @@ class NewsCrawler:
                                     markdown = str(result.markdown)
                             else:
                                 markdown = None
-                            
+
                             extracted = self.extractor.extract(
                                 html=html,
                                 markdown=markdown,
@@ -380,10 +491,14 @@ class NewsCrawler:
                                 gkg_date=gkg_date,
                                 themes=themes
                             )
+
+                            llm_payload = None
+                            if self.llm_strategy and self.llm_mode == "always":
+                                llm_payload = self._parse_llm_content(getattr(result, "extracted_content", None))
                             
                             # 检查内容是否为空（可能是paywall）
                             content = extracted["content"]
-                            if not content or len(content.strip()) < 100:
+                            if (not content or len(content.strip()) < 100) and llm_payload is None:
                                 # 尝试使用 archive.is 绕过 paywall
                                 logger.info(f"检测到内容为空或过短，尝试使用 archive.is 获取: {url}")
                                 archive_result = await self._try_archive_is(url, browser_config, run_config)
@@ -396,8 +511,34 @@ class NewsCrawler:
                                         extracted["summary"] = archive_result.get("summary", extracted["summary"])
                                     content = extracted["content"]
                                     logger.info(f"成功从 archive.is 获取内容: {url}")
+
+                            # LLM fallback: 在规则提取仍不足时触发
+                            word_count = len(re.findall(r"[A-Za-z]+", content or ""))
+                            if self.llm_strategy and self.llm_mode == "fallback" and word_count < self.extractor.min_word_threshold:
+                                llm_payload = await self._run_llm_extraction(url, base_run_config_kwargs, browser_config)
                             
-                            # 创建 Record（即使content为空也保存，标记为需要处理）
+                            if llm_payload:
+                                extracted["content"] = llm_payload.get("content") or extracted["content"]
+                                extracted["title"] = llm_payload.get("title") or extracted["title"]
+                                extracted["summary"] = llm_payload.get("summary") or extracted["summary"]
+                                extracted["published_at"] = llm_payload.get("published_at") or extracted["published_at"]
+                                extracted["language"] = llm_payload.get("language") or extracted["language"]
+                                tags = llm_payload.get("tags")
+                                if isinstance(tags, str):
+                                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                                if isinstance(tags, list):
+                                    extracted["tags"] = tags
+                                content = extracted["content"]
+                                word_count = len(re.findall(r"[A-Za-z]+", content or ""))
+                            
+                            if not content or word_count < self.extractor.min_word_threshold:
+                                last_error = f"content_too_short ({word_count} words)"
+                                logger.info(f"内容过短，标记为失败: {url} ({word_count} words)")
+                                self.url_pool_builder.update_status(url_id, "failed", last_error)
+                                self.stats["failed"] += 1
+                                return None
+
+                            # 创建 Record
                             record = Record(
                                 id=str(uuid.uuid4()),
                                 source=source,
@@ -530,4 +671,3 @@ class NewsCrawler:
         logger.info(f"爬取完成: 总计 {total}，成功 {self.stats['success']}，失败 {self.stats['failed']}，重试 {self.stats['retries']} 次")
         
         return all_records
-
