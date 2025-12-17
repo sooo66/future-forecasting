@@ -225,22 +225,33 @@ class NewsCrawler:
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(query_result.html, 'html.parser')
                 
-                # archive.is 的存档链接通常在以下位置：
-                # 1. <a> 标签的 href 属性，包含 /newest/ 或时间戳
-                # 2. 或者直接是完整的存档URL
                 archive_link = None
+
+                # 优先根据 archive.is 的表格定位：//*[@id="row0"]/div[2]/a[1]
+                row0 = soup.find(id="row0")
+                if row0:
+                    divs = row0.find_all("div")
+                    if len(divs) >= 2:
+                        anchors = divs[1].find_all("a", href=True)
+                        if anchors:
+                            href = anchors[0].get("href", "")
+                            if href.startswith("/"):
+                                archive_link = f"https://archive.is{href}"
+                            elif href.startswith("http"):
+                                archive_link = href
                 
-                # 方法1: 查找包含 /newest/ 的链接
-                for link in soup.find_all('a', href=True):
-                    href = link.get('href', '')
-                    if '/newest/' in href or '/web/' in href:
-                        if href.startswith('/'):
-                            archive_link = f"https://archive.is{href}"
-                        elif href.startswith('http'):
-                            archive_link = href
-                        break
+                # 备选方案：查找包含 /newest/ 或 /web/ 的链接
+                if not archive_link:
+                    for link in soup.find_all('a', href=True):
+                        href = link.get('href', '')
+                        if '/newest/' in href or '/web/' in href:
+                            if href.startswith('/'):
+                                archive_link = f"https://archive.is{href}"
+                            elif href.startswith('http'):
+                                archive_link = href
+                            break
                 
-                # 方法2: 如果没找到，查找包含原始URL的完整链接
+                # 再次备选：查找包含原始 URL 的存档链接
                 if not archive_link:
                     for link in soup.find_all('a', href=True):
                         href = link.get('href', '')
@@ -248,12 +259,10 @@ class NewsCrawler:
                             archive_link = href
                             break
                 
-                # 方法3: 尝试直接访问存档（archive.is 有时会直接显示）
-                # 检查当前页面是否已经是存档内容
+                # 最后兜底：当前页面足够长则直接尝试
                 if not archive_link:
-                    # 检查页面中是否包含原始URL的内容
                     page_text = soup.get_text()
-                    if len(page_text) > 1000:  # 如果页面内容足够长，可能是存档内容
+                    if len(page_text) > 1000:
                         archive_link = archive_query_url
                 
                 if archive_link:
@@ -336,6 +345,17 @@ class NewsCrawler:
         except Exception as e:
             logger.debug(f"解析 LLM JSON 失败: {e}")
         return None
+
+    def _is_proxy_error_content(self, text: Optional[str]) -> bool:
+        """检测返回内容是否为代理错误提示，避免把错误页当正文"""
+        if not text:
+            return False
+        indicators = [
+            "using socks proxy", "socksio", "install httpx[socks]",
+            "proxyerror", "proxy error", "proxy connection failed"
+        ]
+        lower = text.lower()
+        return any(ind in lower for ind in indicators)
     
     async def _crawl_url(self, url_info: Dict) -> Optional[Record]:
         """爬取单个 URL"""
@@ -444,11 +464,27 @@ class NewsCrawler:
             if self.llm_strategy and self.llm_mode == "always":
                 run_config_kwargs["extraction_strategy"] = self.llm_strategy
             
+            base_run_config_kwargs = dict(run_config_kwargs)
+
+            if self.llm_strategy and self.llm_mode == "always":
+                run_config_kwargs["extraction_strategy"] = self.llm_strategy
+            
             run_config = CrawlerRunConfig(**run_config_kwargs) if run_config_kwargs else None
             
             # 重试逻辑
             last_error = None
+            current_proxy = proxy
             for attempt in range(self.retry_attempts):
+                # 每次尝试根据当前代理重建 run_config
+                if base_run_config_kwargs is not None:
+                    attempt_kwargs = dict(base_run_config_kwargs)
+                    if current_proxy:
+                        attempt_kwargs["proxy"] = current_proxy
+                    else:
+                        attempt_kwargs.pop("proxy", None)
+                    if self.llm_strategy and self.llm_mode == "always":
+                        attempt_kwargs["extraction_strategy"] = self.llm_strategy
+                    run_config = CrawlerRunConfig(**attempt_kwargs) if attempt_kwargs else None
                 try:
                     async with AsyncWebCrawler(config=browser_config) as crawler:
                         # Crawl4AI 的 arun 方法参数可能因版本而异
@@ -459,10 +495,17 @@ class NewsCrawler:
                             result = await crawler.arun(
                                 url=url,
                                 user_agent=user_agent if user_agent else None,
-                                proxy=proxy if proxy else None
+                                proxy=current_proxy if current_proxy else None
                             )
                         
                         if result.success:
+                            # 代理错误页检测：如果返回的是代理错误提示，触发重试并改用直连
+                            if self._is_proxy_error_content(result.html):
+                                last_error = "proxy_error_content"
+                                logger.warning(f"检测到代理错误内容，切换为直连重试: {url}")
+                                current_proxy = None
+                                continue
+
                             # 提取内容
                             html = result.html
                             
