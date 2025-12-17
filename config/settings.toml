@@ -1,0 +1,101 @@
+[general]
+# 日期范围
+start_date = "2025-12-09"
+end_date = "2025-12-09"
+
+# 并发控制
+concurrent_downloads = 8
+concurrent_crawls = 8
+per_domain_concurrency = 2
+
+# 重试配置
+retry_attempts = 3
+retry_delay_base = 2.0  # 指数退避的基础延迟（秒）
+
+# 请求延迟（秒）- 随机延迟范围
+request_delay_min = 1.0
+request_delay_max = 3.0
+
+# 测试模式：如果为 true，只处理前 N 个 URL
+test_mode = true
+test_url_limit = 100
+
+# User-Agent 池
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+]
+
+# 代理源配置
+proxy_sources = [
+    "ProxylistProxiedSession"
+]
+
+# 是否使用代理（如果代理获取失败，会回退到直连）
+use_proxy = true
+
+# 是否使用浏览器模式（需要 JS 渲染的页面）
+use_browser = false
+
+# 浏览器配置
+[browser]
+headless = true
+timeout = 30
+
+[paths]
+raw_data_dir = "data/raw/gkg"
+processed_data_dir = "data/processed/records"
+url_pool_db = "data/url_pool/url_pool.db"
+log_dir = "logs"
+
+[whitelist]
+# 媒体域名白名单（格式：域名 -> 媒体名称）
+media_domains = [
+    { name = "1440", domain = "join1440.com" },
+    { name = "BBC News", domain = "bbc.com" },
+    { name = "The Christian Science Monitor", domain = "csmonitor.com" },
+    { name = "Forbes", domain = "forbes.com" },
+    { name = "The Hill", domain = "thehill.com" },
+    { name = "MarketWatch", domain = "marketwatch.com" },
+    { name = "Morning Brew", domain = "morningbrew.com" },
+    { name = "NewsNation", domain = "newsnationnow.com" },
+    { name = "Newsweek", domain = "newsweek.com" },
+    { name = "Reason", domain = "reason.com" },
+    { name = "Reuters", domain = "reuters.com" },
+    { name = "SmartNews (SAN)", domain = "smartnews.com" },
+    { name = "Tangle", domain = "readtangle.com" },
+    { name = "The Wall Street Journal (news)", domain = "wsj.com" },
+    { name = "ABC News", domain = "abcnews.go.com" },
+    { name = "Axios", domain = "axios.com" },
+    { name = "Bloomberg", domain = "bloomberg.com" },
+    { name = "CBS News", domain = "cbsnews.com" },
+    { name = "CNBC", domain = "cnbc.com" },
+    { name = "CNN", domain = "cnn.com" },
+    { name = "Insider", domain = "insider.com" },
+    { name = "NBC News", domain = "nbcnews.com" },
+    { name = "The New York Times (news)", domain = "nytimes.com" },
+    { name = "Politico", domain = "politico.com" },
+    { name = "ProPublica", domain = "propublica.org" },
+    { name = "Semafor", domain = "semafor.com" },
+    { name = "TIME", domain = "time.com" },
+    { name = "USA Today", domain = "usatoday.com" },
+    { name = "The Washington Post", domain = "washingtonpost.com" },
+    { name = "Yahoo News", domain = "news.yahoo.com" },
+    { name = "Daily Mail", domain = "dailymail.co.uk" },
+    { name = "The Dispatch", domain = "thedispatch.com" },
+    { name = "The Epoch Times", domain = "theepochtimes.com" },
+    { name = "Fox Business", domain = "foxbusiness.com" },
+    { name = "The Free Press", domain = "thefp.com" },
+    { name = "Just the News", domain = "justthenews.com" },
+    { name = "National Review (news)", domain = "nationalreview.com" },
+    { name = "New York Post (news)", domain = "nypost.com" },
+    { name = "RealClear Politics", domain = "realclearpolitics.com" },
+    { name = "Upward News", domain = "upward.news" },
+    { name = "Washington Examiner", domain = "washingtonexaminer.com" },
+    { name = "The Washington Times", domain = "washingtontimes.com" },
+    { name = "ZeroHedge", domain = "zerohedge.com" }
+]
+

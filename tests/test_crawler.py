@@ -1,0 +1,98 @@
+"""爬虫模块测试"""
+import pytest
+from pathlib import Path
+import tempfile
+import shutil
+
+from src.crawler.extractor import ContentExtractor
+
+
+@pytest.fixture
+def sample_html():
+    """示例 HTML"""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Test Article Title</title>
+        <meta property="og:title" content="OG Title">
+        <meta name="description" content="This is a test article description">
+        <meta property="article:published_time" content="2025-01-01T12:00:00Z">
+    </head>
+    <body>
+        <article>
+            <h1>Article Heading</h1>
+            <p>This is the first paragraph of the article.</p>
+            <p>This is the second paragraph of the article.</p>
+        </article>
+    </body>
+    </html>
+    """
+
+
+def test_extract_title(sample_html):
+    """测试标题提取"""
+    extractor = ContentExtractor()
+    
+    title = extractor.extract_title(sample_html, "https://www.example.com/article")
+    
+    # 应该优先使用 og:title
+    assert title == "OG Title"
+
+
+def test_extract_summary(sample_html):
+    """测试摘要提取"""
+    extractor = ContentExtractor()
+    
+    summary = extractor.extract_summary(sample_html)
+    
+    assert summary == "This is a test article description"
+
+
+def test_extract_published_at(sample_html):
+    """测试发布时间提取"""
+    extractor = ContentExtractor()
+    
+    published_at = extractor.extract_published_at(sample_html)
+    
+    assert published_at == "2025-01-01T12:00:00Z"
+
+
+def test_extract_content(sample_html):
+    """测试内容提取"""
+    extractor = ContentExtractor()
+    
+    content = extractor.extract_content(sample_html)
+    
+    assert "Article Heading" in content
+    assert "first paragraph" in content
+    assert "second paragraph" in content
+
+
+def test_extract_language(sample_html):
+    """测试语言提取"""
+    extractor = ContentExtractor()
+    
+    language = extractor.extract_language(sample_html, "https://www.example.com/article")
+    
+    assert language == "en"
+
+
+def test_extract_tags():
+    """测试标签提取"""
+    extractor = ContentExtractor()
+    
+    # 测试从 themes 提取
+    tags1 = extractor.extract_tags("ECON;POLITICS;SPORTS", "https://www.example.com/article")
+    assert tags1 is not None
+    assert "ECON" in tags1 or "POLITICS" in tags1
+    
+    # 测试从 URL 提取
+    tags2 = extractor.extract_tags(None, "https://www.example.com/politics/article")
+    assert tags2 is not None
+    assert "politics" in tags2
+    
+    # 测试无标签
+    tags3 = extractor.extract_tags(None, "https://www.example.com/article")
+    assert tags3 is None or len(tags3) == 0
+
