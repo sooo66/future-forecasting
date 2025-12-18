@@ -4,6 +4,8 @@ import json
 import os
 import random
 import re
+import hashlib
+import time
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import uuid
@@ -117,6 +119,66 @@ class NewsCrawler:
 
         # LLM 提取策略（可选）
         self.llm_strategy = self._build_llm_strategy()
+
+        # 精准定位问题用的 trace（默认开启，输出到 logs/crawl_trace_YYYY-MM-DD.jsonl）
+        self._trace_enabled = os.getenv("FF_CRAWLER_TRACE", "1").lower() not in {"0", "false", "no", "off"}
+        self._dump_artifacts = os.getenv("FF_CRAWLER_DUMP_ARTIFACTS", "0").lower() in {"1", "true", "yes", "on"}
+        self._dump_on_failure = os.getenv("FF_CRAWLER_DUMP_ON_FAILURE", "1").lower() not in {"0", "false", "no", "off"}
+        try:
+            self._max_artifact_chars = int(os.getenv("FF_CRAWLER_MAX_ARTIFACT_CHARS", "200000"))
+        except Exception:
+            self._max_artifact_chars = 200000
+        self._artifact_dir = self.config.log_dir / "crawl_artifacts"
+        self._artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    def _trace(self, event: str, **fields):
+        """仅用于定位链路问题的结构化日志（写入 crawl_trace*.jsonl）。"""
+        if not self._trace_enabled:
+            return
+        logger.bind(trace=True, component="crawler", event=event, **fields).debug(event)
+
+    def _sha256(self, text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        if not isinstance(text, str):
+            text = str(text)
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _preview(self, text: Optional[str], limit: int = 800) -> Optional[str]:
+        if text is None:
+            return None
+        if not isinstance(text, str):
+            text = str(text)
+        t = text.strip()
+        if len(t) <= limit:
+            return t
+        return t[:limit] + f"...(truncated,{len(t)} chars)"
+
+    def _text_stats(self, text: Optional[str]) -> Dict[str, int]:
+        if text is None:
+            return {"chars": 0, "words": 0}
+        if not isinstance(text, str):
+            text = str(text)
+        if not text:
+            return {"chars": 0, "words": 0}
+        chars = len(text)
+        words = len(re.findall(r"[A-Za-z]+", text))
+        return {"chars": chars, "words": words}
+
+    def _maybe_dump_artifact(self, *, url_id: str, kind: str, text: Optional[str], failure: bool = False) -> Optional[str]:
+        """可选落盘保存大段文本，避免把全文塞进日志。"""
+        if text is None:
+            return None
+        if not (self._dump_artifacts or (failure and self._dump_on_failure)):
+            return None
+        safe_kind = re.sub(r"[^a-zA-Z0-9_.-]+", "_", kind)[:80]
+        path = self._artifact_dir / f"{url_id}_{safe_kind}.txt"
+        payload = text[: self._max_artifact_chars]
+        try:
+            path.write_text(payload, encoding="utf-8", errors="replace")
+            return str(path)
+        except Exception:
+            return None
     
     def _get_proxy(self) -> Optional[str]:
         """获取随机代理"""
@@ -199,7 +261,7 @@ class NewsCrawler:
         delay = random.uniform(self.request_delay_min, self.request_delay_max)
         await asyncio.sleep(delay)
     
-    async def _try_archive_is(self, original_url: str, browser_config, run_config) -> Optional[Dict]:
+    async def _try_archive_is(self, url_id: str, original_url: str, browser_config, run_config) -> Optional[Dict]:
         """尝试使用 archive.is 获取存档内容以绕过 paywall
         
         archive.is 的工作方式：
@@ -210,6 +272,13 @@ class NewsCrawler:
         try:
             # 构建 archive.is 查询URL
             archive_query_url = f"https://archive.is/{original_url}"
+            self._trace(
+                "archive_query_start",
+                url_id=url_id,
+                url=original_url,
+                archive_query_url=archive_query_url,
+                has_run_config=bool(run_config),
+            )
             
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 # 先访问查询页面
@@ -219,7 +288,16 @@ class NewsCrawler:
                     query_result = await crawler.arun(url=archive_query_url)
             
                 if not query_result.success or not query_result.html:
-                    logger.warning(f"archive_fetch_failed url={original_url}")
+                    self._trace(
+                        "archive_query_failed",
+                        url_id=url_id,
+                        url=original_url,
+                        archive_query_url=archive_query_url,
+                        success=bool(getattr(query_result, "success", False)),
+                        error_message=getattr(query_result, "error_message", None),
+                        html_stats=self._text_stats(getattr(query_result, "html", None)),
+                    )
+                    logger.warning(f"archive_fetch_failed url={original_url} reason=query_page_fetch_failed")
                     return None
                 
                 # 解析 archive.is 页面，查找存档链接
@@ -227,6 +305,7 @@ class NewsCrawler:
                 soup = BeautifulSoup(query_result.html, 'html.parser')
                 
                 archive_link = None
+                archive_link_method = None
 
                 # 优先根据 archive.is 的表格定位：//*[@id="row0"]/div[2]/a[1]
                 row0 = soup.find(id="row0")
@@ -238,8 +317,10 @@ class NewsCrawler:
                             href = anchors[0].get("href", "")
                             if href.startswith("/"):
                                 archive_link = f"https://archive.is{href}"
+                                archive_link_method = "row0_first_link"
                             elif href.startswith("http"):
                                 archive_link = href
+                                archive_link_method = "row0_first_link"
                 
                 # 备选方案：查找包含 /newest/ 或 /web/ 的链接
                 if not archive_link:
@@ -248,8 +329,10 @@ class NewsCrawler:
                         if '/newest/' in href or '/web/' in href:
                             if href.startswith('/'):
                                 archive_link = f"https://archive.is{href}"
+                                archive_link_method = "newest_or_web_link"
                             elif href.startswith('http'):
                                 archive_link = href
+                                archive_link_method = "newest_or_web_link"
                             break
                 
                 # 再次备选：查找包含原始 URL 的存档链接
@@ -258,6 +341,7 @@ class NewsCrawler:
                         href = link.get('href', '')
                         if original_url in href and 'archive.is' in href:
                             archive_link = href
+                            archive_link_method = "contains_original_url"
                             break
                 
                 # 最后兜底：当前页面足够长则直接尝试
@@ -265,10 +349,27 @@ class NewsCrawler:
                     page_text = soup.get_text()
                     if len(page_text) > 1000:
                         archive_link = archive_query_url
+                        archive_link_method = "fallback_use_query_page"
                 
                 if not archive_link:
+                    self._trace(
+                        "archive_link_not_found",
+                        url_id=url_id,
+                        url=original_url,
+                        archive_query_url=archive_query_url,
+                        query_html_stats=self._text_stats(query_result.html),
+                    )
                     logger.warning(f"archive_link_not_found url={original_url}")
                     return None
+
+                self._trace(
+                    "archive_link_selected",
+                    url_id=url_id,
+                    url=original_url,
+                    archive_query_url=archive_query_url,
+                    archive_link=archive_link,
+                    method=archive_link_method,
+                )
                 
                 # 访问存档页面
                 if run_config:
@@ -277,6 +378,15 @@ class NewsCrawler:
                     archive_result = await crawler.arun(url=archive_link)
                 
                 if not archive_result.success or not archive_result.html:
+                    self._trace(
+                        "archive_content_fetch_failed",
+                        url_id=url_id,
+                        url=original_url,
+                        archive_link=archive_link,
+                        success=bool(getattr(archive_result, "success", False)),
+                        error_message=getattr(archive_result, "error_message", None),
+                        html_stats=self._text_stats(getattr(archive_result, "html", None)),
+                    )
                     logger.warning(f"archive_content_fetch_failed url={original_url}")
                     return None
 
@@ -301,6 +411,18 @@ class NewsCrawler:
                     gkg_date=None,
                     themes=None
                 )
+
+                content_stats = self._text_stats(extracted.get("content"))
+                self._trace(
+                    "archive_extracted",
+                    url_id=url_id,
+                    url=original_url,
+                    archive_link=archive_link,
+                    html_stats=self._text_stats(archive_result.html),
+                    markdown_stats=self._text_stats(archive_markdown),
+                    content_stats=content_stats,
+                    title_preview=self._preview(extracted.get("title"), 200),
+                )
                 
                 if extracted["content"] and len(extracted["content"].strip()) > 100:
                     logger.info(f"archive_success url={original_url} via={archive_link}")
@@ -310,14 +432,44 @@ class NewsCrawler:
                         "summary": extracted["summary"]
                     }
                 else:
+                    html_path = self._maybe_dump_artifact(
+                        url_id=url_id,
+                        kind="archive_html",
+                        text=archive_result.html,
+                        failure=True,
+                    )
+                    md_path = self._maybe_dump_artifact(
+                        url_id=url_id,
+                        kind="archive_markdown",
+                        text=archive_markdown,
+                        failure=True,
+                    )
+                    self._trace(
+                        "archive_content_too_short",
+                        url_id=url_id,
+                        url=original_url,
+                        archive_link=archive_link,
+                        content_stats=content_stats,
+                        content_sha256=self._sha256(extracted.get("content")),
+                        content_preview=self._preview(extracted.get("content")),
+                        archive_html_path=html_path,
+                        archive_markdown_path=md_path,
+                    )
                     logger.warning(f"archive_content_too_short url={original_url} via={archive_link}")
         
         except Exception as e:
-            logger.warning(f"archive_exception url={original_url}")
+            self._trace(
+                "archive_exception",
+                url_id=url_id,
+                url=original_url,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            logger.warning(f"archive_exception url={original_url} err={type(e).__name__}:{e}")
         
         return None
 
-    async def _run_llm_extraction(self, url: str, base_run_config_kwargs: Dict, browser_config) -> Optional[Dict]:
+    async def _run_llm_extraction(self, url_id: str, url: str, base_run_config_kwargs: Dict, browser_config) -> Optional[Dict]:
         """在需要时触发 LLM 提取（重用同一套反爬配置）"""
         if not self.llm_strategy:
             return None
@@ -327,18 +479,112 @@ class NewsCrawler:
         run_config_llm = CrawlerRunConfig(**llm_run_kwargs)
         
         try:
+            t0 = time.monotonic()
+            self._trace(
+                "llm_fallback_start",
+                url_id=url_id,
+                url=url,
+                llm_provider=self.config.llm_provider,
+                llm_input_format=self.config.llm_input_format,
+                chunk_token_threshold=self.config.llm_chunk_token_threshold,
+                apply_chunking=self.config.llm_apply_chunking,
+            )
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 llm_result = await crawler.arun(url=url, config=run_config_llm)
+            dt_ms = int((time.monotonic() - t0) * 1000)
+
+            llm_html = getattr(llm_result, "html", None)
+            llm_md = None
+            if hasattr(llm_result, "markdown"):
+                if isinstance(llm_result.markdown, str):
+                    llm_md = llm_result.markdown
+                elif hasattr(llm_result.markdown, "markdown"):
+                    llm_md = llm_result.markdown.markdown
+                elif hasattr(llm_result.markdown, "raw_markdown"):
+                    llm_md = llm_result.markdown.raw_markdown
+                else:
+                    llm_md = str(llm_result.markdown)
+            llm_raw = getattr(llm_result, "extracted_content", None)
+
+            llm_html_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=False)
+            llm_md_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=False)
+            llm_raw_path = self._maybe_dump_artifact(
+                url_id=url_id,
+                kind="llm_fallback_output_raw",
+                text=str(llm_raw) if llm_raw is not None else None,
+                failure=False,
+            )
+            self._trace(
+                "llm_fallback_crawl_done",
+                url_id=url_id,
+                url=url,
+                duration_ms=dt_ms,
+                success=bool(getattr(llm_result, "success", False)),
+                error_message=getattr(llm_result, "error_message", None),
+                html_stats=self._text_stats(llm_html),
+                markdown_stats=self._text_stats(llm_md),
+                llm_raw_stats=self._text_stats(llm_raw),
+                llm_raw_sha256=self._sha256(llm_raw),
+                llm_raw_preview=self._preview(llm_raw),
+                llm_html_path=llm_html_path,
+                llm_markdown_path=llm_md_path,
+                llm_output_path=llm_raw_path,
+            )
             
             if llm_result.success and getattr(llm_result, "extracted_content", None):
                 parsed = self._parse_llm_content(llm_result.extracted_content)
                 if parsed:
+                    content_stats = self._text_stats(parsed.get("content"))
+                    self._trace(
+                        "llm_fallback_parsed",
+                        url_id=url_id,
+                        url=url,
+                        content_stats=content_stats,
+                        title_preview=self._preview(parsed.get("title"), 200),
+                        summary_preview=self._preview(parsed.get("summary"), 200),
+                    )
                     logger.info(f"LLM 提取成功: {url}")
                     return parsed
+                else:
+                    # 解析失败：为定位问题，按需落盘输入/输出
+                    llm_html_fail_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=True)
+                    llm_md_fail_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=True)
+                    llm_raw_fail_path = self._maybe_dump_artifact(
+                        url_id=url_id,
+                        kind="llm_fallback_output_raw",
+                        text=str(llm_raw) if llm_raw is not None else None,
+                        failure=True,
+                    )
+                    self._trace(
+                        "llm_fallback_parse_failed",
+                        url_id=url_id,
+                        url=url,
+                        llm_raw_sha256=self._sha256(llm_raw),
+                        llm_raw_preview=self._preview(llm_raw),
+                        llm_html_path=llm_html_fail_path,
+                        llm_markdown_path=llm_md_fail_path,
+                        llm_output_path=llm_raw_fail_path,
+                    )
             else:
+                # 爬取/抽取失败：按需落盘便于诊断
+                self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=True)
+                self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=True)
+                self._maybe_dump_artifact(
+                    url_id=url_id,
+                    kind="llm_fallback_output_raw",
+                    text=str(llm_raw) if llm_raw is not None else None,
+                    failure=True,
+                )
                 logger.warning(f"LLM 提取失败: {url}")
         except Exception as e:
-            logger.warning(f"LLM 提取异常，忽略: {url}")
+            self._trace(
+                "llm_fallback_exception",
+                url_id=url_id,
+                url=url,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            logger.warning(f"LLM 提取异常，忽略: {url} err={type(e).__name__}:{e}")
         
         return None
 
@@ -375,6 +621,19 @@ class NewsCrawler:
         source_name = url_info.get("source_name", "")
         gkg_date = url_info.get("gkg_date")
         themes = url_info.get("themes")
+
+        self._trace(
+            "crawl_start",
+            url_id=url_id,
+            url=url,
+            domain=domain,
+            source_name=source_name,
+            use_proxy=self.use_proxy,
+            use_browser=self.use_browser,
+            use_llm_extraction=bool(self.llm_strategy),
+            llm_mode=self.llm_mode if self.llm_strategy else None,
+            min_word_threshold=self.extractor.min_word_threshold,
+        )
         
         # 获取域名信号量
         semaphore = self._get_domain_semaphore(domain)
@@ -474,11 +733,6 @@ class NewsCrawler:
             if self.llm_strategy and self.llm_mode == "always":
                 run_config_kwargs["extraction_strategy"] = self.llm_strategy
             
-            base_run_config_kwargs = dict(run_config_kwargs)
-
-            if self.llm_strategy and self.llm_mode == "always":
-                run_config_kwargs["extraction_strategy"] = self.llm_strategy
-            
             run_config = CrawlerRunConfig(**run_config_kwargs) if run_config_kwargs else None
             
             # 重试逻辑
@@ -496,6 +750,17 @@ class NewsCrawler:
                         attempt_kwargs["extraction_strategy"] = self.llm_strategy
                     run_config = CrawlerRunConfig(**attempt_kwargs) if attempt_kwargs else None
                 try:
+                    attempt_no = attempt + 1
+                    t0 = time.monotonic()
+                    self._trace(
+                        "fetch_attempt_start",
+                        url_id=url_id,
+                        url=url,
+                        attempt=attempt_no,
+                        proxy_mode="proxy" if current_proxy else "direct",
+                        has_run_config=bool(run_config),
+                        use_browser=self.use_browser,
+                    )
                     async with AsyncWebCrawler(config=browser_config) as crawler:
                         # Crawl4AI 的 arun 方法参数可能因版本而异
                         if run_config:
@@ -507,12 +772,21 @@ class NewsCrawler:
                                 user_agent=user_agent if user_agent else None,
                                 proxy=current_proxy if current_proxy else None
                             )
+                    dt_ms = int((time.monotonic() - t0) * 1000)
                         
-                        if result.success:
+                    if result.success:
                             # 代理错误页检测：如果返回的是代理错误提示，触发重试并改用直连
                             if self._is_proxy_error_content(result.html):
                                 last_error = "proxy_error_content"
-                                logger.warning(f"检测到代理错误内容，切换为直连重试: {url}")
+                                self._trace(
+                                    "proxy_error_content",
+                                    url_id=url_id,
+                                    url=url,
+                                    attempt=attempt_no,
+                                    duration_ms=dt_ms,
+                                    html_stats=self._text_stats(getattr(result, "html", None)),
+                                )
+                                logger.warning(f"proxy_error_content url={url} attempt={attempt_no} action=switch_to_direct")
                                 current_proxy = None
                                 continue
 
@@ -533,6 +807,17 @@ class NewsCrawler:
                             else:
                                 markdown = None
 
+                            self._trace(
+                                "fetch_attempt_success",
+                                url_id=url_id,
+                                url=url,
+                                attempt=attempt_no,
+                                duration_ms=dt_ms,
+                                proxy_mode="proxy" if current_proxy else "direct",
+                                html_stats=self._text_stats(html),
+                                markdown_stats=self._text_stats(markdown),
+                            )
+
                             extracted = self.extractor.extract(
                                 html=html,
                                 markdown=markdown,
@@ -543,15 +828,67 @@ class NewsCrawler:
                             )
 
                             llm_payload = None
+                            llm_raw = None
                             if self.llm_strategy and self.llm_mode == "always":
-                                llm_payload = self._parse_llm_content(getattr(result, "extracted_content", None))
+                                llm_raw = getattr(result, "extracted_content", None)
+                                llm_payload = self._parse_llm_content(llm_raw)
+                                html_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_html", text=html, failure=False)
+                                md_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_markdown", text=markdown, failure=False)
+                                llm_raw_path = self._maybe_dump_artifact(
+                                    url_id=url_id,
+                                    kind="llm_always_output_raw",
+                                    text=str(llm_raw) if llm_raw is not None else None,
+                                    failure=False,
+                                )
+                                self._trace(
+                                    "llm_always_done",
+                                    url_id=url_id,
+                                    url=url,
+                                    attempt=attempt_no,
+                                    llm_provider=self.config.llm_provider,
+                                    llm_input_format=self.config.llm_input_format,
+                                    llm_raw_stats=self._text_stats(llm_raw),
+                                    llm_raw_sha256=self._sha256(llm_raw),
+                                    llm_raw_preview=self._preview(llm_raw),
+                                    parsed_ok=bool(llm_payload),
+                                    fetch_html_path=html_path,
+                                    fetch_markdown_path=md_path,
+                                    llm_output_path=llm_raw_path,
+                                )
+                                if llm_payload:
+                                    self._trace(
+                                        "llm_always_parsed",
+                                        url_id=url_id,
+                                        url=url,
+                                        content_stats=self._text_stats(llm_payload.get("content")),
+                                        title_preview=self._preview(llm_payload.get("title"), 200),
+                                        summary_preview=self._preview(llm_payload.get("summary"), 200),
+                                    )
+
+                            content_stats = self._text_stats(extracted.get("content"))
+                            self._trace(
+                                "rule_extracted",
+                                url_id=url_id,
+                                url=url,
+                                attempt=attempt_no,
+                                title_preview=self._preview(extracted.get("title"), 200),
+                                summary_preview=self._preview(extracted.get("summary"), 200),
+                                content_stats=content_stats,
+                            )
                             
                             # 检查内容是否为空（可能是paywall）
                             content = extracted["content"]
                             if (not content or len(content.strip()) < 100) and llm_payload is None:
                                 # 尝试使用 archive.is 绕过 paywall
-                                logger.info(f"检测到内容为空或过短，尝试使用 archive.is 获取: {url}")
-                                archive_result = await self._try_archive_is(url, browser_config, run_config)
+                                self._trace(
+                                    "archive_trigger",
+                                    url_id=url_id,
+                                    url=url,
+                                    reason="content_empty_or_short",
+                                    content_stats=self._text_stats(content),
+                                )
+                                logger.info(f"content_empty_or_short_try_archive url={url}")
+                                archive_result = await self._try_archive_is(url_id, url, browser_config, run_config)
                                 
                                 if archive_result and archive_result.get("content"):
                                     extracted["content"] = archive_result["content"]
@@ -560,12 +897,18 @@ class NewsCrawler:
                                     if not extracted["summary"]:
                                         extracted["summary"] = archive_result.get("summary", extracted["summary"])
                                     content = extracted["content"]
-                                    logger.info(f"成功从 archive.is 获取内容: {url}")
+                                    self._trace(
+                                        "archive_applied",
+                                        url_id=url_id,
+                                        url=url,
+                                        content_stats=self._text_stats(content),
+                                    )
+                                    logger.info(f"archive_applied url={url}")
 
                             # LLM fallback: 在规则提取仍不足时触发
                             word_count = len(re.findall(r"[A-Za-z]+", content or ""))
                             if self.llm_strategy and self.llm_mode == "fallback" and word_count < self.extractor.min_word_threshold:
-                                llm_payload = await self._run_llm_extraction(url, base_run_config_kwargs, browser_config)
+                                llm_payload = await self._run_llm_extraction(url_id, url, base_run_config_kwargs, browser_config)
                             
                             if llm_payload:
                                 # 仅使用 LLM 提供的正文，避免任何摘要/改写被写入其它字段
@@ -583,6 +926,14 @@ class NewsCrawler:
                                         llm_summary = " ".join([str(x) for x in llm_summary])
                                     if llm_summary:
                                         extracted["summary"] = llm_summary
+
+                                self._trace(
+                                    "llm_payload_applied",
+                                    url_id=url_id,
+                                    url=url,
+                                    content_stats=self._text_stats(extracted.get("content")),
+                                    summary_preview=self._preview(extracted.get("summary"), 200),
+                                )
                             
                             # 如果仍然没有摘要，使用正文首段作为兜底，避免为空
                             if not extracted.get("summary") and content:
@@ -591,9 +942,38 @@ class NewsCrawler:
                                     extracted["summary"] = paragraphs[0][:500]
                             
                             if not content or word_count < self.extractor.min_word_threshold:
-                                last_error = f"content_too_short ({word_count} words)"
-                                logger.info(f"内容过短，标记为失败: {url} ({word_count} words)")
-                                logger.info(f"content: {content}")
+                                last_error = f"content_too_short:words={word_count}"
+                                content_path = self._maybe_dump_artifact(url_id=url_id, kind="final_content", text=content, failure=True)
+                                fetch_html_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_html", text=html, failure=True)
+                                fetch_markdown_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_markdown", text=markdown, failure=True)
+                                llm_output_path = self._maybe_dump_artifact(
+                                    url_id=url_id,
+                                    kind="llm_output_raw_on_failure",
+                                    text=str(llm_raw) if llm_raw is not None else None,
+                                    failure=True,
+                                )
+                                llm_payload_path = self._maybe_dump_artifact(
+                                    url_id=url_id,
+                                    kind="llm_payload_on_failure",
+                                    text=json.dumps(llm_payload, ensure_ascii=False) if isinstance(llm_payload, dict) else None,
+                                    failure=True,
+                                )
+                                self._trace(
+                                    "final_content_too_short",
+                                    url_id=url_id,
+                                    url=url,
+                                    word_count=word_count,
+                                    min_word_threshold=self.extractor.min_word_threshold,
+                                    content_stats=self._text_stats(content),
+                                    content_sha256=self._sha256(content),
+                                    content_preview=self._preview(content),
+                                    content_path=content_path,
+                                    fetch_html_path=fetch_html_path,
+                                    fetch_markdown_path=fetch_markdown_path,
+                                    llm_output_path=llm_output_path,
+                                    llm_payload_path=llm_payload_path,
+                                )
+                                logger.warning(f"content_too_short url={url} words={word_count} min_words={self.extractor.min_word_threshold}")
                                 self.url_pool_builder.update_status(url_id, "failed", last_error)
                                 self.stats["failed"] += 1
                                 return None
@@ -614,16 +994,43 @@ class NewsCrawler:
                             # 更新状态为成功
                             self.url_pool_builder.update_status(url_id, "success")
                             self.stats["success"] += 1
+
+                            self._trace(
+                                "final_success",
+                                url_id=url_id,
+                                url=url,
+                                attempt=attempt_no,
+                                content_stats=self._text_stats(content),
+                                title_preview=self._preview(extracted.get("title"), 200),
+                            )
                             
                             return record
-                        else:
+                    else:
                             error_msg = result.error_message or 'unknown'
                             last_error = f"fetch_failed:{error_msg}"
-                            logger.warning(f"fetch_failed url={url} proxy={'direct' if not current_proxy else 'proxy'}")
+                            self._trace(
+                                "fetch_attempt_failed",
+                                url_id=url_id,
+                                url=url,
+                                attempt=attempt_no,
+                                duration_ms=dt_ms,
+                                proxy_mode="proxy" if current_proxy else "direct",
+                                error_message=error_msg,
+                            )
+                            logger.warning(f"fetch_failed url={url} attempt={attempt_no} proxy={'direct' if not current_proxy else 'proxy'} err={error_msg}")
                             
                 except Exception as e:
                     last_error = str(e)
-                    logger.warning(f"fetch_exception url={url}")
+                    self._trace(
+                        "fetch_attempt_exception",
+                        url_id=url_id,
+                        url=url,
+                        attempt=attempt + 1,
+                        proxy_mode="proxy" if current_proxy else "direct",
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                    logger.warning(f"fetch_exception url={url} attempt={attempt + 1} err={type(e).__name__}:{e}")
                 
                 # 如果不是最后一次尝试，等待后重试
                 if attempt < self.retry_attempts - 1:
@@ -632,6 +1039,13 @@ class NewsCrawler:
                     self.stats["retries"] += 1
             
             # 所有重试都失败
+            self._trace(
+                "final_fetch_failed",
+                url_id=url_id,
+                url=url,
+                retries=self.retry_attempts,
+                last_error=last_error,
+            )
             self.url_pool_builder.update_status(url_id, "failed", last_error)
             self.stats["failed"] += 1
             return None

@@ -30,6 +30,17 @@ def setup_logger(config: Config):
         retention="30 days",
         compression="zip"
     )
+
+    # 精简爬虫追踪日志（JSONL）：仅记录显式标记 trace=True 的事件，便于定位失败链路/LLM I/O
+    logger.add(
+        log_dir / "crawl_trace_{time:YYYY-MM-DD}.jsonl",
+        level="DEBUG",
+        rotation="00:00",
+        retention="30 days",
+        compression="zip",
+        serialize=True,
+        filter=lambda record: record["extra"].get("trace") is True,
+    )
     
     # 添加错误日志文件
     logger.add(
@@ -42,4 +53,3 @@ def setup_logger(config: Config):
     )
     
     return logger
-
