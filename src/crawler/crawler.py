@@ -32,7 +32,7 @@ class ArticleLLMOutput(BaseModel):
     """用于 LLMExtractionStrategy 的结构化输出定义（只强制 content）"""
     
     title: Optional[str] = Field(None, description="Headline of the article (optional, keep original wording if present)")
-    summary: Optional[str] = Field(None, description="Leave empty/null; no summarization needed")
+    summary: Optional[str] = Field(None, description="Short a summary if meta description is absent")
     content: str = Field(..., description="Full article body text, verbatim, no paraphrasing or summarization")
     published_at: Optional[str] = Field(None, description="ISO8601 publish datetime if available, else null")
     language: Optional[str] = Field(None, description="Primary language code, e.g., en")
@@ -217,8 +217,9 @@ class NewsCrawler:
                     query_result = await crawler.arun(url=archive_query_url, config=run_config)
                 else:
                     query_result = await crawler.arun(url=archive_query_url)
-                
+            
                 if not query_result.success or not query_result.html:
+                    logger.warning(f"archive_fetch_failed url={original_url}")
                     return None
                 
                 # 解析 archive.is 页面，查找存档链接
@@ -265,45 +266,54 @@ class NewsCrawler:
                     if len(page_text) > 1000:
                         archive_link = archive_query_url
                 
-                if archive_link:
-                    # 访问存档页面
-                    if run_config:
-                        archive_result = await crawler.arun(url=archive_link, config=run_config)
+                if not archive_link:
+                    logger.warning(f"archive_link_not_found url={original_url}")
+                    return None
+                
+                # 访问存档页面
+                if run_config:
+                    archive_result = await crawler.arun(url=archive_link, config=run_config)
+                else:
+                    archive_result = await crawler.arun(url=archive_link)
+                
+                if not archive_result.success or not archive_result.html:
+                    logger.warning(f"archive_content_fetch_failed url={original_url}")
+                    return None
+
+                # 处理 archive.is 的 markdown
+                archive_markdown = None
+                if hasattr(archive_result, 'markdown'):
+                    if isinstance(archive_result.markdown, str):
+                        archive_markdown = archive_result.markdown
+                    elif hasattr(archive_result.markdown, 'markdown'):
+                        archive_markdown = archive_result.markdown.markdown
+                    elif hasattr(archive_result.markdown, 'raw_markdown'):
+                        archive_markdown = archive_result.markdown.raw_markdown
                     else:
-                        archive_result = await crawler.arun(url=archive_link)
-                    
-                    if archive_result.success:
-                        # 处理 archive.is 的 markdown
-                        archive_markdown = None
-                        if hasattr(archive_result, 'markdown'):
-                            if isinstance(archive_result.markdown, str):
-                                archive_markdown = archive_result.markdown
-                            elif hasattr(archive_result.markdown, 'markdown'):
-                                archive_markdown = archive_result.markdown.markdown
-                            elif hasattr(archive_result.markdown, 'raw_markdown'):
-                                archive_markdown = archive_result.markdown.raw_markdown
-                            else:
-                                archive_markdown = str(archive_result.markdown)
-                        
-                        # 提取内容
-                        extracted = self.extractor.extract(
-                            html=archive_result.html,
-                            markdown=archive_markdown,
-                            url=original_url,
-                            source_name="",
-                            gkg_date=None,
-                            themes=None
-                        )
-                        
-                        if extracted["content"] and len(extracted["content"].strip()) > 100:
-                            return {
-                                "content": extracted["content"],
-                                "title": extracted["title"],
-                                "summary": extracted["summary"]
-                            }
+                        archive_markdown = str(archive_result.markdown)
+                
+                # 提取内容
+                extracted = self.extractor.extract(
+                    html=archive_result.html,
+                    markdown=archive_markdown,
+                    url=original_url,
+                    source_name="",
+                    gkg_date=None,
+                    themes=None
+                )
+                
+                if extracted["content"] and len(extracted["content"].strip()) > 100:
+                    logger.info(f"archive_success url={original_url} via={archive_link}")
+                    return {
+                        "content": extracted["content"],
+                        "title": extracted["title"],
+                        "summary": extracted["summary"]
+                    }
+                else:
+                    logger.warning(f"archive_content_too_short url={original_url} via={archive_link}")
         
         except Exception as e:
-            logger.debug(f"尝试 archive.is 失败 {original_url}: {e}")
+            logger.warning(f"archive_exception url={original_url}")
         
         return None
 
@@ -326,9 +336,9 @@ class NewsCrawler:
                     logger.info(f"LLM 提取成功: {url}")
                     return parsed
             else:
-                logger.warning(f"LLM 提取失败: {getattr(llm_result, 'error_message', 'unknown')}")
+                logger.warning(f"LLM 提取失败: {url}")
         except Exception as e:
-            logger.warning(f"LLM 提取异常，忽略: {e}")
+            logger.warning(f"LLM 提取异常，忽略: {url}")
         
         return None
 
@@ -515,13 +525,10 @@ class NewsCrawler:
                                 if isinstance(result.markdown, str):
                                     markdown = result.markdown
                                 elif hasattr(result.markdown, 'markdown'):
-                                    # 使用清理后的 markdown（PruningContentFilter 处理过的）
                                     markdown = result.markdown.markdown
                                 elif hasattr(result.markdown, 'raw_markdown'):
-                                    # 如果没有清理后的，使用原始 markdown
                                     markdown = result.markdown.raw_markdown
                                 else:
-                                    # 尝试转换为字符串
                                     markdown = str(result.markdown)
                             else:
                                 markdown = None
@@ -569,6 +576,19 @@ class NewsCrawler:
                                     extracted["content"] = content_from_llm
                                     content = extracted["content"]
                                     word_count = len(re.findall(r"[A-Za-z]+", content or ""))
+                                # 如果 summary 为空且 LLM 提供了摘要，则使用 LLM 摘要
+                                if not extracted.get("summary"):
+                                    llm_summary = llm_payload.get("summary")
+                                    if isinstance(llm_summary, list):
+                                        llm_summary = " ".join([str(x) for x in llm_summary])
+                                    if llm_summary:
+                                        extracted["summary"] = llm_summary
+                            
+                            # 如果仍然没有摘要，使用正文首段作为兜底，避免为空
+                            if not extracted.get("summary") and content:
+                                paragraphs = content.split('\n\n')
+                                if paragraphs:
+                                    extracted["summary"] = paragraphs[0][:500]
                             
                             if not content or word_count < self.extractor.min_word_threshold:
                                 last_error = f"content_too_short ({word_count} words)"
@@ -597,13 +617,13 @@ class NewsCrawler:
                             
                             return record
                         else:
-                            error_msg = f"爬取失败: {result.error_message or '未知错误'}"
-                            last_error = error_msg
-                            logger.warning(f"URL {url} 爬取失败: {error_msg}")
+                            error_msg = result.error_message or 'unknown'
+                            last_error = f"fetch_failed:{error_msg}"
+                            logger.warning(f"fetch_failed url={url} proxy={'direct' if not current_proxy else 'proxy'}")
                             
                 except Exception as e:
                     last_error = str(e)
-                    logger.error(f"URL {url} 爬取时发生异常: {e}")
+                    logger.warning(f"fetch_exception url={url}")
                 
                 # 如果不是最后一次尝试，等待后重试
                 if attempt < self.retry_attempts - 1:

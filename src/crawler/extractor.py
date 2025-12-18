@@ -624,12 +624,6 @@ class ContentExtractor:
         language = self.extract_language(html, url)
         tags = self.extract_tags(themes, url)
         
-        # 如果摘要为空，从正文首段生成
-        if not summary and content:
-            paragraphs = content.split('\n\n')
-            if paragraphs:
-                summary = paragraphs[0][:500]  # 最多 500 字符
-        
         return {
             "title": title,
             "summary": summary,
