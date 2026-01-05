@@ -1,1147 +1,557 @@
-"""Crawl4AI 爬虫模块"""
-import asyncio
+"""简单可用的 Crawl4AI 爬虫实现
+
+- 继承自 ``crawl4ai.hub.BaseCrawler``，对外暴露单一的 ``run`` 方法；
+- 依赖 ``Config``，但支持直接传入 dict，方便在测试中构造临时配置；
+- 输出与 ``utils.models.Record`` 对齐：每条爬取结果都序列化为一条 JSONL 记录。
+
+当前目标是「能跑且易测」，未特别优化扩展性或高级反爬策略。
+"""
+from __future__ import annotations
+
 import json
 import os
-import random
 import re
-import hashlib
 import time
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
 from loguru import logger
 
-try:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, LLMConfig
-    from crawl4ai.content_filter_strategy import PruningContentFilter
-    from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-    from crawl4ai.extraction_strategy import LLMExtractionStrategy
-except ImportError:
-    logger.error("Crawl4AI 未安装，请运行: pip install crawl4ai")
-    raise
-from pydantic import BaseModel, Field
+from crawl4ai import (
+    AsyncWebCrawler,
+    BrowserConfig,
+    CacheMode,
+    CrawlerRunConfig,
+    ProxyConfig,
+    UndetectedAdapter,
+)
+from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
+from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
+from crawl4ai.content_filter_strategy import PruningContentFilter
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from crawl4ai.proxy_strategy import RoundRobinProxyStrategy
 
-from freeproxy import freeproxy
+try:  # 型检查 / 运行时都尽量使用真实 BaseCrawler
+    from crawl4ai.hub import BaseCrawler
+except Exception:  # pragma: no cover - 旧版本 crawl4ai 没有 hub 时兜底
+    class BaseCrawler:  # type: ignore[override]
+        async def run(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            """Placeholder BaseCrawler when crawl4ai.hub is unavailable."""
+            raise RuntimeError("crawl4ai.hub.BaseCrawler is not available")
 
+from crawler.proxy_pool import ProxyManager
 from utils.config import Config
 from utils.models import Record
-from url_pool_builder.builder import URLPoolBuilder
-from .extractor import ContentExtractor
+from crawler.extractor import Extractor
 
 
-class ArticleLLMOutput(BaseModel):
-    """用于 LLMExtractionStrategy 的结构化输出定义（只强制 content）"""
-    
-    title: Optional[str] = Field(None, description="Headline of the article (optional, keep original wording if present)")
-    summary: Optional[str] = Field(None, description="Short a summary if meta description is absent")
-    content: str = Field(..., description="Full article body text, verbatim, no paraphrasing or summarization")
-    published_at: Optional[str] = Field(None, description="ISO8601 publish datetime if available, else null")
-    language: Optional[str] = Field(None, description="Primary language code, e.g., en")
-    tags: Optional[List[str]] = Field(None, description="Optional topical tags/keywords")
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S+")
 
 
-class NewsCrawler:
-    """新闻爬虫
-    
-    使用 Crawl4AI 进行异步爬取，支持：
-    - 并发控制（全局和每域名）
-    - 随机延迟
-    - User-Agent 轮换
-    - 代理支持
-    - 重试机制
-    - 内容提取
+@dataclass
+class _MdBlock:
+    heading: Optional[str]
+    lines: List[str]
+    content_chars: int
+
+
+class Crawler:
+    """基于 Crawl4AI 的新闻爬虫实现。
+
+    用法示例（在代码中/测试中调用）：
+
+    .. code-block:: python
+
+        config_dict = {"general": {"concurrent_crawls": 5}, "paths": {"processed_data_dir": "./data"}}
+        crawler = Crawler(config=config_dict, urls=["https://example.com"])
+        records = asyncio.run(crawler.run())
     """
-    
-    def __init__(self, config: Config, url_pool_builder: URLPoolBuilder):
-        self.config = config
-        self.url_pool_builder = url_pool_builder
-        self.extractor = ContentExtractor()
-        
-        # 配置参数
-        self.concurrent_crawls = config.concurrent_crawls
-        self.per_domain_concurrency = config.per_domain_concurrency
-        self.retry_attempts = config.retry_attempts
-        self.retry_delay_base = config.retry_delay_base
-        self.request_delay_min = config.request_delay_min
-        self.request_delay_max = config.request_delay_max
-        self.user_agents = config.user_agents
-        self.use_proxy = config.use_proxy
-        self.use_browser = config.use_browser
-        self.use_llm_extraction = config.use_llm_extraction
-        self.llm_mode = config.llm_mode
-        
-        # 输出目录
-        self.output_dir = config.processed_data_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 代理客户端
-        self.proxy_client = None
-        if self.use_proxy and freeproxy:
-            try:
-                # 尝试初始化代理客户端
-                # 注意：freeproxy 的具体 API 可能因版本而异，这里提供一个通用实现
-                proxy_sources = ["ProxylistProxiedSession"]
-                for source_name in config.proxy_sources:
-                    # 尝试动态获取代理源类
-                    try:
-                        if hasattr(freeproxy, source_name):
-                            source_class = getattr(freeproxy, source_name)
-                            proxy_sources.append(source_class)
-                    except Exception:
-                        logger.debug(f"无法加载代理源: {source_name}")
-                
-                if proxy_sources:
-                    # 根据 freeproxy 的实际 API 调整
-                    try:
-                        init_proxied_session_cfg = {'filter_rule': {'country_code': ['US']}}
-                        self.proxy_client = freeproxy.ProxiedSessionClient(proxy_sources=proxy_sources, init_proxied_session_cfg=init_proxied_session_cfg)
-                        logger.info("代理客户端初始化成功")
-                    except Exception as e:
-                        logger.warning(f"代理客户端初始化失败（可能 API 不匹配）: {e}")
-                        self.proxy_client = None
-                else:
-                    logger.warning("没有可用的代理源")
-            except Exception as e:
-                logger.warning(f"代理客户端初始化失败: {e}")
-                self.proxy_client = None
-        
-        # 域名并发控制
-        self.domain_semaphores: Dict[str, asyncio.Semaphore] = {}
-        
-        # 统计信息
-        self.stats = {
-            "total": 0,
-            "success": 0,
-            "failed": 0,
-            "retries": 0
-        }
 
-        # LLM 提取策略（可选）
-        self.llm_strategy = self._build_llm_strategy()
+    def __init__(
+        self,
+        config: "Config | dict | str | Path" = "config/settings.toml",
+        *,
+        source_path: Optional[Path] = None,
+        urls: Optional[List[str]] = None,
+        output_path: Optional[Path] = None,
+        proxy_file: Optional[Path] = None,
+        use_proxy: Optional[bool] = None,
+    ) -> None:
+        # Config 支持 dict，便于测试；字符串/Path 时走原来的 TOML 加载流程
+        if isinstance(config, Config):
+            self.config = config
+        elif isinstance(config, (str, Path, dict)):
+            self.config = Config(config)  # type: ignore[arg-type]
+        else:
+            raise TypeError(f"Unsupported config type: {type(config)!r}")
 
-        # 精准定位问题用的 trace（默认开启，输出到 logs/crawl_trace_YYYY-MM-DD.jsonl）
-        self._trace_enabled = os.getenv("FF_CRAWLER_TRACE", "1").lower() not in {"0", "false", "no", "off"}
-        self._dump_artifacts = os.getenv("FF_CRAWLER_DUMP_ARTIFACTS", "0").lower() in {"1", "true", "yes", "on"}
-        self._dump_on_failure = os.getenv("FF_CRAWLER_DUMP_ON_FAILURE", "1").lower() not in {"0", "false", "no", "off"}
-        try:
-            self._max_artifact_chars = int(os.getenv("FF_CRAWLER_MAX_ARTIFACT_CHARS", "200000"))
-        except Exception:
-            self._max_artifact_chars = 200000
-        self._artifact_dir = self.config.log_dir / "crawl_artifacts"
-        self._artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.source_path = source_path
+        self.urls = urls
+        self.output_path = output_path or self._default_output_path()
 
-    def _trace(self, event: str, **fields):
-        """仅用于定位链路问题的结构化日志（写入 crawl_trace*.jsonl）。"""
-        if not self._trace_enabled:
-            return
-        logger.bind(trace=True, component="crawler", event=event, **fields).debug(event)
+        # markdown 原始内容调试文件（与 output_path 同目录，同名加 .raw_md 后缀）
+        self._raw_markdown_path = self.output_path.with_suffix(self.output_path.suffix + ".raw_md")
 
-    def _sha256(self, text: Optional[str]) -> Optional[str]:
-        if text is None:
-            return None
-        if not isinstance(text, str):
-            text = str(text)
-        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+        # 记录 URL -> created_at 映射，便于将上游时间戳透传到 Record.published_at
+        self._url_meta: dict[str, str] = {}
 
-    def _preview(self, text: Optional[str], limit: int = 800) -> Optional[str]:
-        if text is None:
-            return None
-        if not isinstance(text, str):
-            text = str(text)
-        t = text.strip()
-        if len(t) <= limit:
-            return t
-        return t[:limit] + f"...(truncated,{len(t)} chars)"
-
-    def _text_stats(self, text: Optional[str]) -> Dict[str, int]:
-        if text is None:
-            return {"chars": 0, "words": 0}
-        if not isinstance(text, str):
-            text = str(text)
-        if not text:
-            return {"chars": 0, "words": 0}
-        chars = len(text)
-        words = len(re.findall(r"[A-Za-z]+", text))
-        return {"chars": chars, "words": words}
-
-    def _maybe_dump_artifact(self, *, url_id: str, kind: str, text: Optional[str], failure: bool = False) -> Optional[str]:
-        """可选落盘保存大段文本，避免把全文塞进日志。"""
-        if text is None:
-            return None
-        if not (self._dump_artifacts or (failure and self._dump_on_failure)):
-            return None
-        safe_kind = re.sub(r"[^a-zA-Z0-9_.-]+", "_", kind)[:80]
-        path = self._artifact_dir / f"{url_id}_{safe_kind}.txt"
-        payload = text[: self._max_artifact_chars]
-        try:
-            path.write_text(payload, encoding="utf-8", errors="replace")
-            return str(path)
-        except Exception:
-            return None
-    
-    def _get_proxy(self) -> Optional[str]:
-        """获取随机代理"""
-        if not self.proxy_client:
-            return None
-        
-        try:
-            # 根据 freeproxy 的实际 API 调整
-            # 可能的调用方式：
-            # 1. proxy_client.getrandomproxy()
-            # 2. proxy_client.get_proxy()
-            # 3. 其他方式
-            if hasattr(self.proxy_client, 'getrandomproxy'):
-                proxy = self.proxy_client.getrandomproxy()
-            elif hasattr(self.proxy_client, 'get_proxy'):
-                proxy = self.proxy_client.get_proxy()
-            else:
-                # 如果 API 不匹配，返回 None
-                logger.debug("代理客户端 API 不匹配，跳过代理")
-                return None
-            
-            # 确保返回的代理格式正确（如 "http://ip:port"）
-            if proxy and isinstance(proxy, str):
-                return proxy
-            return None
-        except Exception as e:
-            logger.debug(f"获取代理失败: {e}")
-            return None
-    
-    def _get_random_user_agent(self) -> str:
-        """获取随机 User-Agent"""
-        return random.choice(self.user_agents) if self.user_agents else ""
-    
-    def _get_domain_semaphore(self, domain: str) -> asyncio.Semaphore:
-        """获取域名的信号量（用于控制每域名并发）"""
-        if domain not in self.domain_semaphores:
-            self.domain_semaphores[domain] = asyncio.Semaphore(self.per_domain_concurrency)
-        return self.domain_semaphores[domain]
-
-    def _build_llm_strategy(self) -> Optional[LLMExtractionStrategy]:
-        """初始化 LLMExtractionStrategy（可选）"""
-        if not self.use_llm_extraction:
-            return None
-        
-        api_token = os.getenv(self.config.llm_api_key_env)
-        if not api_token and not self.config.llm_provider.startswith("ollama"):
-            logger.warning(f"未找到环境变量 {self.config.llm_api_key_env}，LLM 提取已禁用")
-            return None
-        
-        try:
-            llm_config = LLMConfig(
-                provider=self.config.llm_provider,
-                api_token=api_token,
-            )
-            
-            strategy = LLMExtractionStrategy(
-                llm_config=llm_config,
-                schema=ArticleLLMOutput.model_json_schema(),
-                extraction_type="schema",
-                instruction=self.config.llm_instruction,
-                chunk_token_threshold=self.config.llm_chunk_token_threshold,
-                overlap_rate=self.config.llm_overlap_rate,
-                apply_chunking=self.config.llm_apply_chunking,
-                input_format=self.config.llm_input_format,
-                extra_args={
-                    "temperature": self.config.llm_temperature,
-                    "max_tokens": self.config.llm_max_output_tokens,
-                },
-                verbose=False,
-            )
-            
-            logger.info(f"已启用 LLM 提取，provider={self.config.llm_provider}, mode={self.llm_mode}")
-            return strategy
-        except Exception as e:
-            logger.warning(f"初始化 LLMExtractionStrategy 失败，回退到规则提取: {e}")
-            return None
-    
-    async def _random_delay(self):
-        """随机延迟"""
-        delay = random.uniform(self.request_delay_min, self.request_delay_max)
-        await asyncio.sleep(delay)
-    
-    async def _try_archive_is(self, url_id: str, original_url: str, browser_config, run_config) -> Optional[Dict]:
-        """尝试使用 archive.is 获取存档内容以绕过 paywall
-        
-        archive.is 的工作方式：
-        1. 访问 https://archive.is/{url} 会显示存档列表
-        2. 最新的存档链接通常在页面中，格式类似 /newest/{timestamp} 或直接是完整URL
-        3. 访问存档链接后，页面会重定向或显示存档内容
-        """
-        try:
-            # 构建 archive.is 查询URL
-            archive_query_url = f"https://archive.is/{original_url}"
-            self._trace(
-                "archive_query_start",
-                url_id=url_id,
-                url=original_url,
-                archive_query_url=archive_query_url,
-                has_run_config=bool(run_config),
-            )
-            
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                # 先访问查询页面
-                if run_config:
-                    query_result = await crawler.arun(url=archive_query_url, config=run_config)
-                else:
-                    query_result = await crawler.arun(url=archive_query_url)
-            
-                if not query_result.success or not query_result.html:
-                    self._trace(
-                        "archive_query_failed",
-                        url_id=url_id,
-                        url=original_url,
-                        archive_query_url=archive_query_url,
-                        success=bool(getattr(query_result, "success", False)),
-                        error_message=getattr(query_result, "error_message", None),
-                        html_stats=self._text_stats(getattr(query_result, "html", None)),
-                    )
-                    logger.warning(f"archive_fetch_failed url={original_url} reason=query_page_fetch_failed")
-                    return None
-                
-                # 解析 archive.is 页面，查找存档链接
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(query_result.html, 'html.parser')
-                
-                archive_link = None
-                archive_link_method = None
-
-                # 优先根据 archive.is 的表格定位：//*[@id="row0"]/div[2]/a[1]
-                row0 = soup.find(id="row0")
-                if row0:
-                    divs = row0.find_all("div")
-                    if len(divs) >= 2:
-                        anchors = divs[1].find_all("a", href=True)
-                        if anchors:
-                            href = anchors[0].get("href", "")
-                            if href.startswith("/"):
-                                archive_link = f"https://archive.is{href}"
-                                archive_link_method = "row0_first_link"
-                            elif href.startswith("http"):
-                                archive_link = href
-                                archive_link_method = "row0_first_link"
-                
-                # 备选方案：查找包含 /newest/ 或 /web/ 的链接
-                if not archive_link:
-                    for link in soup.find_all('a', href=True):
-                        href = link.get('href', '')
-                        if '/newest/' in href or '/web/' in href:
-                            if href.startswith('/'):
-                                archive_link = f"https://archive.is{href}"
-                                archive_link_method = "newest_or_web_link"
-                            elif href.startswith('http'):
-                                archive_link = href
-                                archive_link_method = "newest_or_web_link"
-                            break
-                
-                # 再次备选：查找包含原始 URL 的存档链接
-                if not archive_link:
-                    for link in soup.find_all('a', href=True):
-                        href = link.get('href', '')
-                        if original_url in href and 'archive.is' in href:
-                            archive_link = href
-                            archive_link_method = "contains_original_url"
-                            break
-                
-                # 最后兜底：当前页面足够长则直接尝试
-                if not archive_link:
-                    page_text = soup.get_text()
-                    if len(page_text) > 1000:
-                        archive_link = archive_query_url
-                        archive_link_method = "fallback_use_query_page"
-                
-                if not archive_link:
-                    self._trace(
-                        "archive_link_not_found",
-                        url_id=url_id,
-                        url=original_url,
-                        archive_query_url=archive_query_url,
-                        query_html_stats=self._text_stats(query_result.html),
-                    )
-                    logger.warning(f"archive_link_not_found url={original_url}")
-                    return None
-
-                self._trace(
-                    "archive_link_selected",
-                    url_id=url_id,
-                    url=original_url,
-                    archive_query_url=archive_query_url,
-                    archive_link=archive_link,
-                    method=archive_link_method,
-                )
-                
-                # 访问存档页面
-                if run_config:
-                    archive_result = await crawler.arun(url=archive_link, config=run_config)
-                else:
-                    archive_result = await crawler.arun(url=archive_link)
-                
-                if not archive_result.success or not archive_result.html:
-                    self._trace(
-                        "archive_content_fetch_failed",
-                        url_id=url_id,
-                        url=original_url,
-                        archive_link=archive_link,
-                        success=bool(getattr(archive_result, "success", False)),
-                        error_message=getattr(archive_result, "error_message", None),
-                        html_stats=self._text_stats(getattr(archive_result, "html", None)),
-                    )
-                    logger.warning(f"archive_content_fetch_failed url={original_url}")
-                    return None
-
-                # 处理 archive.is 的 markdown
-                archive_markdown = None
-                if hasattr(archive_result, 'markdown'):
-                    if isinstance(archive_result.markdown, str):
-                        archive_markdown = archive_result.markdown
-                    elif hasattr(archive_result.markdown, 'markdown'):
-                        archive_markdown = archive_result.markdown.markdown
-                    elif hasattr(archive_result.markdown, 'raw_markdown'):
-                        archive_markdown = archive_result.markdown.raw_markdown
-                    else:
-                        archive_markdown = str(archive_result.markdown)
-                
-                # 提取内容
-                extracted = self.extractor.extract(
-                    html=archive_result.html,
-                    markdown=archive_markdown,
-                    url=original_url,
-                    source_name="",
-                    gkg_date=None,
-                    themes=None
-                )
-
-                content_stats = self._text_stats(extracted.get("content"))
-                self._trace(
-                    "archive_extracted",
-                    url_id=url_id,
-                    url=original_url,
-                    archive_link=archive_link,
-                    html_stats=self._text_stats(archive_result.html),
-                    markdown_stats=self._text_stats(archive_markdown),
-                    content_stats=content_stats,
-                    title_preview=self._preview(extracted.get("title"), 200),
-                )
-                
-                if extracted["content"] and len(extracted["content"].strip()) > 100:
-                    logger.info(f"archive_success url={original_url} via={archive_link}")
-                    return {
-                        "content": extracted["content"],
-                        "title": extracted["title"],
-                        "summary": extracted["summary"]
-                    }
-                else:
-                    html_path = self._maybe_dump_artifact(
-                        url_id=url_id,
-                        kind="archive_html",
-                        text=archive_result.html,
-                        failure=True,
-                    )
-                    md_path = self._maybe_dump_artifact(
-                        url_id=url_id,
-                        kind="archive_markdown",
-                        text=archive_markdown,
-                        failure=True,
-                    )
-                    self._trace(
-                        "archive_content_too_short",
-                        url_id=url_id,
-                        url=original_url,
-                        archive_link=archive_link,
-                        content_stats=content_stats,
-                        content_sha256=self._sha256(extracted.get("content")),
-                        content_preview=self._preview(extracted.get("content")),
-                        archive_html_path=html_path,
-                        archive_markdown_path=md_path,
-                    )
-                    logger.warning(f"archive_content_too_short url={original_url} via={archive_link}")
-        
-        except Exception as e:
-            self._trace(
-                "archive_exception",
-                url_id=url_id,
-                url=original_url,
-                error_type=type(e).__name__,
-                error=str(e),
-            )
-            logger.warning(f"archive_exception url={original_url} err={type(e).__name__}:{e}")
-        
-        return None
-
-    async def _run_llm_extraction(self, url_id: str, url: str, base_run_config_kwargs: Dict, browser_config) -> Optional[Dict]:
-        """在需要时触发 LLM 提取（重用同一套反爬配置）"""
-        if not self.llm_strategy:
-            return None
-        
-        llm_run_kwargs = dict(base_run_config_kwargs)
-        llm_run_kwargs["extraction_strategy"] = self.llm_strategy
-        run_config_llm = CrawlerRunConfig(**llm_run_kwargs)
-        
-        try:
-            t0 = time.monotonic()
-            self._trace(
-                "llm_fallback_start",
-                url_id=url_id,
-                url=url,
-                llm_provider=self.config.llm_provider,
-                llm_input_format=self.config.llm_input_format,
-                chunk_token_threshold=self.config.llm_chunk_token_threshold,
-                apply_chunking=self.config.llm_apply_chunking,
-            )
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                llm_result = await crawler.arun(url=url, config=run_config_llm)
-            dt_ms = int((time.monotonic() - t0) * 1000)
-
-            llm_html = getattr(llm_result, "html", None)
-            llm_md = None
-            if hasattr(llm_result, "markdown"):
-                if isinstance(llm_result.markdown, str):
-                    llm_md = llm_result.markdown
-                elif hasattr(llm_result.markdown, "markdown"):
-                    llm_md = llm_result.markdown.markdown
-                elif hasattr(llm_result.markdown, "raw_markdown"):
-                    llm_md = llm_result.markdown.raw_markdown
-                else:
-                    llm_md = str(llm_result.markdown)
-            llm_raw = getattr(llm_result, "extracted_content", None)
-
-            llm_html_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=False)
-            llm_md_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=False)
-            llm_raw_path = self._maybe_dump_artifact(
-                url_id=url_id,
-                kind="llm_fallback_output_raw",
-                text=str(llm_raw) if llm_raw is not None else None,
-                failure=False,
-            )
-            self._trace(
-                "llm_fallback_crawl_done",
-                url_id=url_id,
-                url=url,
-                duration_ms=dt_ms,
-                success=bool(getattr(llm_result, "success", False)),
-                error_message=getattr(llm_result, "error_message", None),
-                html_stats=self._text_stats(llm_html),
-                markdown_stats=self._text_stats(llm_md),
-                llm_raw_stats=self._text_stats(llm_raw),
-                llm_raw_sha256=self._sha256(llm_raw),
-                llm_raw_preview=self._preview(llm_raw),
-                llm_html_path=llm_html_path,
-                llm_markdown_path=llm_md_path,
-                llm_output_path=llm_raw_path,
-            )
-            
-            if llm_result.success and getattr(llm_result, "extracted_content", None):
-                parsed = self._parse_llm_content(llm_result.extracted_content)
-                if parsed:
-                    content_stats = self._text_stats(parsed.get("content"))
-                    self._trace(
-                        "llm_fallback_parsed",
-                        url_id=url_id,
-                        url=url,
-                        content_stats=content_stats,
-                        title_preview=self._preview(parsed.get("title"), 200),
-                        summary_preview=self._preview(parsed.get("summary"), 200),
-                    )
-                    logger.info(f"LLM 提取成功: {url}")
-                    return parsed
-                else:
-                    # 解析失败：为定位问题，按需落盘输入/输出
-                    llm_html_fail_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=True)
-                    llm_md_fail_path = self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=True)
-                    llm_raw_fail_path = self._maybe_dump_artifact(
-                        url_id=url_id,
-                        kind="llm_fallback_output_raw",
-                        text=str(llm_raw) if llm_raw is not None else None,
-                        failure=True,
-                    )
-                    self._trace(
-                        "llm_fallback_parse_failed",
-                        url_id=url_id,
-                        url=url,
-                        llm_raw_sha256=self._sha256(llm_raw),
-                        llm_raw_preview=self._preview(llm_raw),
-                        llm_html_path=llm_html_fail_path,
-                        llm_markdown_path=llm_md_fail_path,
-                        llm_output_path=llm_raw_fail_path,
-                    )
-            else:
-                # 爬取/抽取失败：按需落盘便于诊断
-                self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_html", text=llm_html, failure=True)
-                self._maybe_dump_artifact(url_id=url_id, kind="llm_fallback_markdown", text=llm_md, failure=True)
-                self._maybe_dump_artifact(
-                    url_id=url_id,
-                    kind="llm_fallback_output_raw",
-                    text=str(llm_raw) if llm_raw is not None else None,
-                    failure=True,
-                )
-                logger.warning(f"LLM 提取失败: {url}")
-        except Exception as e:
-            self._trace(
-                "llm_fallback_exception",
-                url_id=url_id,
-                url=url,
-                error_type=type(e).__name__,
-                error=str(e),
-            )
-            logger.warning(f"LLM 提取异常，忽略: {url} err={type(e).__name__}:{e}")
-        
-        return None
-
-    def _parse_llm_content(self, content: str) -> Optional[Dict]:
-        """解析 LLM 返回的 JSON 内容"""
-        if not content:
-            return None
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list) and parsed:
-                parsed = parsed[0]
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception as e:
-            logger.debug(f"解析 LLM JSON 失败: {e}")
-        return None
-
-    def _is_proxy_error_content(self, text: Optional[str]) -> bool:
-        """检测返回内容是否为代理错误提示，避免把错误页当正文"""
-        if not text:
-            return False
-        indicators = [
-            "using socks proxy", "socksio", "install httpx[socks]",
-            "proxyerror", "proxy error", "proxy connection failed"
-        ]
-        lower = text.lower()
-        return any(ind in lower for ind in indicators)
-    
-    async def _crawl_url(self, url_info: Dict) -> Optional[Record]:
-        """爬取单个 URL"""
-        url_id = url_info["id"]
-        url = url_info["url"]
-        domain = url_info["domain"]
-        source_name = url_info.get("source_name", "")
-        gkg_date = url_info.get("gkg_date")
-        themes = url_info.get("themes")
-
-        self._trace(
-            "crawl_start",
-            url_id=url_id,
-            url=url,
-            domain=domain,
-            source_name=source_name,
-            use_proxy=self.use_proxy,
-            use_browser=self.use_browser,
-            use_llm_extraction=bool(self.llm_strategy),
-            llm_mode=self.llm_mode if self.llm_strategy else None,
-            min_word_threshold=self.extractor.min_word_threshold,
+        self.proxy_manager = ProxyManager(
+            proxy_file=proxy_file,
+            use_proxy=self.config.use_proxy if use_proxy is None else use_proxy,
         )
-        
-        # 获取域名信号量
-        semaphore = self._get_domain_semaphore(domain)
-        
-        async with semaphore:
-            # 随机延迟
-            await self._random_delay()
-            
-            # 准备配置
-            user_agent = self._get_random_user_agent()
-            proxy = self._get_proxy() if self.use_proxy else None
-            
-            # 构建 source 字段
-            source = f"news/{domain}"
-            
-            # 配置浏览器
-            browser_config = None
-            if self.use_browser:
-                browser_config = BrowserConfig(
-                    headless=self.config.browser_headless,
-                    user_agent_mode="random"
-                )
-            
-            # 配置内容过滤器 - 使用 PruningContentFilter 移除导航、侧边栏等
-            # 根据 Crawl4AI 文档，PruningContentFilter 可以自动识别并移除非主要内容
-            # 尝试配置排除选择器来移除更多无关元素
-            try:
-                # 尝试配置排除选择器（如果 API 支持）
-                exclude_selectors = [
-                    'nav', 'header', 'footer', 'aside', '.nav', '.navigation', 
-                    '.navbar', '.menu', '.sidebar', '.advertisement', '.ad',
-                    '.social', '.share', '.subscribe', '.newsletter', '.cookie',
-                    '.breadcrumb', '.tags', '.related', '.comments', '.trending'
-                ]
-                
-                pruning_kwargs = {
-                    "threshold": 0.52,
-                    "threshold_type": "fixed",
-                    "min_word_threshold": self.extractor.min_word_threshold,
-                    "exclude_selectors": exclude_selectors,
-                }
 
-                # 尝试使用增强的参数（如 threshold/min_word_threshold）
-                try:
-                    content_filter = PruningContentFilter(**pruning_kwargs)
-                except TypeError:
-                    # 如果当前版本不支持这些参数，降级为默认配置
-                    logger.debug("PruningContentFilter 参数不兼容，使用默认配置")
-                    content_filter = PruningContentFilter()
-            except Exception as e:
-                logger.debug(f"无法创建 PruningContentFilter: {e}")
-                content_filter = None
-            
-            # 配置 Markdown 生成器 - 使用内容过滤器
-            try:
-                if content_filter:
-                    markdown_generator = DefaultMarkdownGenerator(content_filter=content_filter)
-                else:
-                    markdown_generator = DefaultMarkdownGenerator()
-            except Exception as e:
-                logger.debug(f"无法创建 DefaultMarkdownGenerator: {e}")
-                markdown_generator = None
-            
-            # 配置运行参数
-            # 注意：Crawl4AI 的 RunConfig API 可能因版本而异
-            # 这里提供一个兼容性实现
-            run_config_kwargs = {}
-            if user_agent:
-                run_config_kwargs["user_agent"] = user_agent
-            if proxy:
-                run_config_kwargs["proxy"] = proxy
-            if self.use_browser:
-                run_config_kwargs["wait_for"] = "body"  # 等待 body 加载
-                run_config_kwargs["page_timeout"] = self.config.browser_timeout * 1000
-            
-            # 设置 Markdown 生成器（如果可用）
-            if markdown_generator:
-                try:
-                    run_config_kwargs["markdown_generator"] = markdown_generator
-                except Exception as e:
-                    logger.debug(f"无法设置 markdown_generator: {e}")
-            
-            # 尝试使用内容选择器来提取主要内容
-            # 根据 Crawl4AI 文档，可以使用 content_selector 参数
-            # 优先选择 article, main 等主要内容容器
-            try:
-                # 尝试设置内容选择器（如果 API 支持）
-                if hasattr(CrawlerRunConfig, 'content_selector'):
-                    run_config_kwargs["content_selector"] = "article, main, [role='article'], .article-content, .article-body, .post-content, .entry-content, .story-body, .content-body"
-                elif hasattr(CrawlerRunConfig, 'css_selector'):
-                    run_config_kwargs["css_selector"] = "article, main, [role='article'], .article-content, .article-body, .post-content, .entry-content, .story-body, .content-body"
-            except Exception as e:
-                logger.debug(f"无法设置内容选择器: {e}")
-            
-            base_run_config_kwargs = dict(run_config_kwargs)
+        self._extractor = Extractor("")  # 先初始化为空，后续重新创建
 
-            if self.llm_strategy and self.llm_mode == "always":
-                run_config_kwargs["extraction_strategy"] = self.llm_strategy
-            
-            run_config = CrawlerRunConfig(**run_config_kwargs) if run_config_kwargs else None
-            
-            # 重试逻辑
-            last_error = None
-            current_proxy = proxy
-            for attempt in range(self.retry_attempts):
-                # 每次尝试根据当前代理重建 run_config
-                if base_run_config_kwargs is not None:
-                    attempt_kwargs = dict(base_run_config_kwargs)
-                    if current_proxy:
-                        attempt_kwargs["proxy"] = current_proxy
-                    else:
-                        attempt_kwargs.pop("proxy", None)
-                    if self.llm_strategy and self.llm_mode == "always":
-                        attempt_kwargs["extraction_strategy"] = self.llm_strategy
-                    run_config = CrawlerRunConfig(**attempt_kwargs) if attempt_kwargs else None
-                try:
-                    attempt_no = attempt + 1
-                    t0 = time.monotonic()
-                    self._trace(
-                        "fetch_attempt_start",
-                        url_id=url_id,
-                        url=url,
-                        attempt=attempt_no,
-                        proxy_mode="proxy" if current_proxy else "direct",
-                        has_run_config=bool(run_config),
-                        use_browser=self.use_browser,
-                    )
-                    async with AsyncWebCrawler(config=browser_config) as crawler:
-                        # Crawl4AI 的 arun 方法参数可能因版本而异
-                        if run_config:
-                            result = await crawler.arun(url=url, config=run_config)
-                        else:
-                            # 如果没有 run_config，直接传递参数
-                            result = await crawler.arun(
-                                url=url,
-                                user_agent=user_agent if user_agent else None,
-                                proxy=current_proxy if current_proxy else None
-                            )
-                    dt_ms = int((time.monotonic() - t0) * 1000)
-                        
-                    if result.success:
-                            # 代理错误页检测：如果返回的是代理错误提示，触发重试并改用直连
-                            if self._is_proxy_error_content(result.html):
-                                last_error = "proxy_error_content"
-                                self._trace(
-                                    "proxy_error_content",
-                                    url_id=url_id,
-                                    url=url,
-                                    attempt=attempt_no,
-                                    duration_ms=dt_ms,
-                                    html_stats=self._text_stats(getattr(result, "html", None)),
-                                )
-                                logger.warning(f"proxy_error_content url={url} attempt={attempt_no} action=switch_to_direct")
-                                current_proxy = None
-                                continue
+        # 从独立配置文件加载域名 -> main content CSS selectors 映射
+        # 配置文件路径: config/main_content_selectors.json
+        # 对于每个域名，可以同时配置:
+        #   - targets:   只抓取这些容器内的正文
+        #   - exclude:   显式排除这些容器（如导航栏、推荐区等）
+        (
+            self._domain_target_selectors,
+            self._domain_excluded_selectors,
+        ) = self._load_domain_selectors()
 
-                            # 提取内容
-                            html = result.html
-                            
-                            # 处理 markdown - Crawl4AI 的 markdown 可能是对象或字符串
-                            # 根据文档，如果使用了 DefaultMarkdownGenerator，markdown 是一个对象
-                            if hasattr(result, 'markdown'):
-                                if isinstance(result.markdown, str):
-                                    markdown = result.markdown
-                                elif hasattr(result.markdown, 'markdown'):
-                                    markdown = result.markdown.markdown
-                                elif hasattr(result.markdown, 'raw_markdown'):
-                                    markdown = result.markdown.raw_markdown
-                                else:
-                                    markdown = str(result.markdown)
-                            else:
-                                markdown = None
+    # ------------------------------------------------------------------
+    # 公共 API
+    # ------------------------------------------------------------------
+    async def run(self) -> List[Record]:  # type: ignore[override]
+        """运行爬虫并返回 `Record` 列表。
 
-                            self._trace(
-                                "fetch_attempt_success",
-                                url_id=url_id,
-                                url=url,
-                                attempt=attempt_no,
-                                duration_ms=dt_ms,
-                                proxy_mode="proxy" if current_proxy else "direct",
-                                html_stats=self._text_stats(html),
-                                markdown_stats=self._text_stats(markdown),
-                            )
-
-                            extracted = self.extractor.extract(
-                                html=html,
-                                markdown=markdown,
-                                url=url,
-                                source_name=source_name,
-                                gkg_date=gkg_date,
-                                themes=themes
-                            )
-
-                            llm_payload = None
-                            llm_raw = None
-                            if self.llm_strategy and self.llm_mode == "always":
-                                llm_raw = getattr(result, "extracted_content", None)
-                                llm_payload = self._parse_llm_content(llm_raw)
-                                html_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_html", text=html, failure=False)
-                                md_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_markdown", text=markdown, failure=False)
-                                llm_raw_path = self._maybe_dump_artifact(
-                                    url_id=url_id,
-                                    kind="llm_always_output_raw",
-                                    text=str(llm_raw) if llm_raw is not None else None,
-                                    failure=False,
-                                )
-                                self._trace(
-                                    "llm_always_done",
-                                    url_id=url_id,
-                                    url=url,
-                                    attempt=attempt_no,
-                                    llm_provider=self.config.llm_provider,
-                                    llm_input_format=self.config.llm_input_format,
-                                    llm_raw_stats=self._text_stats(llm_raw),
-                                    llm_raw_sha256=self._sha256(llm_raw),
-                                    llm_raw_preview=self._preview(llm_raw),
-                                    parsed_ok=bool(llm_payload),
-                                    fetch_html_path=html_path,
-                                    fetch_markdown_path=md_path,
-                                    llm_output_path=llm_raw_path,
-                                )
-                                if llm_payload:
-                                    self._trace(
-                                        "llm_always_parsed",
-                                        url_id=url_id,
-                                        url=url,
-                                        content_stats=self._text_stats(llm_payload.get("content")),
-                                        title_preview=self._preview(llm_payload.get("title"), 200),
-                                        summary_preview=self._preview(llm_payload.get("summary"), 200),
-                                    )
-
-                            content_stats = self._text_stats(extracted.get("content"))
-                            self._trace(
-                                "rule_extracted",
-                                url_id=url_id,
-                                url=url,
-                                attempt=attempt_no,
-                                title_preview=self._preview(extracted.get("title"), 200),
-                                summary_preview=self._preview(extracted.get("summary"), 200),
-                                content_stats=content_stats,
-                            )
-                            
-                            # 检查内容是否为空（可能是paywall）
-                            content = extracted["content"]
-                            if (not content or len(content.strip()) < 100) and llm_payload is None:
-                                # 尝试使用 archive.is 绕过 paywall
-                                self._trace(
-                                    "archive_trigger",
-                                    url_id=url_id,
-                                    url=url,
-                                    reason="content_empty_or_short",
-                                    content_stats=self._text_stats(content),
-                                )
-                                logger.info(f"content_empty_or_short_try_archive url={url}")
-                                archive_result = await self._try_archive_is(url_id, url, browser_config, run_config)
-                                
-                                if archive_result and archive_result.get("content"):
-                                    extracted["content"] = archive_result["content"]
-                                    if not extracted["title"] or extracted["title"] == url:
-                                        extracted["title"] = archive_result.get("title", extracted["title"])
-                                    if not extracted["summary"]:
-                                        extracted["summary"] = archive_result.get("summary", extracted["summary"])
-                                    content = extracted["content"]
-                                    self._trace(
-                                        "archive_applied",
-                                        url_id=url_id,
-                                        url=url,
-                                        content_stats=self._text_stats(content),
-                                    )
-                                    logger.info(f"archive_applied url={url}")
-
-                            # LLM fallback: 在规则提取仍不足时触发
-                            word_count = len(re.findall(r"[A-Za-z]+", content or ""))
-                            if self.llm_strategy and self.llm_mode == "fallback" and word_count < self.extractor.min_word_threshold:
-                                llm_payload = await self._run_llm_extraction(url_id, url, base_run_config_kwargs, browser_config)
-                            
-                            if llm_payload:
-                                # 仅使用 LLM 提供的正文，避免任何摘要/改写被写入其它字段
-                                content_from_llm = llm_payload.get("content") or ""
-                                if isinstance(content_from_llm, list):
-                                    content_from_llm = " ".join([str(x) for x in content_from_llm])
-                                if content_from_llm:
-                                    extracted["content"] = content_from_llm
-                                    content = extracted["content"]
-                                    word_count = len(re.findall(r"[A-Za-z]+", content or ""))
-                                # 如果 summary 为空且 LLM 提供了摘要，则使用 LLM 摘要
-                                if not extracted.get("summary"):
-                                    llm_summary = llm_payload.get("summary")
-                                    if isinstance(llm_summary, list):
-                                        llm_summary = " ".join([str(x) for x in llm_summary])
-                                    if llm_summary:
-                                        extracted["summary"] = llm_summary
-
-                                self._trace(
-                                    "llm_payload_applied",
-                                    url_id=url_id,
-                                    url=url,
-                                    content_stats=self._text_stats(extracted.get("content")),
-                                    summary_preview=self._preview(extracted.get("summary"), 200),
-                                )
-                            
-                            # 如果仍然没有摘要，使用正文首段作为兜底，避免为空
-                            if not extracted.get("summary") and content:
-                                paragraphs = content.split('\n\n')
-                                if paragraphs:
-                                    extracted["summary"] = paragraphs[0][:500]
-                            
-                            if not content or word_count < self.extractor.min_word_threshold:
-                                last_error = f"content_too_short:words={word_count}"
-                                content_path = self._maybe_dump_artifact(url_id=url_id, kind="final_content", text=content, failure=True)
-                                fetch_html_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_html", text=html, failure=True)
-                                fetch_markdown_path = self._maybe_dump_artifact(url_id=url_id, kind="fetch_markdown", text=markdown, failure=True)
-                                llm_output_path = self._maybe_dump_artifact(
-                                    url_id=url_id,
-                                    kind="llm_output_raw_on_failure",
-                                    text=str(llm_raw) if llm_raw is not None else None,
-                                    failure=True,
-                                )
-                                llm_payload_path = self._maybe_dump_artifact(
-                                    url_id=url_id,
-                                    kind="llm_payload_on_failure",
-                                    text=json.dumps(llm_payload, ensure_ascii=False) if isinstance(llm_payload, dict) else None,
-                                    failure=True,
-                                )
-                                self._trace(
-                                    "final_content_too_short",
-                                    url_id=url_id,
-                                    url=url,
-                                    word_count=word_count,
-                                    min_word_threshold=self.extractor.min_word_threshold,
-                                    content_stats=self._text_stats(content),
-                                    content_sha256=self._sha256(content),
-                                    content_preview=self._preview(content),
-                                    content_path=content_path,
-                                    fetch_html_path=fetch_html_path,
-                                    fetch_markdown_path=fetch_markdown_path,
-                                    llm_output_path=llm_output_path,
-                                    llm_payload_path=llm_payload_path,
-                                )
-                                logger.warning(f"content_too_short url={url} words={word_count} min_words={self.extractor.min_word_threshold}")
-                                self.url_pool_builder.update_status(url_id, "failed", last_error)
-                                self.stats["failed"] += 1
-                                return None
-
-                            # 创建 Record
-                            record = Record(
-                                id=str(uuid.uuid4()),
-                                source=source,
-                                url=url,
-                                title=extracted["title"],
-                                summary=extracted["summary"],
-                                content=content,
-                                published_at=extracted["published_at"],
-                                language=extracted["language"],
-                                tags=extracted["tags"]
-                            )
-                            
-                            # 更新状态为成功
-                            self.url_pool_builder.update_status(url_id, "success")
-                            self.stats["success"] += 1
-
-                            self._trace(
-                                "final_success",
-                                url_id=url_id,
-                                url=url,
-                                attempt=attempt_no,
-                                content_stats=self._text_stats(content),
-                                title_preview=self._preview(extracted.get("title"), 200),
-                            )
-                            
-                            return record
-                    else:
-                            error_msg = result.error_message or 'unknown'
-                            last_error = f"fetch_failed:{error_msg}"
-                            self._trace(
-                                "fetch_attempt_failed",
-                                url_id=url_id,
-                                url=url,
-                                attempt=attempt_no,
-                                duration_ms=dt_ms,
-                                proxy_mode="proxy" if current_proxy else "direct",
-                                error_message=error_msg,
-                            )
-                            logger.warning(f"fetch_failed url={url} attempt={attempt_no} proxy={'direct' if not current_proxy else 'proxy'} err={error_msg}")
-                            
-                except Exception as e:
-                    last_error = str(e)
-                    self._trace(
-                        "fetch_attempt_exception",
-                        url_id=url_id,
-                        url=url,
-                        attempt=attempt + 1,
-                        proxy_mode="proxy" if current_proxy else "direct",
-                        error_type=type(e).__name__,
-                        error=str(e),
-                    )
-                    logger.warning(f"fetch_exception url={url} attempt={attempt + 1} err={type(e).__name__}:{e}")
-                
-                # 如果不是最后一次尝试，等待后重试
-                if attempt < self.retry_attempts - 1:
-                    delay = self.retry_delay_base * (2 ** attempt)  # 指数退避
-                    await asyncio.sleep(delay)
-                    self.stats["retries"] += 1
-            
-            # 所有重试都失败
-            self._trace(
-                "final_fetch_failed",
-                url_id=url_id,
-                url=url,
-                retries=self.retry_attempts,
-                last_error=last_error,
-            )
-            self.url_pool_builder.update_status(url_id, "failed", last_error)
-            self.stats["failed"] += 1
-            return None
-    
-    async def _crawl_batch(self, url_batch: List[Dict]) -> List[Record]:
-        """批量爬取 URL"""
-        tasks = [self._crawl_url(url_info) for url_info in url_batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        records = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"爬取任务异常: {result}")
-            elif result is not None:
-                records.append(result)
-        
-        return records
-    
-    def _save_records(self, records: List[Record], date_str: Optional[str] = None):
-        """保存记录到文件"""
-        if not records:
-            return
-        
-        # 如果没有指定日期，使用当前日期
-        if not date_str:
-            date_str = datetime.now().strftime("%Y%m%d")
-        
-        # 保存为 JSONL 格式
-        output_file = self.output_dir / f"{date_str}_records.jsonl"
-        
-        with open(output_file, "a", encoding="utf-8") as f:
-            for record in records:
-                f.write(record.to_json() + "\n")
-        
-        logger.info(f"已保存 {len(records)} 条记录到 {output_file}")
-    
-    async def crawl(self, limit: Optional[int] = None):
-        """开始爬取"""
-        # 获取待爬取的 URL
-        urls = self.url_pool_builder.get_pending_urls(limit=limit)
-        
+        - 如果在初始化时传入了 `urls`，则直接使用；
+        - 否则从 `source_path` 加载 JSONL/纯文本 URL 列表。
+        """
+        urls = self.urls or self._load_urls(self.source_path)
         if not urls:
-            logger.warning("没有待爬取的 URL")
+            logger.warning("输入 URL 为空，跳过爬取")
             return []
+
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.proxy_manager.refresh_env()
+
+        proxy_strategy = self._build_proxy_strategy()
+
+        # 如果本次 URL 只来自单一域名，并且在配置中定义了 main content selectors，
+        # 则将其传递给 Crawl4AI 的 target_elements / excluded_selector 以聚焦正文容器。
+        target_elements = self._infer_single_domain_targets(urls)
+        excluded_selectors = self._infer_single_domain_excluded(urls)
+
+        run_config = self._build_run_config(
+            proxy_strategy,
+            target_elements=target_elements,
+            excluded_selectors=excluded_selectors,
+        )
+        browser_config = self._build_browser_config()
+
+        dispatcher = MemoryAdaptiveDispatcher(
+            memory_threshold_percent=90.0,
+            check_interval=1.0,
+            max_session_permit=self.config.concurrent_crawls,
+        )
+
+        records: List[Record] = []
+
+        async with self._init_crawler(browser_config, use_undetected=True) as crawler:
+            stream = await crawler.arun_many(urls=urls, config=run_config, dispatcher=dispatcher)
+            async for result in stream:
+                record = self._process_result(result)
+                if record is None:
+                    continue
+                records.append(record)
+                self._append_output(record)
+
+        logger.info(f"爬取完成，总记录数: {len(records)}，输出: {self.output_path}")
+        return records
+
+    # ------------------------------------------------------------------
+    # Crawl4AI 配置封装
+    # ------------------------------------------------------------------
+    def _build_proxy_strategy(self) -> Optional[RoundRobinProxyStrategy]:
+        proxies_env = os.getenv("PROXIES")
+        if not proxies_env:
+            return None
+        proxies = ProxyConfig.from_env("PROXIES")
+        return RoundRobinProxyStrategy(proxies)
+
+    def _build_run_config(
+        self,
+        proxy_strategy: Optional[RoundRobinProxyStrategy],
+        *,
+        target_elements: Optional[List[str]] = None,
+        excluded_selectors: Optional[List[str]] = None,
+    ) -> CrawlerRunConfig:
+        mean_delay, max_range = self._build_delay_window()
+        return CrawlerRunConfig(
+            cache_mode=CacheMode.DISABLED,
+            stream=True,
+            proxy_rotation_strategy=proxy_strategy,
+            markdown_generator=DefaultMarkdownGenerator(
+                content_filter=PruningContentFilter(threshold=0.48, threshold_type="dynamic"),
+                options={"ignore_links": True, "ignore_images": True},
+            ),
+            only_text=True,
+            exclude_external_links=True,
+            exclude_internal_links=True,
+            exclude_social_media_links=True,
+            exclude_all_images=True,
+            magic=True,
+            simulate_user=True,
+            override_navigator=True,
+            mean_delay=mean_delay,
+            max_range=max_range,
+            page_timeout=int(self.config.browser_timeout * 1000),
+            # 如果提供了更精确的 main content selectors，则只在这些容器内生成 markdown
+            target_elements=target_elements,
+            # 显式排除的容器（如导航栏、推荐区等）
+            # 注意：excluded_selector 需要是字符串，如果有多个选择器需要用逗号分隔
+            excluded_selector=self._convert_excluded_selectors_to_string(excluded_selectors),
+        )
+
+    def _build_browser_config(self) -> BrowserConfig:
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        # 默认采用 undetected/stealth 配置，尽量避免简单反爬
+        return BrowserConfig(
+            enable_stealth=True,
+            headless=True,
+            user_agent_mode="random",
+            headers=headers,
+        )
+
+    def _init_crawler(self, browser_config: BrowserConfig, use_undetected: bool = True) -> AsyncWebCrawler:
+        """初始化 AsyncWebCrawler。
+
+        - 默认使用 UndetectedAdapter + AsyncPlaywrightCrawlerStrategy；
+        - 如果未来需要精简/禁用 undetected，可以将 `use_undetected` 设为 False，
+          直接使用默认的 AsyncWebCrawler(config=browser_config)。
+        """
+        if not use_undetected:
+            return AsyncWebCrawler(config=browser_config)
+
+        adapter = UndetectedAdapter()
+        strategy = AsyncPlaywrightCrawlerStrategy(browser_config=browser_config, browser_adapter=adapter)
+        return AsyncWebCrawler(crawler_strategy=strategy, config=browser_config)
+
+    def _build_delay_window(self) -> tuple[float, float]:
+        minimum = max(0.0, float(self.config.request_delay_min))
+        maximum = max(minimum, float(self.config.request_delay_max))
+        mean_delay = (minimum + maximum) / 2.0
+        max_range = max(0.0, maximum - minimum)
+        return mean_delay, max_range
+
+    def _convert_excluded_selectors_to_string(self, excluded_selectors: Optional[List[str]]) -> Optional[str]:
+        """将排除选择器列表转换为逗号分隔的字符串，符合 Crawl4AI 的 excluded_selector 参数要求。"""
+        if not excluded_selectors:
+            return None
+        # 过滤空字符串并去除前后空格
+        clean_selectors = [s.strip() for s in excluded_selectors if s and s.strip()]
+        if not clean_selectors:
+            return None
+        return ", ".join(clean_selectors)
+
+    # ------------------------------------------------------------------
+    # main content selectors 配置加载 & 域名推断
+    # ------------------------------------------------------------------
+    def _load_domain_selectors(self) -> tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """加载域名 -> main content CSS selectors 映射。
+
+        优先读取 `config/main_content_selectors.py`（支持默认值 + 继承），
+        兼容旧的 `config/main_content_selectors.json`。
+        """
+        py_path = Path("config/main_content_selectors.py")
+        json_path = Path("config/main_content_selectors.json")
+
+        data: Any = None
+        default_targets: List[str] = []
+        default_excludes: List[str] = []
+
+        if py_path.exists():
+            try:
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location("main_content_selectors", py_path)
+                if not spec or not spec.loader:
+                    raise RuntimeError("无法加载 main_content_selectors.py")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)  # type: ignore[call-arg]
+                data = getattr(module, "DOMAIN_SELECTORS", None)
+                default_targets = list(getattr(module, "DEFAULT_TARGETS", []) or [])
+                default_excludes = list(getattr(module, "DEFAULT_EXCLUDE", []) or [])
+            except Exception as exc:
+                logger.warning(f"加载 main_content_selectors.py 失败: {exc}")
+                data = None
+
+        if data is None and json_path.exists():
+            try:
+                with json_path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:
+                logger.warning(f"加载 main_content_selectors.json 失败: {exc}")
+                return {}, {}
+
+        if not isinstance(data, dict):
+            return {}, {}
+
+        targets: Dict[str, List[str]] = {}
+        excludes: Dict[str, List[str]] = {}
+
+        for domain, value in data.items():
+            if domain.startswith("_"):
+                # 跳过 _comment 等元信息
+                continue
+
+            dom_key = domain.lower()
+
+            # 旧格式：直接是 selector list
+            if isinstance(value, list):
+                clean = [str(s) for s in value if isinstance(s, str) and s.strip()]
+                if clean:
+                    targets[dom_key] = [*default_targets, *clean] if default_targets else clean
+                continue
+
+            # 新格式：{ "targets": [...], "exclude": [...], "override_targets": bool, "override_exclude": bool }
+            if not isinstance(value, dict):
+                continue
+
+            raw_targets = value.get("targets") or []
+            raw_excludes = value.get("exclude") or []
+            override_targets = bool(value.get("override_targets", False))
+            override_excludes = bool(value.get("override_exclude", False))
+
+            t_clean = [str(s) for s in raw_targets if isinstance(s, str) and s.strip()]
+            e_clean = [str(s) for s in raw_excludes if isinstance(s, str) and s.strip()]
+
+            final_targets = t_clean if override_targets else [*default_targets, *t_clean]
+            final_excludes = e_clean if override_excludes else [*default_excludes, *e_clean]
+
+            if final_targets:
+                targets[dom_key] = final_targets
+            if final_excludes:
+                excludes[dom_key] = final_excludes
+
+        return targets, excludes
+
+    def _infer_single_domain_targets(self, urls: List[str]) -> Optional[List[str]]:
+        """如果本次爬取只涉及单一主机，并且在配置中定义了 targets，则返回之。
+
+        多域场景或未配置时返回 None，退回默认的全页抓取行为。
+        """
+        domains = set()
+        for u in urls:
+            try:
+                netloc = urlparse(u).netloc or ""
+            except Exception:
+                continue
+            host = netloc.split("@")[-1].split(":")[0]
+            if host:
+                domains.add(host.lower())
+        if len(domains) != 1:
+            return None
+        (only_domain,) = tuple(domains)
+
+        # 精确匹配 host，如果你希望合并子域，可以自己在配置里只写主域并按需扩展这里的逻辑
+        return self._domain_target_selectors.get(only_domain)
+
+    def _infer_single_domain_excluded(self, urls: List[str]) -> Optional[List[str]]:
+        """如果本次爬取只涉及单一主机，并且在配置中定义了 exclude，则返回之。"""
+        domains = set()
+        for u in urls:
+            try:
+                netloc = urlparse(u).netloc or ""
+            except Exception:
+                continue
+            host = netloc.split("@")[-1].split(":")[0]
+            if host:
+                domains.add(host.lower())
+        if len(domains) != 1:
+            return None
+        (only_domain,) = tuple(domains)
+        return self._domain_excluded_selectors.get(only_domain)
+
+    # ------------------------------------------------------------------
+    # 结果处理 & 序列化
+    # ------------------------------------------------------------------
+    def _process_result(self, result: Any) -> Optional[Record]:
+        """将 Crawl4AI 的结果转换为 `Record`。
+
+        - 失败的请求只记录日志，不会输出 `Record`；
+        - 不再尝试从 HTML 中抽取发布时间（pubtime），
+          `published_at` 字段使用空字符串占位，后续可以由 URL 池/上游填充。
+        """
+        url = getattr(result, "url", "") or getattr(result, "input_url", "")
+        success = bool(getattr(result, "success", False))
+        error_message = getattr(result, "error_message", None) or getattr(result, "error", None)
+
+        cleaned_html = getattr(result, "cleaned_html", None) or ""
+        raw_html = getattr(result, "html", None) or ""
+        html = cleaned_html or raw_html or ""
+
+        if not success:
+            logger.warning(f"爬取失败: {url} | {error_message}")
+            return None
+
+        markdown_text_raw = self._normalize_fit_markdown(getattr(result, "markdown", None))
+        # 将原始 markdown 写入调试文件，方便排查重复等问题
+        # self._append_raw_markdown_debug(url, markdown_text_raw)
+        # 在 extractor 中做统一的 markdown 清洗
+        cleaned_markdown = self._extractor.extract_content(markdown_text_raw)
+
+        self._append_raw_markdown_debug(url, cleaned_markdown)
+
+        if not html and not cleaned_markdown:
+            logger.warning(f"爬取结果为空: {url}")
+            return None
+
+        # 内容、标题、描述统一走 Extractor，逻辑在 tests/test_crawler.py 中有用例
+        # 重新创建 extractor（需要 HTML）
+        self._extractor = Extractor(html)
         
-        # 测试模式限制（仅在明确启用且没有指定limit时）
-        # 注意：如果 limit 已指定，则使用 limit，不再应用 test_url_limit
-        if self.config.test_mode and limit is None:
-            original_count = len(urls)
-            urls = urls[:self.config.test_url_limit]
-            if len(urls) < original_count:
-                logger.info(f"测试模式：只处理前 {len(urls)} 个 URL（共 {original_count} 个待处理）")
-        
-        total = len(urls)
-        self.stats["total"] = total
-        
-        logger.info(f"开始爬取 {total} 个 URL")
-        
-        # 分批处理
-        batch_size = self.concurrent_crawls * 2  # 每批处理更多，提高效率
-        all_records = []
-        
-        for i in range(0, total, batch_size):
-            batch = urls[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (total + batch_size - 1) // batch_size
-            
-            logger.info(f"处理批次 {batch_num}/{total_batches}，共 {len(batch)} 个 URL")
-            
-            # 控制全局并发
-            semaphore = asyncio.Semaphore(self.concurrent_crawls)
-            
-            async def crawl_with_semaphore(url_info):
-                async with semaphore:
-                    return await self._crawl_url(url_info)
-            
-            tasks = [crawl_with_semaphore(url_info) for url_info in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 收集成功的记录
-            batch_records = []
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"爬取任务异常: {result}")
-                elif result is not None:
-                    batch_records.append(result)
-            
-            # 保存批次记录
-            if batch_records:
-                self._save_records(batch_records)
-                all_records.extend(batch_records)
-            
-            # 批次间稍作休息
-            if i + batch_size < total:
-                await asyncio.sleep(1)
-        
-        logger.info(f"爬取完成: 总计 {total}，成功 {self.stats['success']}，失败 {self.stats['failed']}，重试 {self.stats['retries']} 次")
-        
-        return all_records
+        title = self._extractor.extract_title() or ""
+        description = self._extractor.extract_description()
+        content = cleaned_markdown
+
+        # URL 池已经针对英文做过筛选，这里直接标记为 "en"
+        language = "en"
+        # 新接口没有 extract_tags 方法，暂时设为 None
+        tags = None
+
+        # 优先使用上游 URL 列表中携带的 created_at / create_at 作为发布时间
+        published_at = self._url_meta.get(url, "")
+
+        record = Record(
+            id=str(uuid.uuid4()),
+            source=self._infer_source(url),
+            url=url,
+            title=title,
+            description=description,
+            content=content,
+            published_at=published_at,
+            language=language,
+            tags=tags,
+        )
+        return record
+
+    def _normalize_fit_markdown(self, markdown: Any) -> str:
+        if not markdown:
+            return ""
+        if isinstance(markdown, str):
+            return markdown
+        fit_md = getattr(markdown, "fit_markdown", None)
+        if isinstance(fit_md, str) and fit_md.strip():
+            return fit_md
+        raw_md = getattr(markdown, "raw_markdown", None)
+        if isinstance(raw_md, str) and raw_md.strip():
+            return raw_md
+        return ""
+
+    def _filter_markdown_lines(self, markdown: str) -> str:
+        """行级清洗：去掉明显太短的正文行，并裁掉末尾纯 heading 区域。"""
+        if not markdown:
+            return ""
+
+        kept: list[str] = []
+        for raw_line in markdown.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                continue
+
+            if "#" in line:
+                kept.append(line)
+                continue
+
+            if len(line.strip()) >= 100:
+                kept.append(line)
+
+        if not kept:
+            return ""
+
+        # 去掉末尾连续的包含 '#' 的行（典型尾部导航）
+        last_non_hash_idx = -1
+        for i in range(len(kept) - 1, -1, -1):
+            if "#" not in kept[i]:
+                last_non_hash_idx = i
+                break
+
+        if last_non_hash_idx == -1:
+            return ""
+
+        kept = kept[: last_non_hash_idx + 1]
+        return "\n".join(kept)
+
+    def _append_raw_markdown_debug(self, url: str, markdown_raw: str) -> None:
+        """将每条结果的 markdown 文本写入调试文件（当前为清洗后的正文）。"""
+        if not markdown_raw:
+            return
+        try:
+            self._raw_markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._raw_markdown_path.open("a", encoding="utf-8") as f:
+                f.write("URL: " + url + "\n")
+                f.write(markdown_raw)
+                f.write("\n" + "-" * 80 + "\n")
+        except Exception as exc:
+            logger.debug(f"写入 raw markdown 调试文件失败: {exc}")
+
+    def _infer_source(self, url: str) -> str:
+        try:
+            netloc = urlparse(url).netloc or "unknown"
+            # 去掉用户名、端口等，只保留域名部分
+            host = netloc.split("@")[
+                -1
+            ]  # user:pass@host:port -> host:port
+            host = host.split(":")[0]
+            host = host or "unknown"
+        except Exception:
+            host = "unknown"
+        return f"news/{host}"
+
+    # ------------------------------------------------------------------
+    # 输入 URL 加载 & 路径工具
+    # ------------------------------------------------------------------
+    def _load_urls(self, source_path: Optional[Path]) -> List[str]:
+        if not source_path:
+            return []
+        if not source_path.exists():
+            logger.error(f"URL 输入文件不存在: {source_path}")
+            return []
+
+        urls: List[str] = []
+        self._url_meta.clear()
+
+        with source_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        url = obj.get("url")
+                        created_at = obj.get("created_at") or obj.get("create_at")
+                        if url and isinstance(created_at, str):
+                            self._url_meta[str(url)] = created_at
+                    else:
+                        url = None
+                except json.JSONDecodeError:
+                    url = line
+
+                if url:
+                    urls.append(str(url))
+        return urls
+
+    def _append_output(self, record: Record) -> None:
+        """将记录追加到输出文件"""
+        try:
+            with self.output_path.open("a", encoding="utf-8") as f:
+                f.write(record.to_json() + "\n")
+        except Exception as exc:
+            logger.error(f"写入输出文件失败: {exc}")
+
+    def _default_output_path(self) -> Path:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return self.config.processed_data_dir / f"crawl_results_{ts}.jsonl"

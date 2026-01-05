@@ -8,7 +8,7 @@ from utils.config import Config
 from utils.logger import setup_logger
 from gdelt_downloader import GDELTDownloader, GDELTParser
 from url_pool_builder import URLPoolBuilder
-from crawler import NewsCrawler
+from crawler import NewsCrawler, Crawler
 
 
 def download_gkg(args):
@@ -62,16 +62,30 @@ def crawl(args):
     setup_logger(config)
     
     logger.info("开始爬取新闻")
-    
+
+    if args.source:
+        output_path = Path(args.output) if args.output else None
+        proxy_file = Path(args.proxy_file) if args.proxy_file else None
+        use_proxy = False if args.no_proxy else None
+        crawler = Crawler(
+            config=config,
+            source_path=Path(args.source),
+            output_path=output_path,
+            proxy_file=proxy_file,
+            use_proxy=use_proxy,
+        )
+        records = asyncio.run(crawler.run())
+        return records or []
+
     builder = URLPoolBuilder(config)
     crawler = NewsCrawler(config, builder)
-    
-    limit = args.limit if hasattr(args, 'limit') and args.limit else None
-    
+
+    limit = args.limit if hasattr(args, "limit") and args.limit else None
+
     # 运行异步爬取
     records = asyncio.run(crawler.crawl(limit=limit))
     records = records or []  # 保底避免 None
-    
+
     logger.info(f"爬取完成，共获得 {len(records)} 条记录")
     return records
 
@@ -164,6 +178,27 @@ def main():
         "--limit",
         type=int,
         help="限制爬取的 URL 数量（用于测试）"
+    )
+    crawl_parser.add_argument(
+        "--source",
+        type=str,
+        required=True,
+        help="urls.jsonl 文件路径（每行一个 JSON，至少包含 url 字段）"
+    )
+    crawl_parser.add_argument(
+        "--output",
+        type=str,
+        help="输出 jsonl 文件路径（默认写入 processed_data_dir）"
+    )
+    crawl_parser.add_argument(
+        "--proxy-file",
+        type=str,
+        help="代理池配置文件路径（默认不使用外部代理池）"
+    )
+    crawl_parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="禁用代理池轮换（即使配置允许）"
     )
     
     # full-pipeline 命令

@@ -1,642 +1,671 @@
-"""内容提取模块"""
+"""
+Generic extractor for many news/blog sites.
+
+Public API:
+- Extractor(html): parse HTML once
+- extract_title() -> Optional[str]
+- extract_description() -> Optional[str]
+- extract_content(fit_markdown: str) -> str   # clean FitMarkdown (no HTML needed)
+
+Design goals:
+- High generality across domains
+- Deterministic, testable heuristics
+- Minimal, high-confidence keyword lists
+
+This variant: content output drops ALL headings and short/noisy lines,
+keeping only main body paragraphs (high precision).
+"""
+
+from __future__ import annotations
+
+import json
 import re
-from typing import Optional, Dict, Tuple, List
-from datetime import datetime
-from urllib.parse import urlparse, urljoin
+from dataclasses import dataclass
+from typing import Optional, List, Iterable, Any
+
 from bs4 import BeautifulSoup
-from loguru import logger
 
-class ContentExtractor:
-    """从 HTML 中提取新闻内容的提取器"""
-    
-    def __init__(self, min_word_threshold: int = 80):
-        # min_word_threshold 用于评估内容质量，低于该值会尝试其他提取策略
-        self.min_word_threshold = min_word_threshold
-    
-    def extract_title(self, html: str, url: str) -> str:
-        """提取标题
-        
-        优先级：
-        1. <meta property="og:title">
-        2. <title>
-        3. <meta name="title">
-        4. schema.org headline
-        5. <h1>
+
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S+")
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _norm_key(s: str) -> str:
+    return _norm_space(s).lower()
+
+
+def _strip_control_chars(s: str) -> str:
+    # keep normal unicode text; remove low ASCII controls
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s or "")
+
+
+def _truncate(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[:n].rstrip()
+
+
+def _looks_like_sentence(text: str) -> bool:
+    # Lightweight: presence of sentence punctuation OR CJK punctuation
+    return bool(re.search(r"[.!?。！？]", text))
+
+
+def _is_heading(line: str) -> bool:
+    return bool(_HEADING_RE.match(line.strip()))
+
+
+def _remove_title_suffix(title: str) -> str:
+    """
+    Remove common site suffix patterns:
+    - "Title | Site"
+    - "Title - Site"
+    - "Title — Site"
+    Keep the left part when it looks like a proper title.
+    """
+    t = _norm_space(title)
+    if not t:
+        return t
+
+    parts = re.split(r"\s+[\|\-—–:]\s+", t)
+    if len(parts) <= 1:
+        return t
+
+    left = parts[0].strip()
+    if len(left) < 8:
+        return t
+    return left
+
+
+# -----------------------------
+# HTML Extractor
+# -----------------------------
+
+@dataclass(frozen=True)
+class _Candidate:
+    source: str
+    text: str
+
+
+class Extractor:
+    """
+    Parse HTML once and provide:
+    - extract_title()
+    - extract_description()
+    - extract_content(fit_markdown)
+
+    Note: Content cleaning is markdown-only (FitMarkdown already pre-cleaned).
+    """
+
+    # Minimal, high-confidence noise hints for *titles*
+    _TITLE_NOISE_HINTS = (
+        "subscribe",
+        "newsletter",
+        "sign in",
+        "log in",
+        "cookie",
+        "privacy",
+        "terms",
+        "advertisement",
+    )
+
+    # Caption / player UI tokens (high precision)
+    _UI_TOKENS = (
+        "video player is loading",
+        "this is a modal window",
+        "beginning of dialog window",
+        "end of dialog window",
+        "escape will cancel and close the window",
+        "text color",
+        "text background color",
+        "caption",
+        "caption area",
+        "background color",
+        "opacity",
+        "font size",
+        "font family",
+        "text edge",
+        "edge style",
+        "drop shadow",
+        "raised",
+        "depressed",
+        "uniform",
+        "proportional",
+        "sans-serif",
+        "monospace",
+        "serif",
+        "semi-transparent",
+        "transparent",
+        "opaque",
+        # colors (they appear in UI menus)
+        "white",
+        "black",
+        "red",
+        "green",
+        "blue",
+        "yellow",
+        "magenta",
+        "cyan",
+    )
+
+    # Glue pattern for "Text ColorWhite" / "OpacityOpaque" style concatenation
+    _UI_GLUE_PAT = re.compile(
+        r"(Text\s*Color|Opacity|Font\s*Size|Font\s*Family|Text\s*Background\s*Color|"
+        r"Caption\s*Area\s*Background\s*Color)"
+        r"(White|Black|Red|Green|Blue|Yellow|Magenta|Cyan|Opaque|Transparent|Semi-Transparent|\d{1,3}%|\w+)",
+        flags=re.I,
+    )
+
+    # Inline noise hints (keep small, high precision)
+    _INLINE_NOISE_HINTS = (
+        "sign up",
+        "sign in",
+        "log in",
+        "create account",
+        "subscribe",
+        "newsletter",
+        "unlock unlimited access",
+        "privacy policy",
+        "terms of service",
+        "cookie policy",
+        "all rights reserved",
+        "copyright",
+        "advertisement",
+        "sponsored",
+        "promo code",
+        "use code",
+        "watch live",
+        "live:",
+        "listen",
+        "share",
+        "copy link",
+        "print",
+        "report",
+        "support the investigative reporting",
+        "vip access",
+    )
+
+    _SEE_ALL_PAT = re.compile(r"^(see|view|show)\s+(all|more)\b", flags=re.I)
+
+    # -----------------------------
+    # Content selection knobs
+    # -----------------------------
+    # 行/段落太短通常是频道/推荐/按钮/面包屑。你要“只保留主要内容”，这里要更激进。
+    _MIN_PARAGRAPH_CHARS = 60           # 句子/段落最小长度（可按站点调：50~120）
+    _MIN_PARAGRAPH_WORDLIKE_TOKENS = 10 # 句子/段落最小 token 数（中英通用，粗略）
+    _MIN_SENTENCE_PUNCT_RATIO = 0.0     # 不强制比例，只要有句号类标点即可（见 _looks_like_sentence）
+
+    def __init__(self, html: str):
+        self.html = html or ""
+        self.soup = BeautifulSoup(self.html, "lxml") if self.html else BeautifulSoup("", "lxml")
+
+    # -----------------------------
+    # Public: Title / Description
+    # -----------------------------
+
+    def extract_title(self) -> Optional[str]:
         """
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 尝试 OpenGraph title
-        og_title = soup.find('meta', property='og:title')
-        if og_title and og_title.get('content'):
-            return og_title['content'].strip()
-        
-        # 尝试 title 标签
-        title_tag = soup.find('title')
-        if title_tag:
-            title = title_tag.get_text().strip()
-            if title:
-                return title
-        
-        # 尝试 meta name="title"
-        meta_title = soup.find('meta', attrs={'name': 'title'})
-        if meta_title and meta_title.get('content'):
-            return meta_title['content'].strip()
-        
-        # 尝试 schema.org headline
-        schema_headline = soup.find(attrs={'itemprop': 'headline'})
-        if schema_headline:
-            return schema_headline.get_text().strip()
-        
-        # 尝试第一个 h1
-        h1 = soup.find('h1')
+        Generic title extraction:
+        1) <h1>
+        2) meta keys that look like title/headline
+        3) JSON-LD headline/name
+        4) <title> (with suffix removal)
+        Then select best candidate by validity rules.
+        """
+        candidates: List[_Candidate] = []
+
+        h1 = self.soup.find("h1")
         if h1:
-            return h1.get_text().strip()
-        
-        # 如果都找不到，返回 URL 作为后备
-        logger.warning(f"无法提取标题，使用 URL: {url}")
-        return url
-    
-    def extract_summary(self, html: str) -> Optional[str]:
-        """提取摘要
-        
-        优先级：
-        1. <meta name="description">
-        2. <meta property="og:description">
-        3. schema.org description
-        4. 从正文首段生成
+            t = _norm_space(h1.get_text(" ", strip=True))
+            if t:
+                candidates.append(_Candidate("h1", t))
+
+        meta_map = self._meta_map()
+        for k, v in meta_map.items():
+            if "title" in k or "headline" in k or k.endswith("dc.title") or k.endswith("dcterms.title"):
+                if v:
+                    candidates.append(_Candidate(f"meta:{k}", v))
+
+        jl = self._extract_json_ld_first(("headline", "name", "title"))
+        if jl:
+            candidates.append(_Candidate("jsonld", jl))
+
+        if self.soup.title and self.soup.title.text:
+            tt = _norm_space(self.soup.title.text)
+            tt = _remove_title_suffix(tt)
+            if tt:
+                candidates.append(_Candidate("title_tag", tt))
+
+        return self._pick_best_title(candidates)
+
+    def extract_description(self) -> Optional[str]:
         """
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 尝试 meta description
-        meta_desc = soup.find('meta', attrs={'name': 'description'})
-        if meta_desc and meta_desc.get('content'):
-            desc = meta_desc['content'].strip()
-            if desc:
-                return desc
-        
-        # 尝试 OpenGraph description
-        og_desc = soup.find('meta', property='og:description')
-        if og_desc and og_desc.get('content'):
-            desc = og_desc['content'].strip()
-            if desc:
-                return desc
-        
-        # 尝试 schema.org description
-        schema_desc = soup.find(attrs={'itemprop': 'description'})
-        if schema_desc:
-            desc = schema_desc.get_text().strip()
-            if desc:
-                return desc
-        
-        # 从正文首段生成（如果正文提取成功）
-        # 这个方法会在 extract_content 之后调用，所以这里先返回 None
+        Generic description extraction:
+        1) meta keys that look like description/summary/abstract
+        2) JSON-LD description/abstract
+        3) first paragraph text (from likely main containers), truncated to 240 chars
+        """
+        meta_map = self._meta_map()
+        desc_candidates: List[_Candidate] = []
+        for k, v in meta_map.items():
+            if not v:
+                continue
+            if (
+                "description" in k
+                or "summary" in k
+                or "abstract" in k
+                or k.endswith("dc.description")
+                or k.endswith("dcterms.description")
+            ):
+                desc_candidates.append(_Candidate(f"meta:{k}", v))
+
+        best_meta = self._pick_best_description([c.text for c in desc_candidates])
+        if best_meta:
+            return best_meta
+
+        jl = self._extract_json_ld_first(("description", "abstract"))
+        if jl:
+            jl = self._clean_inline_text(jl)
+            if jl:
+                return _truncate(jl, 240) or None
+
+        p = self._extract_first_paragraph_text()
+        if p:
+            p = self._clean_inline_text(p)
+            p = _truncate(p, 240)
+            return p or None
+
         return None
-    
-    def extract_content(self, html: str, markdown: Optional[str] = None, domain: Optional[str] = None, url: Optional[str] = None) -> str:
-        """提取正文内容
-        
-        优先利用 Crawl4AI 生成的 markdown；多个候选内容会按质量打分后择优返回，避免导航/广告噪声或内容缺失。
+
+    # -----------------------------
+    # Public: Content cleaning (FitMarkdown)
+    # -----------------------------
+
+    def extract_content(self, fit_markdown: str) -> str:
         """
-        candidates: List[Tuple[str, str]] = []
-        
-        # 如果没有传入 domain，尝试从 URL 中提取
-        if not domain and url:
-            domain = self._extract_domain_from_url(url)
-        
-        if markdown:
-            cleaned_markdown = self._clean_markdown_content(markdown, domain)
-            if cleaned_markdown:
-                candidates.append(("markdown", cleaned_markdown))
-        
-        html_content = self._extract_from_html(html)
-        if html_content:
-            candidates.append(("html", html_content))
-        
-        best_content, chosen_source = self._select_best_content(candidates)
-        if chosen_source:
-            logger.debug(f"内容提取使用 {chosen_source} 源，字数 {len(best_content.split())}")
-        
-        return best_content
+        High-precision main content extraction from FitMarkdown.
 
-    def _score_content(self, text: str) -> float:
-        """为候选正文打分，兼顾长度、重复度和导航噪声占比"""
-        if not text:
-            return 0.0
-        
-        cleaned = text.strip()
-        words = re.findall(r"[A-Za-z]+", cleaned)
-        word_count = len(words)
-        if word_count == 0:
-            return 0.0
-        
-        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-        nav_keywords = [
-            "subscribe", "menu", "login", "sign up", "sign in", "newsletter",
-            "advertisement", "cookie", "privacy", "terms", "related stories",
-            "most read", "trending", "sponsor", "promo", "share",
-        ]
-        text_lower = cleaned.lower()
-        nav_hits = sum(text_lower.count(k) for k in nav_keywords)
-        nav_penalty = nav_hits / max(len(lines), 1)
-        
-        unique_lines = len(set(lines))
-        unique_ratio = unique_lines / max(len(lines), 1)
-        avg_line_length = sum(len(line) for line in lines) / max(len(lines), 1)
-        long_line_bonus = min(avg_line_length / 80, 1.0)
-        
-        # 评分偏向：字数越多越好，行重复率越低越好，导航占比越低越好
-        base_score = word_count * (0.6 + 0.4 * long_line_bonus)
-        diversity_bonus = base_score * (0.3 * unique_ratio)
-        penalty = nav_penalty * 50
-        
-        score = base_score + diversity_bonus - penalty
-        if word_count < self.min_word_threshold:
-            score *= 0.6  # 字数过少的内容降权
-        
-        return max(score, 0.0)
+        Output characteristics:
+        - NO headings at all
+        - NO short lines/paragraphs
+        - NO UI/nav/related/subscription blocks
+        - Only substantial body paragraphs (sentence-like, sufficiently long)
+        """
+        return self.clean_fit_markdown(fit_markdown)
 
-    def _select_best_content(self, candidates: List[Tuple[str, str]]) -> Tuple[str, str]:
-        """从多个候选内容中选择质量最高的"""
-        best_content = ""
-        best_source = ""
-        best_score = 0.0
-        
-        for source, content in candidates:
-            deduped = self._deduplicate_lines(content)
-            score = self._score_content(deduped)
+    def clean_fit_markdown(self, markdown: str) -> str:
+        if not markdown or not markdown.strip():
+            return ""
+
+        md = markdown.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 1) 行级过滤：去 heading / 去 code block / 去 UI / 去短噪声
+        filtered_lines = self._filter_lines_strict(md)
+        if not filtered_lines:
+            return ""
+
+        # 2) 行级筛选：只保留“像正文”的行
+        lines = [ln for ln in filtered_lines if ln.strip() and self._is_body_paragraph(ln)]
+        if not lines:
+            return ""
+
+        # 3) 最终输出：每行一行（纯正文）
+        return "\n".join(lines).strip()
+
+    # -----------------------------
+    # Internals: HTML
+    # -----------------------------
+
+    def _meta_map(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for tag in self.soup.find_all("meta"):
+            key = tag.get("name") or tag.get("property") or tag.get("itemprop") or tag.get("http-equiv")
+            val = tag.get("content")
+            if not key or not val:
+                continue
+            k = _norm_key(str(key))
+            v = _clean_meta_text(str(val))
+            if not k or not v:
+                continue
+            if k not in out:
+                out[k] = v
+        return out
+
+    def _extract_json_ld_first(self, keys: tuple[str, ...]) -> Optional[str]:
+        for script in self.soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            raw = script.string
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for item in self._iter_json_ld(payload):
+                if not isinstance(item, dict):
+                    continue
+                for k in keys:
+                    val = item.get(k)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        return None
+
+    @staticmethod
+    def _iter_json_ld(payload: Any) -> Iterable[Any]:
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            graph = payload.get("@graph")
+            if isinstance(graph, list):
+                return graph
+            return [payload]
+        return []
+
+    def _extract_first_paragraph_text(self) -> Optional[str]:
+        soup = self.soup
+
+        containers = []
+        for sel in ("article", "main"):
+            containers.extend(soup.find_all(sel))
+        containers.extend(soup.find_all(attrs={"role": "main"}))
+
+        if not containers:
+            containers = [soup.body] if soup.body else [soup]
+
+        for c in containers:
+            for p in c.find_all("p"):
+                txt = _norm_space(p.get_text(" ", strip=True))
+                txt = _strip_control_chars(txt)
+                if len(txt) >= 80:
+                    return txt
+        return None
+
+    def _pick_best_title(self, candidates: List[_Candidate]) -> Optional[str]:
+        scored: List[tuple[float, str]] = []
+        for c in candidates:
+            t = _strip_control_chars(_norm_space(c.text))
+            t = _remove_title_suffix(t)
+            if not self._is_valid_title(t):
+                continue
+            score = 0.0
+            if c.source == "h1":
+                score += 2.0
+            if len(t) > 120:
+                score -= 2.0
+            elif len(t) > 90:
+                score -= 1.0
+            score += min(1.5, (len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", t)) / max(1, len(t))) * 1.5)
+            score -= t.count("|") * 0.7 + t.count(" - ") * 0.5
+            scored.append((score, t))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1].strip() or None
+
+    def _pick_best_description(self, candidates: List[str]) -> Optional[str]:
+        best: Optional[str] = None
+        best_score = -1e9
+        for raw in candidates:
+            s = self._clean_inline_text(raw)
+            if not s:
+                continue
+            if len(s) < 40:
+                continue
+            if len(s) > 1200:
+                continue
+            score = 0.0
+            if _looks_like_sentence(s):
+                score += 1.0
+            if 80 <= len(s) <= 240:
+                score += 1.0
+            elif len(s) > 400:
+                score -= 0.5
             if score > best_score:
                 best_score = score
-                best_content = deduped
-                best_source = source
-        
-        return best_content, best_source
-
-    def _deduplicate_lines(self, text: str) -> str:
-        """合并重复行，移除明显的噪声行"""
-        seen = set()
-        cleaned_lines = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped in seen:
-                continue
-            seen.add(stripped)
-            cleaned_lines.append(stripped)
-        return "\n".join(cleaned_lines)
-    
-    def _clean_markdown_for_domain(self, markdown: str, domain: str) -> str:
-        """针对特定域名的清理规则"""
-        content = markdown
-        
-        # Bloomberg 特定清理
-        if 'bloomberg.com' in domain:
-            # 移除 Bloomberg 特定的导航和广告
-            content = re.sub(r'### Bloomberg.*?### For Customers', '', content, flags=re.DOTALL)
-            content = re.sub(r'Bloomberg.*?Connecting decision makers.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'### For Customers.*?### Support', '', content, flags=re.DOTALL)
-            content = re.sub(r'LIVE NOW.*?PlayWatch', '', content, flags=re.DOTALL)
-            content = re.sub(r'Confidential tip\?.*?New Window', '', content, flags=re.DOTALL)
-            content = re.sub(r'BTV\+.*?Submit a Tip', '', content, flags=re.DOTALL)
-            content = re.sub(r'Help©.*?All Rights Reserved', '', content, flags=re.DOTALL)
-            content = re.sub(r'## We\'ve updated our terms.*?', '', content, flags=re.DOTALL)
-        
-        # ZeroHedge 特定清理
-        if 'zerohedge.com' in domain:
-            content = re.sub(r'!\[zerohedge logo\]\(\)', '', content)
-            content = re.sub(r'\* Join Premium.*?More!triangle', '', content, flags=re.DOTALL)
-            content = re.sub(r'\* Advertise.*?mobile-logo', '', content, flags=re.DOTALL)
-            content = re.sub(r'Zerohedge Debates.*?apply\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'Alt-Market.*?Visual Combat Banzai7', '', content, flags=re.DOTALL)
-            content = re.sub(r'!\[print-icon\]\(\)', '', content)
-            content = re.sub(r'# Want to know more\?.*?ZEROHEDGE DIRECTLY TO YOUR INBOX', '', content, flags=re.DOTALL)
-            content = re.sub(r'Receive a daily recap.*?inbox\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'### Sign up now.*?inbox\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'### Today\'s Top Stories.*?Copyright', '', content, flags=re.DOTALL)
-        
-        # CNN 特定清理
-        if 'cnn.com' in domain:
-            content = re.sub(r'### CNN values your feedback.*?Thank You!', '', content, flags=re.DOTALL)
-            content = re.sub(r'Your effort and contribution.*?appreciated\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'2025 Elections.*?5 Things Quiz', '', content, flags=re.DOTALL)
-            content = re.sub(r'Your CNN account.*?account', '', content, flags=re.DOTALL)
-            content = re.sub(r'Ad Choices.*?All Rights Reserved', '', content, flags=re.DOTALL)
-            content = re.sub(r'CNN Sans.*?News Network', '', content, flags=re.DOTALL)
-            content = re.sub(r'## Legal Terms and Privacy.*?', '', content, flags=re.DOTALL)
-        
-        # Forbes 特定清理
-        if 'forbes.com' in domain:
-            content = re.sub(r'Americans Want To Recycle.*?Paid Program', '', content, flags=re.DOTALL)
-            content = re.sub(r'How Innovation Can.*?Paid Program', '', content, flags=re.DOTALL)
-            content = re.sub(r'Celebrating Top Fundraisers.*?Paid Program', '', content, flags=re.DOTALL)
-            content = re.sub(r'America\'s 2025.*?Paid Program', '', content, flags=re.DOTALL)
-            content = re.sub(r'World\'s Billionaires.*?More\.\.\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'Editorial Standards.*?Permissions', '', content, flags=re.DOTALL)
-            content = re.sub(r'LOADING VIDEO.*?FORBES\' FEATURED Video', '', content, flags=re.DOTALL)
-            content = re.sub(r'© 2025 Forbes.*?All Rights Reserved', '', content, flags=re.DOTALL)
-        
-        # Washington Examiner 特定清理
-        if 'washingtonexaminer.com' in domain:
-            content = re.sub(r'Election 2025.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'!\[.*?Logo.*?\]\(.*?\)', '', content, flags=re.IGNORECASE)
-            content = re.sub(r'Faith, Freedom.*?Equality, Not Elitism', '', content, flags=re.DOTALL)
-            content = re.sub(r'## Recommended Stories.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'### Promoted Stories.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'#### Related Content.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'## COMMENTARY.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'## RESTORING AMERICA.*?', '', content, flags=re.DOTALL)
-        
-        # NYPost 特定清理
-        if 'nypost.com' in domain:
-            content = re.sub(r'Post Sports\+.*?Email Newsletters', '', content, flags=re.DOTALL)
-            content = re.sub(r'!\[.*?Read the Latest.*?\]\(\)', '', content, flags=re.IGNORECASE)
-            content = re.sub(r'!\[.*?logo.*?\]\(\)', '', content, flags=re.IGNORECASE)
-            content = re.sub(r'#### trending now.*?\)', '', content, flags=re.DOTALL)
-            content = re.sub(r'## Explore More.*?\)', '', content, flags=re.DOTALL)
-            content = re.sub(r'### Start your day.*?story\.', '', content, flags=re.DOTALL)
-            content = re.sub(r'Read Next.*?in US News', '', content, flags=re.DOTALL)
-            content = re.sub(r'#### Trending Now.*?comments', '', content, flags=re.DOTALL)
-            content = re.sub(r'## Now on Page Six.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'## Now on.*?Decider', '', content, flags=re.DOTALL)
-            content = re.sub(r'##\s+Covers.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'## More Stories.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'Sections & Features.*?', '', content, flags=re.DOTALL)
-            content = re.sub(r'© 2025 NYP Holdings.*?', '', content, flags=re.DOTALL)
-        
-        return content
-    
-    def _clean_markdown_content(self, markdown: str, domain: Optional[str] = None) -> str:
-        """清理 markdown 内容，移除导航、链接、标签等，提取干净的主要内容
-        
-        注意：如果使用了 Crawl4AI 的 PruningContentFilter，大部分导航内容应该已经被过滤
-        这里进行额外的清理以确保内容质量
-        """
-        if not markdown:
-            return ""
-        
-        content = markdown.strip()
-        
-        # 先应用域名特定的清理规则
-        if domain:
-            content = self._clean_markdown_for_domain(content, domain)
-        
-        # 移除代码块（通常不是正文内容）
-        content = re.sub(r'```[\s\S]*?```', '', content)
-        
-        # 移除 markdown 链接格式 [text](url) - 但保留纯文本
-        # 先提取链接文本，然后移除链接格式
-        def replace_link(match):
-            link_text = match.group(1)
-            # 如果链接文本看起来像导航项（短且包含常见导航词），则移除
-            nav_keywords = ['skip', 'menu', 'login', 'sign', 'register', 'subscribe', 
-                          'follow', 'share', 'tweet', 'facebook', 'linkedin', 'instagram',
-                          'navigation', 'nav', 'header', 'footer', 'sidebar', 'aside',
-                          'cookie', 'privacy', 'terms', 'contact', 'about', 'home',
-                          'bloomberg', 'terminal', 'demo', 'request', 'customer', 'support',
-                          'anywhere', 'remote', 'login', 'company', 'products']
-            link_lower = link_text.lower()
-            if any(keyword in link_lower for keyword in nav_keywords):
-                return ''
-            # 如果链接文本很短（可能是标签），也移除
-            if len(link_text) < 3:
-                return ''
-            # 如果链接文本全是符号或数字，移除
-            if re.match(r'^[^\w\s]+$', link_text) or link_text.isdigit():
-                return ''
-            # 否则保留文本，移除链接格式
-            return link_text
-        
-        content = re.sub(r'\[([^\]]+)\]\([^\)]+\)', replace_link, content)
-        
-        # 移除纯 URL（http:// 或 https:// 开头的行或文本）
-        content = re.sub(r'https?://[^\s\)]+', '', content)
-        
-        # 移除图片标记 ![...](url) 或 ![alt]
-        content = re.sub(r'!\[[^\]]*\]\([^\)]*\)', '', content)
-        content = re.sub(r'!\[[^\]]*\]', '', content)
-        
-        # 移除标签格式，如 * [Trading] * [Compliance] 或 [Trading] * 等
-        content = re.sub(r'\*\s*\[[^\]]+\]\s*\*', '', content)
-        content = re.sub(r'\[[^\]]+\]\s*\*', '', content)
-        content = re.sub(r'\*\s*\[[^\]]+\]', '', content)
-        content = re.sub(r'^\s*\[[^\]]+\]\s*$', '', content, flags=re.MULTILINE)
-        
-        # 移除行首的符号和空格（如 * item, - item, • item）
-        content = re.sub(r'^\s*[•\-\*\+]\s+', '', content, flags=re.MULTILINE)
-        
-        # 移除只有符号的分隔线（如 "---", "***", "===" 等）
-        content = re.sub(r'^[=\-\*_]{3,}\s*$', '', content, flags=re.MULTILINE)
-        
-        # 移除短行（可能是标签或导航项）
-        lines = content.split('\n')
-        cleaned_lines = []
-        for line in lines:
-            line = line.strip()
-            # 跳过空行
-            if not line:
-                continue
-            # 跳过只有符号的行
-            if re.match(r'^[^\w\s]+$', line):
-                continue
-            # 跳过看起来像导航的短行（包含常见导航词）
-            nav_patterns = [
-                r'^(skip|menu|login|sign|register|subscribe|follow|share|tweet|facebook|linkedin|instagram|navigation|nav|header|footer|sidebar|aside|cookie|privacy|terms|contact|about|home)',
-                r'^[A-Z\s]{1,30}$',  # 全大写的短行（可能是导航标题）
-                r'^(bloomberg|terminal|demo|request|customer|support|anywhere|remote|company|products|logo|advertise|premium|channels|partners)',
-                r'^(election|sections|features|company|editions|more from)',  # 网站导航
-            ]
-            if any(re.match(pattern, line, re.IGNORECASE) for pattern in nav_patterns):
-                continue
-            
-            # 跳过看起来像图片描述的行
-            if re.match(r'^!?\[.*\]', line) or 'image' in line.lower() or 'logo' in line.lower():
-                continue
-            # 跳过只有链接的行（已经处理过链接，但可能还有残留）
-            if re.match(r'^https?://', line):
-                continue
-            # 跳过太短的行（可能是标签，少于 10 个字符）
-            if len(line) < 10:
-                # 但如果包含常见标点，可能是有效内容
-                if not re.search(r'[.!?]', line):
-                    continue
-            cleaned_lines.append(line)
-        
-        content = '\n'.join(cleaned_lines)
-        
-        # 尝试提取主要内容段落
-        # 找到最长的连续段落块（通常是正文）
-        paragraphs = content.split('\n\n')
-        if len(paragraphs) > 3:
-            # 过滤掉太短的段落（可能是标签或导航）
-            meaningful_paragraphs = []
-            for p in paragraphs:
-                p_clean = p.strip()
-                # 保留长度大于 50 的段落
-                if len(p_clean) > 50:
-                    # 检查段落是否包含太多链接标记（可能是导航）
-                    link_count = len(re.findall(r'\[|\]|\(https?://', p_clean))
-                    if link_count < len(p_clean) / 20:  # 链接密度不能太高
-                        meaningful_paragraphs.append(p_clean)
-            
-            if meaningful_paragraphs:
-                # 找到最长的段落块（通常是正文）
-                # 按长度排序，保留前 80% 的段落
-                meaningful_paragraphs.sort(key=len, reverse=True)
-                keep_count = max(1, int(len(meaningful_paragraphs) * 0.8))
-                content = '\n\n'.join(meaningful_paragraphs[:keep_count])
-            elif paragraphs:
-                # 如果没有找到长段落，至少保留最长的几个
-                paragraphs.sort(key=len, reverse=True)
-                content = '\n\n'.join(paragraphs[:min(5, len(paragraphs))])
-        
-        # 移除多余的换行
-        content = re.sub(r'\n{3,}', '\n\n', content)
-        
-        # 移除行首和行尾的多余空格
-        lines = content.split('\n')
-        content = '\n'.join(line.strip() for line in lines if line.strip())
-        content = self._deduplicate_lines(content)
-        
-        return content.strip()
-    
-    def _extract_from_html(self, html: str) -> str:
-        """从 HTML 中提取主要内容"""
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 移除脚本、样式、导航等
-        for element in soup(["script", "style", "nav", "header", "footer", "aside", 
-                            "noscript", "iframe", "form", "button", "svg"]):
-            element.decompose()
-        
-        # 移除常见的导航和侧边栏类
-        removal_selectors = [
-            '.nav', '.navigation', '.navbar', '.menu', '.sidebar', '.aside', '.header', '.footer',
-            '.breadcrumb', '.tags', '.related', '.comments', '.social', '.share', '.subscribe',
-            '.advertisement', '.ad', '.ads', '.promo', '.sponsor', '.newsletter', '.signup',
-            '.cookie', '.consent', '.gdpr', '.modal', '.overlay', '[role="navigation"]',
-            '[aria-label*="breadcrumb"]', '[aria-label*="navigation"]'
-        ]
-        for element in soup.select(', '.join(removal_selectors)):
-            element.decompose()
-        
-        # 尝试找到文章主体
-        article_selectors = [
-            'article',
-            '[role="article"]',
-            'main',
-            '.article-content',
-            '.article-body',
-            '.post-content',
-            '.entry-content',
-            '.story-body',
-            '.content-body',
-            '.story-text',
-            '.article-text',
-            '[itemprop="articleBody"]'
-        ]
-        
-        article = None
-        for selector in article_selectors:
-            article = soup.select_one(selector)
-            if article:
-                break
-        
-        if not article:
-            # 如果没有找到，尝试找到包含最多文本的 div
-            body = soup.find('body')
-            if body:
-                # 找到所有包含文本的 div
-                divs = body.find_all('div', recursive=True)
-                if divs:
-                    # 选择文本最长的 div（通常是正文）
-                    article = max(divs, key=lambda d: len(d.get_text(strip=True)))
-        
-        if not article:
-            article = soup.find('body')
-        
-        if article:
-            # 提取文本，移除短行和链接
-            text = article.get_text(separator='\n', strip=True)
-            
-            # 清理文本
-            lines = text.split('\n')
-            cleaned_lines = []
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                # 跳过短行（可能是标签）
-                if len(line) < 10:
-                    continue
-                # 跳过看起来像 URL 的行
-                if line.startswith('http://') or line.startswith('https://'):
-                    continue
-                cleaned_lines.append(line)
-            
-            text = '\n'.join(cleaned_lines)
-            # 清理多余的空白
-            text = re.sub(r'\n{3,}', '\n\n', text)
-            return self._deduplicate_lines(text.strip())
-        
-        return ""
-    
-    def extract_published_at(self, html: str, fallback_date: Optional[str] = None) -> str:
-        """提取发布时间
-        
-        优先级：
-        1. <meta property="article:published_time">
-        2. <time datetime="...">
-        3. schema.org datePublished
-        4. 回退到 fallback_date（通常是 GKG 日期）
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 尝试 OpenGraph published_time
-        og_published = soup.find('meta', property='article:published_time')
-        if og_published and og_published.get('content'):
-            try:
-                dt = datetime.fromisoformat(og_published['content'].replace('Z', '+00:00'))
-                return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            except:
-                pass
-        
-        # 尝试 time 标签
-        time_tag = soup.find('time', attrs={'datetime': True})
-        if time_tag:
-            try:
-                dt = datetime.fromisoformat(time_tag['datetime'].replace('Z', '+00:00'))
-                return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            except:
-                pass
-        
-        # 尝试 schema.org datePublished
-        schema_date = soup.find(attrs={'itemprop': 'datePublished'})
-        if schema_date:
-            date_str = schema_date.get('content') or schema_date.get_text()
-            if date_str:
-                try:
-                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-                except:
-                    pass
-        
-        # 回退到 fallback_date
-        if fallback_date:
-            try:
-                # 假设 fallback_date 是 YYYY-MM-DD 格式
-                dt = datetime.strptime(fallback_date, '%Y-%m-%d')
-                return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            except:
-                pass
-        
-        # 如果都失败，使用当前时间
-        logger.warning(f"无法提取发布时间，使用当前时间")
-        return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-    
-    def extract_language(self, html: str, url: str) -> str:
-        """提取语言
-        
-        优先级：
-        1. HTML lang 属性
-        2. URL 中的语言标识
-        3. 默认返回 'en'
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 尝试 HTML lang 属性
-        html_tag = soup.find('html')
-        if html_tag and html_tag.get('lang'):
-            lang = html_tag['lang'].lower()
-            # 提取主要语言代码（如 'en-US' -> 'en'）
-            lang_code = lang.split('-')[0]
-            if lang_code == 'en':
-                return 'en'
-        
-        # 检查 URL 中的语言标识
-        url_lower = url.lower()
-        if '/en/' in url_lower or url_lower.endswith('/en'):
-            return 'en'
-        
-        # 默认返回英文（因为我们已经在前面的步骤中过滤了非英文 URL）
-        return 'en'
-    
-    def extract_tags(self, themes: Optional[str], url: str) -> Optional[list]:
-        """提取粗粒度分类标签（限定类别，避免生成细碎标签）"""
-        categories = {
-            "politics": [
-                "politics", "election", "government", "policy", "geopolitics", "diplomacy"
-            ],
-            "business_finance": [
-                "economy", "economic", "econ", "finance", "business", "market", "markets",
-                "banking", "investment", "stock", "trade"
-            ],
-            "technology": [
-                "technology", "tech", "ai", "cyber", "software", "hardware", "internet", "it"
-            ],
-            "science": [
-                "science", "research", "space", "nasa", "astronomy", "physics", "climate"
-            ],
-            "health": [
-                "health", "medical", "medicine", "covid", "virus", "disease", "vaccine"
-            ],
-            "sports": [
-                "sports", "sport", "football", "soccer", "nba", "nfl", "mlb", "olympic"
-            ],
-            "entertainment": [
-                "entertainment", "culture", "movie", "film", "music", "tv", "showbiz", "celebrity"
-            ],
-            "world": [
-                "world", "international", "global", "foreign"
-            ],
-        }
-        
-        selected = set()
-        
-        def match_keyword_list(text: str):
-            text_lower = text.lower()
-            for cat, keywords in categories.items():
-                for kw in keywords:
-                    if kw in text_lower:
-                        selected.add(cat)
-        
-        # 1) 从 GKG themes 里匹配关键词
-        if themes:
-            theme_list = [t.strip() for t in themes.split(';') if t.strip()]
-            for t in theme_list:
-                match_keyword_list(t)
-        
-        # 2) URL 路径匹配
-        match_keyword_list(url)
-        
-        return list(selected) if selected else None
-    
-    def extract(self, html: str, markdown: Optional[str], url: str, 
-                source_name: str, gkg_date: Optional[str] = None,
-                themes: Optional[str] = None) -> Dict:
-        """提取所有内容字段"""
-        # 提取域名用于特定清理规则
-        domain = self._extract_domain_from_url(url)
-        
-        title = self.extract_title(html, url)
-        summary = self.extract_summary(html)
-        content = self.extract_content(html, markdown, domain, url)
-        published_at = self.extract_published_at(html, gkg_date)
-        language = self.extract_language(html, url)
-        tags = self.extract_tags(themes, url)
-        
-        return {
-            "title": title,
-            "summary": summary,
-            "content": content,
-            "published_at": published_at,
-            "language": language,
-            "tags": tags
-        }
-    
-    def _extract_domain_from_url(self, url: str) -> Optional[str]:
-        """从 URL 中提取域名"""
-        try:
-            parsed = urlparse(url)
-            return parsed.netloc.lower()
-        except:
+                best = s
+        if not best:
             return None
+        return _truncate(best, 240) or None
+
+    def _is_valid_title(self, title: str) -> bool:
+        t = (title or "").strip()
+        if len(t) < 8:
+            return False
+        lower = t.lower()
+        if any(k in lower for k in self._TITLE_NOISE_HINTS):
+            return False
+        if self._looks_like_caption_ui_line(t):
+            return False
+        return True
+
+    def _clean_inline_text(self, text: str) -> str:
+        s = _strip_control_chars(text or "")
+        s = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", s)
+        s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)
+        s = re.sub(r"https?://\S+", "", s)
+        s = re.sub(r"\bwww\.[^\s]+", "", s)
+        s = _norm_space(s)
+        return s
+
+    # -----------------------------
+    # Internals: Markdown cleaning (strict body-only)
+    # -----------------------------
+
+    def _filter_lines_strict(self, markdown: str) -> List[str]:
+        """
+        Strict line filter:
+        - Drop ALL headings
+        - Drop fenced code blocks entirely
+        - Drop caption/player UI lines
+        - Drop obvious nav/subscription/promotional lines
+        - Drop "See all / View all / Show more"
+        - Drop list-item link clusters that look like nav blocks
+        - Keep only candidate body lines + blank lines (as paragraph boundaries)
+        """
+        out: List[str] = []
+
+        for raw in markdown.splitlines():
+            stripped = raw.strip()
+
+            # preserve blank lines (for paragraph boundaries)
+            if not stripped:
+                out.append("")
+                continue
+
+            # drop headings entirely
+            if _is_heading(stripped):
+                continue
+
+            s = _norm_space(_strip_control_chars(stripped))
+            if not s:
+                continue
+
+            lower = s.lower()
+
+            # caption/player UI
+            if self._looks_like_caption_ui_line(s):
+                continue
+            if any(tok in lower for tok in self._UI_TOKENS):
+                # keep if it is clearly a sentence-like paragraph (rare)
+                if not (_looks_like_sentence(s) and len(s) >= 100):
+                    continue
+
+            # explicit see-all controls
+            if self._SEE_ALL_PAT.match(s):
+                continue
+
+            # inline noise hints
+            if any(h in lower for h in self._INLINE_NOISE_HINTS):
+                if not (_looks_like_sentence(s) and len(s) >= 120):
+                    continue
+
+            # nav/list-like lines (bullets, numbered lists, short link titles)
+            if self._is_nav_listish_line(s):
+                continue
+
+            # very short non-sentence lines are almost always junk at this stage
+            if self._is_short_noise_line_strict(s):
+                continue
+
+            out.append(s)
+
+        # collapse multiple blanks
+        compact: List[str] = []
+        prev_blank = False
+        for ln in out:
+            blank = (ln.strip() == "")
+            if blank and prev_blank:
+                continue
+            compact.append(ln)
+            prev_blank = blank
+
+        return compact
+
+    def _is_nav_listish_line(self, s: str) -> bool:
+        """
+        Detect typical non-body lines:
+        - bullet/numbered items (often related links)
+        - pipe-separated clusters
+        - short title-like lines without punctuation
+        """
+        t = s.strip()
+        if not t:
+            return False
+
+        if re.match(r"^[-*•]\s+\S+", t):
+            return True
+        if re.match(r"^\d+\.\s+\S+", t):
+            return True
+
+        if "|" in t and not _looks_like_sentence(t) and len(t) < 260:
+            return True
+
+        # "#### Health" 已在 heading 阶段丢弃；这里处理“Health”这种短频道残留
+        if len(t) <= 30 and not _looks_like_sentence(t):
+            # 单/双 token 的短名词非常像频道
+            tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", t)
+            if 1 <= len(tokens) <= 3:
+                return True
+
+        return False
+
+    def _is_short_noise_line_strict(self, s: str) -> bool:
+        """
+        Strict short-line removal (more aggressive than original):
+        - If not sentence-like and < 80 => drop
+        - If sentence-like but < 60 => drop (usually caption/byline)
+        """
+        t = s.strip()
+        print(len(t), t)
+        if not t:
+            return True
+        if _looks_like_sentence(t):
+            return len(t) < 60
+        return len(t) < 80
+
+    def _is_body_paragraph(self, p: str) -> bool:
+        """
+        Decide whether a line is likely main body content.
+        High precision:
+        - must be sentence-like (punctuation) OR very long
+        - must be long enough
+        - must have enough word-like tokens
+        - must not look like UI/nav leftovers
+        """
+        s = _norm_space(_strip_control_chars(p or ""))
+        if not s:
+            return False
+
+        lower = s.lower()
+
+        # UI/menu remnants
+        if self._looks_like_caption_ui_line(s):
+            return False
+        if any(h in lower for h in self._INLINE_NOISE_HINTS):
+            return False
+
+        # token/length thresholds
+        if len(s) < self._MIN_PARAGRAPH_CHARS:
+            return False
+
+        tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", s)
+        if len(tokens) < self._MIN_PARAGRAPH_WORDLIKE_TOKENS:
+            return False
+
+        # sentence-ness: require punctuation, unless paragraph is very long
+        if not _looks_like_sentence(s) and len(s) < max(260, self._MIN_PARAGRAPH_CHARS * 2):
+            return False
+
+        # Avoid paragraphs that are basically lists or link clusters
+        if self._is_nav_listish_paragraph(s):
+            return False
+
+        return True
+
+    def _is_nav_listish_paragraph(self, s: str) -> bool:
+        """
+        Paragraph-level nav detection:
+        - many short fragments separated by '*' or '\n' already merged as ' * '
+        - many numbered items
+        - low punctuation but many title-like chunks
+        """
+        t = s.strip()
+        if not t:
+            return True
+
+        # Many bullet markers that survived merging (rare but happens)
+        bullet_like = len(re.findall(r"\s[*•]\s", t))
+        if bullet_like >= 2 and not _looks_like_sentence(t):
+            return True
+
+        # Many numbered items in one paragraph
+        num_like = len(re.findall(r"\b\d+\.\s", t))
+        if num_like >= 2:
+            return True
+
+        # Very low punctuation density but lots of tokens can indicate nav clusters
+        punct_cnt = len(re.findall(r"[.!?。！？]", t))
+        if punct_cnt == 0 and len(t) < 600:
+            # if it is long but has no sentence punctuation, it's suspicious
+            return True
+
+        return False
+
+    def _looks_like_caption_ui_line(self, line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return False
+
+        if self._UI_GLUE_PAT.search(s):
+            return True
+
+        lower = s.lower()
+        hits = sum(1 for t in self._UI_TOKENS if t in lower)
+
+        has_sentence_punct = bool(re.search(r"[.!?。！？]", s))
+        longish = len(s) >= 90
+
+        has_many_percents = len(re.findall(r"\b\d{1,3}%\b", s)) >= 2
+        color_hits = sum(1 for c in ("white", "black", "red", "green", "blue", "yellow", "magenta", "cyan") if c in lower)
+
+        if hits >= 4 and longish and not has_sentence_punct:
+            return True
+        if hits >= 3 and color_hits >= 3 and not has_sentence_punct and longish:
+            return True
+        if has_many_percents and ("font" in lower or "opacity" in lower) and not has_sentence_punct:
+            return True
+
+        return False
+
+
+def _clean_meta_text(s: str) -> str:
+    s = _strip_control_chars(s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s

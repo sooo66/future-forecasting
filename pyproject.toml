@@ -27,6 +27,13 @@ dependencies = [
     "tqdm>=4.66.0",
     "urllib3>=2.0.0",
     "httpx[socks]>=0.28.1",
+    "waybackpy>=3.0.6",
+    "fake-useragent>=2.2.0",
+    "matplotlib>=3.10.8",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "transformers>=4.57.3",
+    "scikit-learn>=1.7.2",
 ]
 
 [[tool.uv.index]]

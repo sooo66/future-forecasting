@@ -17,7 +17,18 @@ else:
 class Config:
     """配置管理器"""
     
-    def __init__(self, config_path: str = "config/settings.toml"):
+    def __init__(self, config_path: "str | Path | dict" = "config/settings.toml"):
+        """初始化配置
+        
+        - 默认从 `config/settings.toml` 读取配置文件；
+        - 在测试或脚本中可以直接传入一个 dict，避免依赖磁盘上的 TOML 文件。
+        """
+        # 直接传入 dict 时，跳过文件读取，便于单元测试
+        if isinstance(config_path, dict):
+            self.config_path = None
+            self._config = config_path
+            return
+        
         self.config_path = Path(config_path)
         if not self.config_path.exists():
             raise FileNotFoundError(f"配置文件不存在: {config_path}")
