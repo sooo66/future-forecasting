@@ -6,9 +6,9 @@ from loguru import logger
 
 from utils.config import Config
 from utils.logger import setup_logger
-from gdelt_downloader import GDELTDownloader, GDELTParser
-from url_pool_builder import URLPoolBuilder
-from crawler import NewsCrawler, Crawler
+from info.news import GDELTDownloader, GDELTParser, URLPoolBuilder, NewsCrawler
+from info.sociomedia import run_sociomedia_from_config
+from info.crawler import Crawler
 
 
 def download_gkg(args):
@@ -59,7 +59,7 @@ def build_url_pool(args):
 def crawl(args):
     """爬取新闻"""
     config = Config(args.config)
-    setup_logger(config)
+    setup_logger(config, verbose=bool(getattr(args, "verbose", False)))
     
     logger.info("开始爬取新闻")
 
@@ -93,7 +93,7 @@ def crawl(args):
 def full_pipeline(args):
     """完整流程"""
     config = Config(args.config)
-    setup_logger(config)
+    setup_logger(config, verbose=bool(getattr(args, "verbose", False)))
     
     logger.info("开始完整流程")
     
@@ -151,7 +151,7 @@ def full_pipeline(args):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="新闻爬虫系统 - 从 GDELT GKG 构建新闻 URL 池并爬取结构化数据"
+        description="信息采集系统入口 - 支持新闻、博客等多来源管道"
     )
     
     parser.add_argument(
@@ -162,53 +162,83 @@ def main():
     )
     
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
-    
-    # download-gkg 命令
-    subparsers.add_parser("download-gkg", help="下载 GDELT GKG 数据")
-    
-    # parse-gkg 命令
-    subparsers.add_parser("parse-gkg", help="解析 GDELT GKG 数据")
-    
-    # build-url-pool 命令
-    subparsers.add_parser("build-url-pool", help="构建 URL 池")
-    
-    # crawl 命令
-    crawl_parser = subparsers.add_parser("crawl", help="爬取新闻")
-    crawl_parser.add_argument(
+
+    news_parser = subparsers.add_parser("news", help="新闻来源管道")
+    news_sub = news_parser.add_subparsers(dest="news_command", help="news 子命令")
+
+    news_sub.add_parser("download-gkg", help="下载 GDELT GKG 数据")
+    news_sub.add_parser("parse-gkg", help="解析 GDELT GKG 数据")
+    news_sub.add_parser("build-url-pool", help="构建 URL 池")
+
+    news_crawl_parser = news_sub.add_parser("crawl", help="爬取新闻")
+    news_crawl_parser.add_argument(
         "--limit",
         type=int,
         help="限制爬取的 URL 数量（用于测试）"
     )
-    crawl_parser.add_argument(
+    news_crawl_parser.add_argument(
         "--source",
         type=str,
-        required=True,
-        help="urls.jsonl 文件路径（每行一个 JSON，至少包含 url 字段）"
+        help="urls.jsonl 文件路径（每行一个 JSON，至少包含 url 字段）；不传则使用新闻 URL 池"
     )
-    crawl_parser.add_argument(
+    news_crawl_parser.add_argument(
         "--output",
         type=str,
         help="输出 jsonl 文件路径（默认写入 processed_data_dir）"
     )
-    crawl_parser.add_argument(
+    news_crawl_parser.add_argument(
         "--proxy-file",
         type=str,
         help="代理池配置文件路径（默认不使用外部代理池）"
     )
-    crawl_parser.add_argument(
+    news_crawl_parser.add_argument(
         "--no-proxy",
         action="store_true",
         help="禁用代理池轮换（即使配置允许）"
     )
-    
-    # full-pipeline 命令
-    pipeline_parser = subparsers.add_parser("full-pipeline", help="执行完整流程")
+    news_crawl_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="输出更详细的日志（同时写入日志文件）"
+    )
+
+    pipeline_parser = news_sub.add_parser("full-pipeline", help="执行完整新闻流程")
     pipeline_parser.add_argument(
         "--limit",
         type=int,
         help="限制爬取的 URL 数量（用于测试）"
     )
-    
+    pipeline_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="输出更详细的日志（同时写入日志文件）"
+    )
+
+    sociomedia_parser = subparsers.add_parser("sociomedia", help="社交媒体来源管道")
+    sociomedia_parser.add_argument(
+        "--config",
+        type=str,
+        default="config/sociomedia_sources.toml",
+        help="配置文件路径（默认: config/sociomedia_sources.toml）",
+    )
+    sociomedia_parser.add_argument(
+        "--date",
+        type=str,
+        help="单日日期（YYYY-MM-DD），会覆盖配置中的 start/end",
+    )
+    sociomedia_parser.add_argument(
+        "--source",
+        type=str,
+        choices=["twitter", "quora", "all"],
+        default="all",
+        help="选择来源（twitter/quora/all）",
+    )
+    sociomedia_parser.add_argument(
+        "--limit",
+        type=int,
+        help="单日最大抓取条数（对选定来源生效）",
+    )
+
     args = parser.parse_args()
     
     if not args.command:
@@ -216,16 +246,26 @@ def main():
         return
     
     try:
-        if args.command == "download-gkg":
-            download_gkg(args)
-        elif args.command == "parse-gkg":
-            parse_gkg(args)
-        elif args.command == "build-url-pool":
-            build_url_pool(args)
-        elif args.command == "crawl":
-            crawl(args)
-        elif args.command == "full-pipeline":
-            full_pipeline(args)
+        if args.command == "news":
+            if args.news_command == "download-gkg":
+                download_gkg(args)
+            elif args.news_command == "parse-gkg":
+                parse_gkg(args)
+            elif args.news_command == "build-url-pool":
+                build_url_pool(args)
+            elif args.news_command == "crawl":
+                crawl(args)
+            elif args.news_command == "full-pipeline":
+                full_pipeline(args)
+            else:
+                news_parser.print_help()
+        elif args.command == "sociomedia":
+            run_sociomedia_from_config(
+                args.config,
+                date_override=args.date,
+                source=args.source,
+                limit_override=args.limit,
+            )
         else:
             parser.print_help()
     except KeyboardInterrupt:

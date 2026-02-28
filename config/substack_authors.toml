@@ -1,0 +1,150 @@
+[date_range]
+start_date = "2025-12-01T00:00:00Z"
+end_date = "2025-12-31T23:59:59Z"
+
+[paths]
+output_dir = "data/processed/substack"
+state_path = "data/processed/substack_state.json"
+
+[domains.finance]
+[[domains.finance.authors]]
+name = "Not Boring"
+base_url = "https://notboring.substack.com"
+
+[[domains.finance.authors]]
+name = "The Generalist"
+base_url = "https://thegeneralist.substack.com"
+
+[domains.technology]
+[[domains.technology.authors]]
+name = "Platformer"
+base_url = "https://platformer.substack.com"
+
+[[domains.technology.authors]]
+name = "Big Technology"
+base_url = "https://bigtechnology.substack.com"
+
+[[domains.technology.authors]]
+name = "Lenny's Newsletter"
+base_url = "https://lenny.substack.com"
+
+[[domains.technology.authors]]
+name = "Exponential View"
+base_url = "https://exponentialview.substack.com"
+
+[[domains.technology.authors]]
+name = "Eugene Wei"
+base_url = "https://eugenewei.substack.com"
+
+[[domains.technology.authors]]
+name = "The Pragmatic Engineer"
+base_url = "https://pragmaticengineer.substack.com"
+
+[domains.politics]
+[[domains.politics.authors]]
+name = "Slow Boring"
+base_url = "https://slowboring.substack.com"
+
+[[domains.politics.authors]]
+name = "Tangle"
+base_url = "https://tangle.substack.com"
+
+[[domains.politics.authors]]
+name = "Popular Information"
+base_url = "https://popularinformation.substack.com"
+
+[domains.economics]
+[[domains.economics.authors]]
+name = "Noahpinion"
+base_url = "https://noahpinion.substack.com"
+
+[[domains.economics.authors]]
+name = "BIG by Matt Stoller"
+base_url = "https://mattstoller.substack.com"
+
+[domains.ai]
+[[domains.ai.authors]]
+name = "Import AI"
+base_url = "https://importai.substack.com"
+
+[[domains.ai.authors]]
+name = "Latent Space"
+base_url = "https://latentspace.substack.com"
+
+[[domains.ai.authors]]
+name = "Ben's Bites"
+base_url = "https://bensbites.substack.com"
+
+[[domains.ai.authors]]
+name = "One Useful Thing"
+base_url = "https://oneusefulthing.substack.com"
+
+[domains.science]
+[[domains.science.authors]]
+name = "Astral Codex Ten"
+base_url = "https://astralcodexten.substack.com"
+
+[[domains.science.authors]]
+name = "Experimental History"
+base_url = "https://experimentalhistory.substack.com"
+
+[domains.research]
+[[domains.research.authors]]
+name = "Construction Physics"
+base_url = "https://constructionphysics.substack.com"
+
+[[domains.research.authors]]
+name = "Works in Progress"
+base_url = "https://worksinprogress.substack.com"
+
+[domains.climate]
+[[domains.climate.authors]]
+name = "HEATED"
+base_url = "https://emilyatkin.substack.com"
+
+[domains.data]
+[[domains.data.authors]]
+name = "FlowingData"
+base_url = "https://flowingdata.substack.com"
+
+[domains.geopolitics]
+[[domains.geopolitics.authors]]
+name = "ChinaTalk"
+base_url = "https://chinatalk.substack.com"
+
+
+[domains.culture]
+[[domains.culture.authors]]
+name = "The Honest Broker"
+base_url = "https://freddiedeboer.substack.com"
+
+[[domains.culture.authors]]
+name = "Persuasion"
+base_url = "https://persuasion.substack.com"
+
+[[domains.culture.authors]]
+name = "Pirate Wires"
+base_url = "https://piratewires.substack.com"
+
+[[domains.culture.authors]]
+name = "Culture Study"
+base_url = "https://culturestudy.substack.com"
+
+[[domains.culture.authors]]
+name = "Ann Helen Petersen"
+base_url = "https://annhelen.substack.com"
+
+[domains.history]
+[[domains.history.authors]]
+name = "Letters from an American"
+base_url = "https://heathercoxrichardson.substack.com"
+
+[domains.media]
+[[domains.media.authors]]
+name = "The Free Press"
+base_url = "https://thefp.substack.com"
+
+[domains.sports]
+[[domains.sports.authors]]
+name = "House of Strauss"
+base_url = "https://houseofstrauss.substack.com"

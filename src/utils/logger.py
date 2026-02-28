@@ -5,7 +5,7 @@ from loguru import logger
 from .config import Config
 
 
-def setup_logger(config: Config):
+def setup_logger(config: Config, *, verbose: bool = False):
     """配置日志系统"""
     log_dir = config.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -13,11 +13,11 @@ def setup_logger(config: Config):
     # 移除默认处理器
     logger.remove()
     
-    # 添加控制台输出（INFO 级别以上）
+    # 添加控制台输出（默认 INFO，verbose 时 DEBUG）
     logger.add(
         sys.stdout,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level="INFO",
+        level="DEBUG" if verbose else "INFO",
         colorize=True
     )
     

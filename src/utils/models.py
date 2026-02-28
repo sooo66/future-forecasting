@@ -15,8 +15,9 @@ class Record:
     description: Optional[str]
     content: Any  # 修改为 Any，因为可能是 MarkdownGenerationResult 或字符串
     published_at: str  # ISO8601 字符串
-    language: Optional[str]
-    tags: Optional[List[str]]
+    language: Optional[str] = None
+    tags: Optional[List[str]] = None
+    pubtime: Optional[str] = None  # 与 published_at 对齐的发布时间
     
     def to_dict(self) -> dict:
         """转换为字典"""

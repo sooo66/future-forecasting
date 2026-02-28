@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "polymarket",
+  "owner": "tianzecn",
+  "repo": "myclaudecode",
+  "path": "plugins/blockchain/skills/polymarket",
+  "branch": "main",
+  "sha": "e13def858529c68414fe63d8418c7c4886ae719d",
+  "source": "manual"
+}

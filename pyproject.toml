@@ -34,6 +34,8 @@ dependencies = [
     "torchvision>=0.24.1",
     "transformers>=4.57.3",
     "scikit-learn>=1.7.2",
+    "openbb>=4.6.0",
+    "qwen-agent[code-interpreter,gui,mcp,rag]>=0.0.5",
 ]
 
 [[tool.uv.index]]
