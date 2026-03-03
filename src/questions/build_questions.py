@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import re
 import sys
@@ -29,34 +28,36 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import requests
 
 try:
-    import matplotlib
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except Exception:  # visualization is best-effort
-    plt = None
+from question_visualization import make_visualizations
 
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
 # ---- defaults ----
-DEFAULT_PAGE_LIMIT = 200
-DEFAULT_MAX_MARKETS = 1800
-DEFAULT_MIX_MAX_OFFSET = 12000
-DEFAULT_MIN_LIQUIDITY = 0.0
+DEFAULT_PAGE_LIMIT = 80
 DEFAULT_MIN_VOLUME_TOTAL = 100.0
-DEFAULT_MIN_VOLUME_24H = 0.0
-DEFAULT_MIN_CRITERIA_CHARS = 40
-DEFAULT_SUM_TOLERANCE = 0.08
-DEFAULT_SAMPLE_SIZE = 300
 DEFAULT_VALIDATE_N = 20
 DEFAULT_SAMPLE_OFFSETS_DAYS = [30, 7, 1]
-DEFAULT_MIN_DURATION_DAYS = 30
+DEFAULT_MIN_DURATION_DAYS = 3
+DEFAULT_RECENT_RESOLVE_DAYS = 92
 DEFAULT_MAX_SERIES_POINTS = 180
+DEFAULT_MAX_RUNTIME_SEC = 900
+DEFAULT_MAX_EMPTY_PAGES = 40
+DEFAULT_PANEL_DOMAIN_QUOTA = 40
+DEFAULT_PANEL_MIN_COUNTS = "30:80,7:150,1:150"
+DEFAULT_MIN_ACTIVE_DOMAINS = 2
+DEFAULT_MIN_PER_DOMAIN = 15
+DEFAULT_MAX_DOMAIN_RATIO = 4.0
+DEFAULT_MAX_POOL_SIZE = 5000
+DEFAULT_MIN_FINAL_COUNT = 800
 
-REQUEST_TIMEOUT = 25
-MAX_RETRIES = 4
+REQUEST_TIMEOUT = 8
+MAX_RETRIES = 2
 BASE_BACKOFF_SEC = 0.6
 RATE_LIMIT_SLEEP_SEC = 0.03
 RANDOM_SEED = 42
@@ -85,19 +86,22 @@ DOMAIN_TAG_SLUGS: Dict[str, List[str]] = {
 
 @dataclass
 class Config:
-    max_markets: int
     page_limit: int
-    mix_max_offset: int
-    min_liquidity: float
     min_volume_total: float
-    min_volume_24h: float
-    min_criteria_chars: int
-    sum_tolerance: float
-    sample_size: int
     validate_n: int
     sample_offsets_days: List[int]
     min_duration_days: int
+    recent_resolve_days: int
     max_series_points: int
+    max_runtime_sec: int
+    max_empty_pages: int
+    panel_domain_quota: int
+    panel_min_counts: Dict[int, int]
+    min_active_domains: int
+    min_per_domain: int
+    max_domain_ratio: float
+    max_pool_size: int
+    min_final_count: int
     output_dir: Path
 
 
@@ -116,6 +120,10 @@ def parse_dt(value: Any) -> Optional[datetime]:
     if not text:
         return None
     text = text.replace(" ", "T")
+    # normalize timezone suffixes like +00 / -05 to +00:00 / -05:00
+    m = re.search(r"([+-]\d{2})$", text)
+    if m:
+        text = text + ":00"
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
@@ -164,19 +172,6 @@ def normalize_slug(text: str) -> str:
     t = text.strip().lower()
     t = re.sub(r"[^a-z0-9]+", "-", t)
     return re.sub(r"-+", "-", t).strip("-") or "other"
-
-
-def interleaved_offsets(max_offset: int, page_limit: int) -> List[int]:
-    pages = list(range(0, max_offset + 1, page_limit))
-    out: List[int] = []
-    i, j = 0, len(pages) - 1
-    while i <= j:
-        out.append(pages[i])
-        i += 1
-        if i <= j:
-            out.append(pages[j])
-            j -= 1
-    return out
 
 
 def duration_days(open_dt: datetime, close_dt: datetime) -> float:
@@ -228,7 +223,17 @@ class PolymarketClient:
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt == MAX_RETRIES:
                     return None, f"api_error:{endpoint_name}"
-                time.sleep(BASE_BACKOFF_SEC * (2**attempt))
+                if resp.status_code == 429:
+                    ra = resp.headers.get("Retry-After")
+                    wait = 1.0
+                    if ra:
+                        try:
+                            wait = min(max(float(ra), 0.2), 3.0)
+                        except ValueError:
+                            wait = 1.0
+                    time.sleep(wait)
+                else:
+                    time.sleep(BASE_BACKOFF_SEC * (2**attempt))
                 continue
 
             if not (200 <= resp.status_code < 300):
@@ -277,9 +282,9 @@ class PolymarketClient:
             return None, None
         return data, None
 
-    def get_price_history(self, yes_token_id: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    def get_price_history(self, token_id: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
         params = {
-            "market": yes_token_id,
+            "market": token_id,
             "interval": "max",
             "fidelity": 1440,
         }
@@ -312,8 +317,8 @@ def parse_outcomes(m: Dict[str, Any]) -> Tuple[List[str], List[float]]:
     return outcomes, prices
 
 
-def is_yes_no(outcomes: List[str]) -> bool:
-    return len(outcomes) == 2 and {x.lower() for x in outcomes} == {"yes", "no"}
+def is_binary_outcomes(outcomes: List[str]) -> bool:
+    return len(outcomes) == 2 and all(bool(x) for x in outcomes)
 
 
 def resolved_status(m: Dict[str, Any], prices: List[float]) -> bool:
@@ -324,35 +329,19 @@ def resolved_status(m: Dict[str, Any], prices: List[float]) -> bool:
     return max(prices) >= 0.95 and min(prices) <= 0.05
 
 
-def valid_probability_pair(prices: List[float], tol: float) -> bool:
+def extract_binary_answer(prices: List[float]) -> Optional[int]:
     if len(prices) != 2:
-        return False
-    if any(p < -1e-9 or p > 1 + 1e-9 for p in prices):
-        return False
-    return abs((prices[0] + prices[1]) - 1.0) <= tol
-
-
-def extract_answer_yes(outcomes: List[str], prices: List[float]) -> Optional[int]:
-    if len(outcomes) != 2 or len(prices) != 2:
         return None
-    try:
-        yes_idx = [x.lower() for x in outcomes].index("yes")
-    except ValueError:
+    if any(p is None for p in prices):
         return None
-    return 1 if prices[yes_idx] >= 0.5 else 0
+    return 1 if prices[0] >= prices[1] else 0
 
 
-def yes_token_id(m: Dict[str, Any], outcomes: List[str]) -> Optional[str]:
+def primary_token_id(m: Dict[str, Any]) -> Optional[str]:
     ids = maybe_json_list(m.get("clobTokenIds"))
-    if len(ids) < 2:
+    if len(ids) < 1:
         return None
-    try:
-        yes_idx = [x.lower() for x in outcomes].index("yes")
-    except ValueError:
-        return None
-    if yes_idx >= len(ids):
-        return None
-    return str(ids[yes_idx])
+    return str(ids[0])
 
 
 def parse_times(m: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime], Optional[datetime]]:
@@ -367,7 +356,7 @@ def resolution_criteria(m: Dict[str, Any]) -> str:
     source = str(m.get("resolutionSource") or "").strip()
     if source and source not in desc:
         return (desc + "\nResolution source: " + source).strip()
-    return desc
+    return desc or source
 
 
 def collect_official_tags(m: Dict[str, Any]) -> List[str]:
@@ -413,7 +402,7 @@ def infer_domain(m: Dict[str, Any]) -> str:
     if "sports" in tagset:
         return "sports"
     if "crypto" in tagset:
-        return "crypto"
+        return "finance"
     if tagset.intersection({"politics", "elections", "us-politics", "current-events", "global-elections"}):
         return "politics"
     if tagset.intersection({"equities", "stocks", "finance", "business", "macro"}):
@@ -458,17 +447,8 @@ def compress_series(series: List[Dict[str, Any]], max_points: int) -> List[Dict[
     if len(series) <= max_points:
         return series
 
-    if max_points < 2:
-        return [series[0], series[-1]]
-
-    step = (len(series) - 1) / float(max_points - 1)
-    idxs = sorted({int(round(i * step)) for i in range(max_points)})
-    out = [series[i] for i in idxs]
-    if out[0]["t"] != series[0]["t"]:
-        out[0] = series[0]
-    if out[-1]["t"] != series[-1]["t"]:
-        out[-1] = series[-1]
-    return out
+    # Keep the latest points for long markets instead of uniform downsampling.
+    return series[-max_points:]
 
 
 def series_span_days(series: List[Dict[str, Any]]) -> float:
@@ -486,9 +466,6 @@ def nearest_prob_at_or_before(series: List[Dict[str, Any]], target: datetime) ->
     before = [x for x in series if x.get("t") and x["t"] <= target_iso]
     if before:
         return to_float(before[-1].get("p_yes"))
-    after = [x for x in series if x.get("t") and x["t"] > target_iso]
-    if after:
-        return to_float(after[0].get("p_yes"))
     return None
 
 
@@ -507,11 +484,11 @@ def difficulty_label(p_yes: Optional[float], vol: float) -> str:
     if p_yes is None:
         return "unknown"
     uncertainty = max(0.0, 1.0 - abs(p_yes - 0.5) * 2.0)  # near 0.5 => harder
-    vol_norm = min(max(vol / 0.08, 0.0), 1.0)
-    score = 0.75 * uncertainty + 0.25 * vol_norm
-    if score >= 0.66:
+    vol_norm = min(max(vol / 0.05, 0.0), 1.0)
+    score = 0.6 * uncertainty + 0.4 * vol_norm
+    if score >= 0.58:
         return "hard"
-    if score >= 0.38:
+    if score >= 0.30:
         return "medium"
     return "easy"
 
@@ -522,6 +499,8 @@ def build_sampled_points(series: List[Dict[str, Any]], resolve_dt: datetime, off
         key = f"{d}d"
         target = resolve_dt - timedelta(days=d)
         p = nearest_prob_at_or_before(series, target)
+        if p is None:
+            continue
         vol = local_volatility(series, target)
         out[key] = {
             "t": to_iso(target),
@@ -566,6 +545,45 @@ def balanced_sample_by_domain(records: List[Dict[str, Any]], sample_size: int) -
     return out
 
 
+def dominant_difficulty(market: Dict[str, Any]) -> str:
+    sampled = market.get("sampled", {})
+    if not isinstance(sampled, dict):
+        return "unknown"
+    for k in ("30d", "7d", "1d"):
+        if k in sampled and isinstance(sampled[k], dict):
+            return str(sampled[k].get("difficult", "unknown"))
+    vals = [str(v.get("difficult", "unknown")) for v in sampled.values() if isinstance(v, dict)]
+    return vals[0] if vals else "unknown"
+
+
+def balanced_sample_by_domain_and_difficulty(records: List[Dict[str, Any]], sample_size: int) -> List[Dict[str, Any]]:
+    if sample_size <= 0 or sample_size >= len(records):
+        return list(records)
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        key = (str(r.get("domain", "other")), dominant_difficulty(r))
+        groups[key].append(r)
+    for arr in groups.values():
+        arr.sort(key=lambda x: str(x.get("market_id")))
+    keys = sorted(groups.keys())
+    ptr = {k: 0 for k in keys}
+    out: List[Dict[str, Any]] = []
+    while len(out) < sample_size:
+        progressed = False
+        for k in keys:
+            i = ptr[k]
+            if i >= len(groups[k]):
+                continue
+            out.append(groups[k][i])
+            ptr[k] += 1
+            progressed = True
+            if len(out) >= sample_size:
+                break
+        if not progressed:
+            break
+    return out
+
+
 def validate_schema(records: List[Dict[str, Any]], sample_offsets_days: List[int], n: int) -> None:
     if not records:
         print("schema_check: no records")
@@ -587,6 +605,7 @@ def validate_schema(records: List[Dict[str, Any]], sample_offsets_days: List[int
         "community_time_series",
         "sampled",
     ]
+    allowed_sample_keys = {f"{d}d" for d in sample_offsets_days}
 
     for rec in sample:
         for k in required:
@@ -612,15 +631,12 @@ def validate_schema(records: List[Dict[str, Any]], sample_offsets_days: List[int
             prev_t = t
 
         s = rec.get("sampled", {})
-        if not isinstance(s, dict):
+        if not isinstance(s, dict) or not s:
             errors += 1
             continue
-        for d in sample_offsets_days:
-            k = f"{d}d"
-            if k not in s:
-                errors += 1
+        for k, obj in s.items():
+            if k not in allowed_sample_keys:
                 continue
-            obj = s[k]
             if not isinstance(obj, dict):
                 errors += 1
                 continue
@@ -630,48 +646,186 @@ def validate_schema(records: List[Dict[str, Any]], sample_offsets_days: List[int
     print(f"schema_check_samples={n} errors={errors}")
 
 
-def make_visualizations(markets: List[Dict[str, Any]], output_dir: Path, ts: str) -> List[Path]:
-    paths: List[Path] = []
-    if plt is None:
-        return paths
+def horizon_validity_summary(records: List[Dict[str, Any]], sample_offsets_days: List[int]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {f"{d}d": {"covered": 0, "missing": 0} for d in sample_offsets_days}
+    for rec in records:
+        resolve_dt = parse_dt(rec.get("resolve_time"))
+        series = rec.get("community_time_series", [])
+        first_dt = None
+        if isinstance(series, list) and series:
+            first_dt = parse_dt(series[0].get("t"))
+        for d in sample_offsets_days:
+            key = f"{d}d"
+            sampled = (rec.get("sampled") or {}).get(key)
+            p = to_float(sampled.get("p_yes")) if isinstance(sampled, dict) else None
+            if p is None or resolve_dt is None or first_dt is None:
+                out[key]["missing"] += 1
+                continue
+            out[key]["covered"] += 1
+    return out
 
-    domain_counts = Counter(m.get("domain", "other") for m in markets)
-    if domain_counts:
-        fig = plt.figure(figsize=(9, 4))
-        xs = list(domain_counts.keys())
-        ys = [domain_counts[x] for x in xs]
-        plt.bar(xs, ys)
-        plt.title("Domain Distribution")
-        plt.xticks(rotation=30, ha="right")
-        plt.tight_layout()
-        p = output_dir / f"q_domain_dist_{ts}.png"
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        paths.append(p)
 
-    diff_counts = Counter()
-    for m in markets:
+def panel_sort_key(m: Dict[str, Any]) -> Tuple[int, int, str]:
+    sampled = m.get("sampled", {})
+    sampled_count = len(sampled) if isinstance(sampled, dict) else 0
+    series = m.get("community_time_series", [])
+    series_len = len(series) if isinstance(series, list) else 0
+    return (-sampled_count, -series_len, str(m.get("market_id", "")))
+
+
+def build_panels(
+    records: List[Dict[str, Any]],
+    offsets: List[int],
+    domain_quota: int,
+    min_per_domain: int,
+    max_domain_ratio: float,
+) -> Dict[str, Dict[str, Any]]:
+    panels: Dict[str, Dict[str, Any]] = {}
+    for d in offsets:
+        key = f"{d}d"
+        eligible = [m for m in records if isinstance(m.get("sampled"), dict) and key in m["sampled"]]
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for m in eligible:
+            groups[str(m.get("domain", "other"))].append(m)
+        for arr in groups.values():
+            arr.sort(key=panel_sort_key)
+
+        # Soft balance:
+        # 1) start from all eligible records (no pre-cap) to avoid artificial exact-equal counts
+        # 2) trim dominant domains only if ratio gets too high
+        selected_by_domain: Dict[str, List[Dict[str, Any]]] = {}
+        for domain in sorted(groups.keys()):
+            selected_by_domain[domain] = list(groups[domain])
+
+        def counts_map() -> Dict[str, int]:
+            return {dname: len(arr) for dname, arr in selected_by_domain.items() if arr}
+
+        domain_counts = counts_map()
+        # Trim only when imbalance is too high among active domains.
+        while True:
+            active = {dname: c for dname, c in domain_counts.items() if c >= min_per_domain}
+            if len(active) < 2:
+                break
+            mn = min(active.values())
+            mx = max(active.values())
+            if mn <= 0 or (mx / mn) <= max_domain_ratio:
+                break
+            biggest = max(active.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            # Keep a loose floor near quota so trimming does not erase domain coverage.
+            if len(selected_by_domain.get(biggest, [])) <= max(domain_quota, min_per_domain):
+                break
+            if not selected_by_domain.get(biggest):
+                break
+            selected_by_domain[biggest].pop()
+            domain_counts = counts_map()
+
+        selected: List[Dict[str, Any]] = []
+        for domain in sorted(selected_by_domain.keys()):
+            selected.extend(selected_by_domain[domain])
+        domain_counts = counts_map()
+
+        selected.sort(key=lambda x: str(x.get("market_id", "")))
+        panels[key] = {
+            "offset_days": d,
+            "domain_quota": domain_quota,
+            "count": len(selected),
+            "domain_counts": dict(sorted(domain_counts.items())),
+            "markets": selected,
+        }
+    return panels
+
+
+def panel_goal_status(
+    panels: Dict[str, Dict[str, Any]],
+    offsets: List[int],
+    panel_min_counts: Dict[int, int],
+    min_active_domains: int,
+    min_per_domain: int,
+    max_domain_ratio: float,
+) -> Tuple[bool, Dict[str, Dict[str, Any]]]:
+    status: Dict[str, Dict[str, Any]] = {}
+    all_ok = True
+    for d in offsets:
+        key = f"{d}d"
+        panel = panels.get(key, {})
+        domain_counts = panel.get("domain_counts", {}) if isinstance(panel, dict) else {}
+        if not isinstance(domain_counts, dict):
+            domain_counts = {}
+        min_count = int(panel_min_counts.get(d, 0))
+        total = int(panel.get("count", 0)) if isinstance(panel, dict) else 0
+        active_vals = [int(v) for v in domain_counts.values() if int(v) >= min_per_domain]
+        active_domains = len(active_vals)
+        ratio = float("inf")
+        if active_vals:
+            ratio = max(active_vals) / max(1, min(active_vals))
+
+        count_ok = total >= min_count
+        active_ok = active_domains >= min_active_domains
+        ratio_ok = ratio <= max_domain_ratio if active_vals else False
+        ok = count_ok and active_ok and ratio_ok
+        if not ok:
+            all_ok = False
+
+        status[key] = {
+            "count": total,
+            "min_count": min_count,
+            "count_ok": count_ok,
+            "active_domains": active_domains,
+            "min_active_domains": min_active_domains,
+            "active_ok": active_ok,
+            "domain_ratio": None if ratio == float("inf") else round(ratio, 4),
+            "max_domain_ratio": max_domain_ratio,
+            "ratio_ok": ratio_ok,
+            "ok": ok,
+        }
+    return all_ok, status
+
+
+def final_count_from_panels(panels: Dict[str, Dict[str, Any]]) -> int:
+    ids = set()
+    for panel in panels.values():
+        if not isinstance(panel, dict):
+            continue
+        for m in panel.get("markets", []):
+            if isinstance(m, dict):
+                ids.add(str(m.get("market_id", "")))
+    return len(ids)
+
+
+def panel_domain_counts(records: List[Dict[str, Any]], offsets: List[int]) -> Dict[str, Counter]:
+    counts: Dict[str, Counter] = {f"{d}d": Counter() for d in offsets}
+    for m in records:
+        dom = str(m.get("domain", "other"))
         sampled = m.get("sampled", {})
         if not isinstance(sampled, dict):
             continue
-        for obj in sampled.values():
-            if isinstance(obj, dict):
-                diff_counts[str(obj.get("difficult", "unknown"))] += 1
+        for d in offsets:
+            k = f"{d}d"
+            if k in sampled:
+                counts[k][dom] += 1
+    return counts
 
-    if diff_counts:
-        fig = plt.figure(figsize=(6, 4))
-        order = ["easy", "medium", "hard", "unknown"]
-        xs = [k for k in order if k in diff_counts] + [k for k in diff_counts if k not in order]
-        ys = [diff_counts[x] for x in xs]
-        plt.bar(xs, ys)
-        plt.title("Difficult Distribution")
-        plt.tight_layout()
-        p = output_dir / f"q_difficult_dist_{ts}.png"
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        paths.append(p)
 
-    return paths
+def candidate_deficit_score(
+    row: Dict[str, Any],
+    counts: Dict[str, Counter],
+    offsets: List[int],
+    quota: int,
+) -> float:
+    dom = str(row.get("domain", "other"))
+    dur = float(row.get("_duration_days", 0.0))
+    horizon_weight = {30: 3.0, 7: 1.4, 1: 1.0}
+    score = 0.0
+    for d in offsets:
+        if dur < d:
+            continue
+        k = f"{d}d"
+        cur = counts.get(k, Counter()).get(dom, 0)
+        gap = max(quota - cur, 0)
+        score += float(gap) * float(horizon_weight.get(d, 1.0))
+    # minor tie-breakers toward richer markets
+    score += min(float(row.get("_volume_total", 0.0)) / 10000.0, 0.5)
+    return score
 
 
 def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
@@ -680,8 +834,8 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
 
     candidates: List[Dict[str, Any]] = []
     seen_ids = set()
-    scanned = 0
-
+    tried_history_ids = set()
+    kept_market_ids = set()
     domain_sources: List[Tuple[str, str]] = []
     for domain, slugs in DOMAIN_TAG_SLUGS.items():
         found_id: Optional[str] = None
@@ -702,16 +856,38 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
     if not domain_sources:
         domain_sources = [("global", "")]
 
-    offsets = interleaved_offsets(cfg.mix_max_offset, cfg.page_limit)
+    progress = None
+    scan_progress = None
+    if tqdm is not None:
+        progress = tqdm(desc="Building pool markets", unit="mkt")
+        scan_progress = tqdm(total=0, desc="Scanning markets", unit="mkt")
 
-    for offset in offsets:
-        if scanned >= cfg.max_markets:
+    markets: List[Dict[str, Any]] = []
+    offset = 0
+    empty_page_streak = 0
+    recent_cutoff = utc_now() - timedelta(days=cfg.recent_resolve_days)
+    start_monotonic = time.monotonic()
+    stop_reason = "exhausted"
+
+    # Build with sequential streaming pagination until one stop condition is met.
+    while True:
+        elapsed = time.monotonic() - start_monotonic
+        if elapsed >= cfg.max_runtime_sec:
+            stop_reason = "max_runtime_reached"
+            break
+        if empty_page_streak >= cfg.max_empty_pages:
+            stop_reason = "max_empty_pages_reached"
+            break
+        if len(markets) >= cfg.max_pool_size:
+            stop_reason = "max_pool_size_reached"
             break
 
-        for _src_domain, src_tag_id in domain_sources:
-            if scanned >= cfg.max_markets:
-                break
+        before_candidates = len(candidates)
+        before_markets = len(markets)
 
+        for _src_domain, src_tag_id in domain_sources:
+            if len(markets) >= cfg.max_pool_size:
+                break
             page, err = client.list_markets_page(limit=cfg.page_limit, offset=offset, tag_id=(src_tag_id or None))
             if err:
                 reject_ctr[err] += 1
@@ -720,25 +896,27 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
                 continue
 
             for m in page:
-                if scanned >= cfg.max_markets:
-                    break
                 mid = market_id(m)
                 if not mid or mid in seen_ids:
                     continue
                 seen_ids.add(mid)
-                scanned += 1
+                if scan_progress is not None:
+                    scan_progress.update(1)
 
                 outcomes, prices = parse_outcomes(m)
                 if not resolved_status(m, prices):
                     reject_ctr["unresolved"] += 1
                     continue
-                if not is_yes_no(outcomes):
-                    reject_ctr["invalid_market_data"] += 1
+                if not is_binary_outcomes(outcomes):
+                    reject_ctr["non_binary_outcomes"] += 1
                     continue
 
                 open_dt, close_dt, resolve_dt = parse_times(m)
                 if open_dt is None or close_dt is None or resolve_dt is None:
                     reject_ctr["missing_resolution"] += 1
+                    continue
+                if resolve_dt < recent_cutoff:
+                    reject_ctr["old_resolve_time"] += 1
                     continue
 
                 if duration_days(open_dt, close_dt) <= cfg.min_duration_days:
@@ -746,42 +924,22 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
                     continue
 
                 crit = resolution_criteria(m)
-                if len(crit.strip()) < cfg.min_criteria_chars:
-                    reject_ctr["missing_criteria"] += 1
-                    continue
 
-                liquidity = to_float(m.get("liquidityNum"))
-                if liquidity is None:
-                    liquidity = to_float(m.get("liquidity"))
                 volume_total = to_float(m.get("volumeNum"))
                 if volume_total is None:
                     volume_total = to_float(m.get("volume"))
-                volume_24h = to_float(m.get("volume24hr"))
 
-                if (liquidity or 0.0) < cfg.min_liquidity:
-                    reject_ctr["low_liquidity"] += 1
-                    continue
-                if (volume_total or 0.0) < cfg.min_volume_total or (volume_24h or 0.0) < cfg.min_volume_24h:
+                if (volume_total or 0.0) < cfg.min_volume_total:
                     reject_ctr["low_volume"] += 1
                     continue
 
-                if not valid_probability_pair(prices, cfg.sum_tolerance):
-                    reject_ctr["invalid_market_data"] += 1
-                    continue
-
-                ans = extract_answer_yes(outcomes, prices)
+                ans = extract_binary_answer(prices)
                 if ans is None:
                     reject_ctr["missing_resolution"] += 1
                     continue
 
-                try:
-                    yes_idx = [x.lower() for x in outcomes].index("yes")
-                except ValueError:
-                    reject_ctr["missing_resolution"] += 1
-                    continue
-
-                p_yes_final = float(prices[yes_idx])
-                yid = yes_token_id(m, outcomes)
+                p_yes_final = float(prices[0])
+                yid = primary_token_id(m)
                 domain = infer_domain(m)
 
                 candidates.append(
@@ -790,7 +948,7 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
                         "question": str(m.get("question") or "").strip(),
                         "domain": domain,
                         "description": str(m.get("description") or "").strip() or None,
-                        "resolution_criteria": crit,
+                        "resolution_criteria": crit or "",
                         "open_time": to_iso(open_dt),
                         "close_time": to_iso(close_dt),
                         "resolve_time": to_iso(resolve_dt),
@@ -804,63 +962,156 @@ def build_dataset(cfg: Config) -> Tuple[Dict[str, Any], Counter]:
                     }
                 )
 
-    selected = balanced_sample_by_domain(candidates, cfg.sample_size)
+        # materialize incrementally after each sequential offset batch
+        remaining = [c for c in candidates if c["market_id"] not in tried_history_ids]
+        if remaining:
+            current_counts = panel_domain_counts(markets, cfg.sample_offsets_days)
+            pre_selected = sorted(
+                remaining,
+                key=lambda x: (
+                    -candidate_deficit_score(x, current_counts, cfg.sample_offsets_days, cfg.panel_domain_quota),
+                    -float(x.get("_duration_days", 0.0)),
+                    -float(x.get("_volume_total", 0.0)),
+                    str(x.get("market_id", "")),
+                ),
+            )
+            for row in pre_selected:
+                if len(markets) >= cfg.max_pool_size:
+                    break
+                mid = row["market_id"]
+                if mid in tried_history_ids or mid in kept_market_ids:
+                    continue
+                tried_history_ids.add(mid)
+                yid = row.get("_yes_token_id")
+                resolve_dt = parse_dt(row.get("resolve_time")) or utc_now()
+                p_yes_final = float(row.get("_p_yes_final", 0.5))
 
-    markets: List[Dict[str, Any]] = []
-    for row in selected:
-        yid = row.get("_yes_token_id")
-        resolve_dt = parse_dt(row.get("resolve_time")) or utc_now()
-        p_yes_final = float(row.get("_p_yes_final", 0.5))
+                history: List[Dict[str, Any]] = []
+                if yid:
+                    h, herr = client.get_price_history(str(yid))
+                    if herr:
+                        reject_ctr[herr] += 1
+                        continue
+                    history = h or []
 
-        history: List[Dict[str, Any]] = []
-        if yid:
-            h, herr = client.get_price_history(str(yid))
-            if herr:
-                reject_ctr[herr] += 1
-                continue
-            history = h or []
+                series = build_daily_series(history, resolve_dt=resolve_dt, p_yes_final=p_yes_final)
+                series = compress_series(series, cfg.max_series_points)
+                if series_span_days(series) <= cfg.min_duration_days:
+                    reject_ctr["short_series_coverage"] += 1
+                    continue
 
-        series = build_daily_series(history, resolve_dt=resolve_dt, p_yes_final=p_yes_final)
-        series = compress_series(series, cfg.max_series_points)
-        if series_span_days(series) <= cfg.min_duration_days:
-            reject_ctr["short_series_coverage"] += 1
-            continue
+                row["community_time_series"] = series
+                row["sampled"] = build_sampled_points(series, resolve_dt, cfg.sample_offsets_days)
 
-        row["community_time_series"] = series
-        row["sampled"] = build_sampled_points(series, resolve_dt, cfg.sample_offsets_days)
+                row.pop("_duration_days", None)
+                row.pop("_volume_total", None)
+                row.pop("_yes_token_id", None)
+                row.pop("_p_yes_final", None)
+                markets.append(row)
+                kept_market_ids.add(mid)
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        f"offset={offset}, scanned={len(seen_ids)}, candidates={len(candidates)}, pool={len(markets)}, empty_streak={empty_page_streak}"
+                    )
 
-        row.pop("_duration_days", None)
-        row.pop("_volume_total", None)
-        row.pop("_yes_token_id", None)
-        row.pop("_p_yes_final", None)
-        markets.append(row)
+        if len(candidates) == before_candidates and len(markets) == before_markets:
+            empty_page_streak += 1
+        else:
+            empty_page_streak = 0
+
+        panels_now = build_panels(
+            markets,
+            cfg.sample_offsets_days,
+            cfg.panel_domain_quota,
+            cfg.min_per_domain,
+            cfg.max_domain_ratio,
+        )
+        goals_met_now, _ = panel_goal_status(
+            panels_now,
+            cfg.sample_offsets_days,
+            cfg.panel_min_counts,
+            cfg.min_active_domains,
+            cfg.min_per_domain,
+            cfg.max_domain_ratio,
+        )
+        final_count_now = final_count_from_panels(panels_now)
+        if goals_met_now and final_count_now >= cfg.min_final_count:
+            stop_reason = "coverage_and_min_final_reached"
+            break
+        offset += cfg.page_limit
+
+    if progress is not None:
+        progress.close()
+    if scan_progress is not None:
+        scan_progress.close()
+    markets = sorted(markets, key=lambda x: str(x.get("market_id", "")))
+    panels = build_panels(
+        markets,
+        cfg.sample_offsets_days,
+        cfg.panel_domain_quota,
+        cfg.min_per_domain,
+        cfg.max_domain_ratio,
+    )
+    coverage_goals_met, coverage_goal_status = panel_goal_status(
+        panels,
+        cfg.sample_offsets_days,
+        cfg.panel_min_counts,
+        cfg.min_active_domains,
+        cfg.min_per_domain,
+        cfg.max_domain_ratio,
+    )
+    selected_ids = set()
+    for panel in panels.values():
+        for m in panel.get("markets", []):
+            selected_ids.add(str(m.get("market_id", "")))
+    final_markets = [m for m in markets if str(m.get("market_id", "")) in selected_ids]
 
     payload = {
         "metadata": {
             "generated_at": to_iso(utc_now()),
-            "count": len(markets),
+            "count": len(final_markets),
             "sample_offsets_days": cfg.sample_offsets_days,
+            "stop_reason": stop_reason,
+            "last_offset": offset,
+            "empty_page_streak": empty_page_streak,
+            "max_runtime_sec": cfg.max_runtime_sec,
+            "max_empty_pages": cfg.max_empty_pages,
+            "panel_domain_quota": cfg.panel_domain_quota,
+            "pool_count": len(markets),
+            "max_pool_size": cfg.max_pool_size,
+            "min_final_count": cfg.min_final_count,
+            "panel_min_counts": {str(k): int(v) for k, v in sorted(cfg.panel_min_counts.items())},
+            "min_active_domains": cfg.min_active_domains,
+            "min_per_domain": cfg.min_per_domain,
+            "max_domain_ratio": cfg.max_domain_ratio,
+            "coverage_goals_met": coverage_goals_met,
+            "coverage_goal_status": coverage_goal_status,
         },
-        "markets": markets,
+        "markets": final_markets,
+        "panels": panels,
     }
     return payload, reject_ctr
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     p = argparse.ArgumentParser(description="Build resolved binary Polymarket dataset")
-    p.add_argument("--max-markets", type=int, default=DEFAULT_MAX_MARKETS)
     p.add_argument("--page-limit", type=int, default=DEFAULT_PAGE_LIMIT)
-    p.add_argument("--mix-max-offset", type=int, default=DEFAULT_MIX_MAX_OFFSET)
-    p.add_argument("--min-liquidity", type=float, default=DEFAULT_MIN_LIQUIDITY)
     p.add_argument("--min-volume-total", type=float, default=DEFAULT_MIN_VOLUME_TOTAL)
-    p.add_argument("--min-volume-24h", type=float, default=DEFAULT_MIN_VOLUME_24H)
-    p.add_argument("--min-criteria-chars", type=int, default=DEFAULT_MIN_CRITERIA_CHARS)
-    p.add_argument("--sum-tolerance", type=float, default=DEFAULT_SUM_TOLERANCE)
-    p.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     p.add_argument("--validate-n", type=int, default=DEFAULT_VALIDATE_N)
     p.add_argument("--sample-offsets", type=str, default=",".join(str(x) for x in DEFAULT_SAMPLE_OFFSETS_DAYS))
     p.add_argument("--min-duration-days", type=int, default=DEFAULT_MIN_DURATION_DAYS)
+    p.add_argument("--recent-resolve-days", type=int, default=DEFAULT_RECENT_RESOLVE_DAYS)
     p.add_argument("--max-series-points", type=int, default=DEFAULT_MAX_SERIES_POINTS)
+    p.add_argument("--max-runtime-sec", type=int, default=DEFAULT_MAX_RUNTIME_SEC)
+    p.add_argument("--max-empty-pages", type=int, default=DEFAULT_MAX_EMPTY_PAGES)
+    p.add_argument("--panel-domain-quota", type=int, default=DEFAULT_PANEL_DOMAIN_QUOTA)
+    p.add_argument("--panel-min-counts", type=str, default=DEFAULT_PANEL_MIN_COUNTS)
+    p.add_argument("--min-active-domains", type=int, default=DEFAULT_MIN_ACTIVE_DOMAINS)
+    p.add_argument("--min-per-domain", type=int, default=DEFAULT_MIN_PER_DOMAIN)
+    p.add_argument("--max-domain-ratio", type=float, default=DEFAULT_MAX_DOMAIN_RATIO)
+    p.add_argument("--max-pool-size", type=int, default=DEFAULT_MAX_POOL_SIZE)
+    p.add_argument("--min-final-count", type=int, default=DEFAULT_MIN_FINAL_COUNT)
     p.add_argument("--output-dir", type=str, default="src/questions")
 
     args = p.parse_args(argv)
@@ -874,20 +1125,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     if not offsets:
         offsets = list(DEFAULT_SAMPLE_OFFSETS_DAYS)
 
+    panel_min_counts: Dict[int, int] = {}
+    for part in str(args.panel_min_counts).split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        left, right = part.split(":", 1)
+        left = left.strip().lower().removesuffix("d")
+        right = right.strip()
+        if not left.isdigit() or not right.isdigit():
+            continue
+        panel_min_counts[int(left)] = max(0, int(right))
+    if not panel_min_counts:
+        panel_min_counts = {30: 80, 7: 150, 1: 150}
+    for d in offsets:
+        panel_min_counts.setdefault(int(d), 0)
+
+    min_final_count = max(1, int(args.min_final_count))
+
     return Config(
-        max_markets=args.max_markets,
         page_limit=args.page_limit,
-        mix_max_offset=args.mix_max_offset,
-        min_liquidity=args.min_liquidity,
         min_volume_total=args.min_volume_total,
-        min_volume_24h=args.min_volume_24h,
-        min_criteria_chars=args.min_criteria_chars,
-        sum_tolerance=args.sum_tolerance,
-        sample_size=args.sample_size,
         validate_n=args.validate_n,
         sample_offsets_days=sorted(set(offsets), reverse=True),
         min_duration_days=args.min_duration_days,
+        recent_resolve_days=max(1, int(args.recent_resolve_days)),
         max_series_points=max(31, int(args.max_series_points)),
+        max_runtime_sec=max(60, int(args.max_runtime_sec)),
+        max_empty_pages=max(1, int(args.max_empty_pages)),
+        panel_domain_quota=max(1, int(args.panel_domain_quota)),
+        panel_min_counts=dict(sorted(panel_min_counts.items())),
+        min_active_domains=max(1, int(args.min_active_domains)),
+        min_per_domain=max(1, int(args.min_per_domain)),
+        max_domain_ratio=max(1.0, float(args.max_domain_ratio)),
+        max_pool_size=max(100, int(args.max_pool_size)),
+        min_final_count=min_final_count,
         output_dir=Path(args.output_dir),
     )
 
@@ -914,11 +1186,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for obj in (m.get("sampled") or {}).values():
             if isinstance(obj, dict):
                 difficult_counts[str(obj.get("difficult", "unknown"))] += 1
+    horizon_stats = horizon_validity_summary(markets, cfg.sample_offsets_days)
+    panel_stats = {}
+    for k, panel in (data.get("panels") or {}).items():
+        if not isinstance(panel, dict):
+            continue
+        panel_stats[k] = {
+            "count": int(panel.get("count", 0)),
+            "domain_counts": panel.get("domain_counts", {}),
+        }
 
     print("=== Dataset Summary ===")
     print("count=", data.get("metadata", {}).get("count", 0))
+    print("stop_reason=", data.get("metadata", {}).get("stop_reason"))
+    print("min_final_count=", data.get("metadata", {}).get("min_final_count"))
     print("domain_counts=", dict(sorted(domain_counts.items())))
     print("difficult_counts=", dict(sorted(difficult_counts.items())))
+    print("horizon_validity=", horizon_stats)
+    print("panel_stats=", panel_stats)
+    print("coverage_goals_met=", data.get("metadata", {}).get("coverage_goals_met"))
+    print("coverage_goal_status=", data.get("metadata", {}).get("coverage_goal_status"))
     print("top_reject_reasons=", reject_ctr.most_common(10))
     print("output_main=", out_path)
     if viz_paths:

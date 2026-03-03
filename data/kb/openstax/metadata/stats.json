@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-03-02T09:51:40.742029+00:00",
+  "source": "kb/openstax",
+  "cutoff": "2026-03-01T00:00:00+00:00",
+  "counts": {
+    "books_total": 107,
+    "downloaded": 1
+  },
+  "file_count": 1,
+  "total_tokens": 104399,
+  "avg_tokens": 104399.0,
+  "pubtime_distribution": {
+    "2025-08": 1
+  },
+  "subject_distribution": {
+    "Science": 1,
+    "Business": 1
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "updated_at": "2026-03-02T10:37:49.675518+00:00",
+  "cutoff": "2026-03-01T00:00:00+00:00",
+  "done_ids": [
+    "openstax_college-success",
+    "openstax_contemporary-mathematics",
+    "openstax_introduction-intellectual-property",
+    "openstax_population-health",
+    "openstax_principles-data-science",
+    "openstax_world-history-volume-1"
+  ],
+  "counts": {
+    "books_total": 107,
+    "skipped_not_live": 34,
+    "eligible": 73,
+    "selected": 6,
+    "downloaded": 6
+  }
+}

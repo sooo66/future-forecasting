@@ -1,0 +1,16 @@
+{
+  "from": "2024-01-01",
+  "until": "2024-12-31",
+  "last_resumption_token": null,
+  "updated_at": "2026-03-02T08:19:38.378333+00:00",
+  "counts": {
+    "processed": 13,
+    "downloaded": 13,
+    "missing_handle": 0,
+    "pid_resolve_failed": 0,
+    "no_text_asset": 0,
+    "text_download_failed": 0,
+    "skipped_already_processed": 0,
+    "failures": 0
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-03-02T10:37:07.822658+00:00",
+  "source": "kb/openstax",
+  "cutoff": "2026-03-01T00:00:00+00:00",
+  "counts": {
+    "books_total": 107,
+    "skipped_not_live": 34,
+    "eligible": 73,
+    "selected": 3,
+    "downloaded": 3
+  },
+  "file_count": 3,
+  "total_tokens": 549973,
+  "avg_tokens": 183324.33,
+  "pubtime_distribution": {
+    "2025-07": 1,
+    "2025-09": 1,
+    "2026-02": 1
+  },
+  "primary_subject_distribution": {
+    "Business": 1,
+    "College Success": 1,
+    "Computer Science": 1
+  },
+  "subject_distribution": {
+    "Business": 2,
+    "College Success": 1,
+    "Computer Science": 1,
+    "Math": 1
+  }
+}
