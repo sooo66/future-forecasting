@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from src.kb.wbokr_text_only import main
+from src.modules.kb.harvesters.worldbank_harvester import main
 
 
 if __name__ == "__main__":

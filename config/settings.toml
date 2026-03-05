@@ -18,6 +18,30 @@ use_proxy = true
 [browser]
 timeout = 30
 
+[crawler]
+# 主抓取引擎:
+# - "crawl4ai": 仅 Crawl4AI 主抓取（失败后可走 fallback）
+# - "scrapling": Scrapling 主抓取（可选 rescue 到 Crawl4AI）
+# - "hybrid": Scrapling 主抓取 + Crawl4AI rescue（推荐）
+primary_engine = "hybrid"
+
+# Scrapling 主抓取并发（默认可与 concurrent_crawls 一致）
+scrapling_primary_concurrency = 16
+# Scrapling 结果最小正文长度，低于该阈值会转给 Crawl4AI rescue
+scrapling_quality_min_chars = 280
+# Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
+scrapling_primary_timeout_sec = 12.0
+scrapling_primary_retries = 1
+# 当主引擎为 scrapling 时，是否将失败/低质量 URL 交给 Crawl4AI
+enable_crawl4ai_rescue_after_scrapling = true
+
+# Crawl4AI 失败后的多级 fallback
+enable_scrapling_fallback = true
+enable_jina_reader_fallback = true
+fallback_concurrency = 5
+fallback_timeout_sec = 30
+jina_reader_prefix = "https://r.jina.ai/"
+
 [paths]
 raw_data_dir = "data/raw/gkg"
 processed_data_dir = "data/processed/records"

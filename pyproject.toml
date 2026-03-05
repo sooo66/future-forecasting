@@ -36,6 +36,7 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "openbb>=4.6.0",
     "qwen-agent[code-interpreter,gui,mcp,rag]>=0.0.5",
+    "scrapling[all]>=0.2.99",
 ]
 
 [[tool.uv.index]]

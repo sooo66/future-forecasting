@@ -1,0 +1,2 @@
+"""Blog module internals."""
+

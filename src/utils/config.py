@@ -170,7 +170,7 @@ class Config:
             "llm.instruction",
             (
                 "Return a single JSON object with fields: title (optional), summary (optional), content (required), "
-                "published_at (optional), language (optional), tags (optional array). "
+                "published_at (optional), language (optional). "
                 "Copy the main article body VERBATIM into content — no summarize/paraphrasing/translation/rewriting. "
                 "If HTML has no description/summary, generate a concise summary; otherwise preserve provided summary. "
                 "Preserve original wording/order in content, omit navigation/ads. "
