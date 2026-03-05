@@ -136,8 +136,8 @@ class NewsModule:
     def _to_text_record(self, rec: Record) -> dict | None:
         payload = {
             "title": rec.title or "",
-            "content": rec.content or "",
             "description": rec.description,
+            "content": rec.content or "",
         }
         # News timestamp must prioritize GDELT day injected by URL pool (gkg_date).
         day = to_day(rec.published_at) or to_day(rec.pubtime)

@@ -516,7 +516,6 @@ class RedditModule:
             "score": self._safe_int(post.get("score")) or 0,
             "num_comments": num_comments,
             "title": title,
-            "selftext": str(post.get("selftext") or "") or None,
             "comments": comments,
         }
 

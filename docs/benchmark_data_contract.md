@@ -28,11 +28,11 @@
 - World Bank: `report/world_bank`
 
 ## Module Payload（当前）
-- `info.news`: `title`, `content`, `description`
+- `info.news`: `title`, `description`, `content`
 - `info.blog.substack`: `title`, `author`, `description`, `content`
-- `info.sociomedia.reddit`: `subreddit`, `score`, `num_comments`, `title`, `selftext`, `comments`
-- `info.paper.arxiv`: `title`, `description`, `content`, `authors`, `categories`
-- `kb.book.openstax`: `title`, `book_title`, `page_title`, `subjects`, `content`
+- `info.sociomedia.reddit`: `subreddit`, `score`, `num_comments`, `title`, `comments`
+- `info.paper.arxiv`: `title`, `authors`, `description`, `content`, `categories`
+- `kb.book.openstax`: `title`, `page_title`, `content`
 - `kb.report.world_bank`: `title`, `content`
 
 ## Modules

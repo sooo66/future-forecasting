@@ -52,9 +52,7 @@ class OpenStaxModule:
         source = "book/openstax"
         payload = {
             "title": str(row.get("title") or ""),
-            "book_title": str(row.get("book_title") or ""),
             "page_title": str(row.get("page_title") or ""),
-            "subjects": row.get("subjects") or [],
             "content": row.get("content") or "",
         }
         rid = stable_record_id(source, row.get("url"), day, payload["title"])

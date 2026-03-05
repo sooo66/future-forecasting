@@ -140,9 +140,9 @@ class ArxivModule:
         source = "paper/arxiv"
         payload = {
             "title": title,
+            "authors": authors,
             "description": summary or None,
             "content": summary,
-            "authors": authors,
             "categories": categories,
         }
         rid = stable_record_id(source, url, day, title)
