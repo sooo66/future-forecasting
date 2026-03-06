@@ -103,7 +103,7 @@ class NewsModule:
                     "crawler.news_reset_in_progress_on_start",
                     True,
                 ),
-                "news_progress_bar_color": base_cfg.get("crawler.news_progress_bar_color", "cyan"),
+                "news_progress_bar_color": base_cfg.get("crawler.news_progress_bar_color", "yellow"),
                 "gkg_parse_chunk_size": base_cfg.get("crawler.gkg_parse_chunk_size", 10000),
                 "cleanup_raw_gkg_after_build": base_cfg.get(
                     "crawler.cleanup_raw_gkg_after_build",
