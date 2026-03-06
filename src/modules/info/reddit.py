@@ -10,6 +10,7 @@ from loguru import logger
 
 from core.contracts import TextRecord, stable_record_id
 from modules.base import RunContext
+from modules.common.proxy_pool import configure_requests_session
 from utils.time_utils import to_day
 
 
@@ -113,13 +114,22 @@ class RedditModule:
         else:
             self.top_fallback_subreddits = {s.strip().lower() for s in top_fallback_subreddits if s and s.strip()}
         self.session = requests.Session()
-        self.session.trust_env = False
         self.session.headers.update(
             {
                 "Accept": "application/json",
                 "User-Agent": "future-forecasting-reddit-module/1.0",
             }
         )
+        self._proxy_enabled = configure_requests_session(self.session)
+        self._proxy_bypassed = False
+        self._request_stats = {
+            "proxy_bypass": 0,
+            "pullpush_failures": 0,
+            "listing_failures": 0,
+            "comment_failures": 0,
+            "http_429": 0,
+            "http_4xx": 0,
+        }
 
     def run(self, ctx: RunContext) -> Iterable[dict]:
         date_from = ctx.date_from.astimezone(timezone.utc)
@@ -135,6 +145,8 @@ class RedditModule:
                     count += 1
                     yield row
             logger.info(f"[{self.name}] normalized records={count}")
+            if count == 0:
+                logger.warning(f"[{self.name}] no records emitted; request_stats={self._request_stats}")
 
         return _iter()
 
@@ -274,11 +286,20 @@ class RedditModule:
                 "sort_type": "created_utc",
             }
             try:
-                resp = self.session.get(PULLPUSH_API_URL, params=params, timeout=self.request_timeout)
+                resp = self._request(
+                    PULLPUSH_API_URL,
+                    params=params,
+                    timeout=self.request_timeout,
+                    failure_key="pullpush_failures",
+                )
             except Exception as exc:
                 logger.warning(f"[{self.name}] pullpush request failed subreddit={subreddit}: {exc}")
                 break
             if resp.status_code >= 400:
+                if resp.status_code == 429:
+                    self._request_stats["http_429"] += 1
+                else:
+                    self._request_stats["http_4xx"] += 1
                 logger.warning(
                     f"[{self.name}] pullpush status={resp.status_code} subreddit={subreddit} page={page}"
                 )
@@ -418,11 +439,18 @@ class RedditModule:
         payload: dict = {}
         for attempt in range(1, self.listing_retry_max + 1):
             try:
-                resp = self.session.get(url, params=params, timeout=self.request_timeout)
+                resp = self._request(
+                    url,
+                    params=params,
+                    timeout=self.request_timeout,
+                    failure_key="listing_failures",
+                )
                 if resp.status_code == 429 and attempt < self.listing_retry_max:
+                    self._request_stats["http_429"] += 1
                     time.sleep(1.0 * attempt)
                     continue
                 if resp.status_code >= 400:
+                    self._request_stats["http_4xx"] += 1
                     return [], None
                 payload = resp.json()
                 break
@@ -446,11 +474,18 @@ class RedditModule:
         payload = None
         for attempt in range(1, self.comments_retry_max + 1):
             try:
-                resp = self.session.get(url, params=params, timeout=self.comments_timeout)
+                resp = self._request(
+                    url,
+                    params=params,
+                    timeout=self.comments_timeout,
+                    failure_key="comment_failures",
+                )
                 if resp.status_code == 429 and attempt < self.comments_retry_max:
+                    self._request_stats["http_429"] += 1
                     time.sleep(0.8)
                     continue
                 if resp.status_code >= 400:
+                    self._request_stats["http_4xx"] += 1
                     return []
                 payload = resp.json()
                 break
@@ -545,3 +580,42 @@ class RedditModule:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _request(
+        self,
+        url: str,
+        *,
+        params: dict,
+        timeout: tuple[float, float],
+        failure_key: str,
+    ) -> requests.Response:
+        try:
+            return self.session.get(url, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            self._request_stats[failure_key] = self._request_stats.get(failure_key, 0) + 1
+            if self._should_retry_direct(exc):
+                self._disable_proxy()
+                return self.session.get(url, params=params, timeout=timeout)
+            raise
+
+    def _should_retry_direct(self, exc: requests.RequestException) -> bool:
+        if not self._proxy_enabled or self._proxy_bypassed:
+            return False
+        if not self.session.proxies:
+            return False
+        message = str(exc).lower()
+        proxy_markers = (
+            "proxy",
+            "127.0.0.1:7897",
+            "failed to establish a new connection",
+            "connection refused",
+        )
+        return any(marker in message for marker in proxy_markers)
+
+    def _disable_proxy(self) -> None:
+        if self._proxy_bypassed:
+            return
+        self.session.proxies.clear()
+        self._proxy_bypassed = True
+        self._request_stats["proxy_bypass"] = self._request_stats.get("proxy_bypass", 0) + 1
+        logger.warning(f"[{self.name}] proxy unavailable; fallback to direct mode")

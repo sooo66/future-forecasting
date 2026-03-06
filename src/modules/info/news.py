@@ -10,7 +10,6 @@ from loguru import logger
 from core.contracts import TextRecord, stable_record_id
 from modules.base import RunContext
 from modules.info.news_stack.gdelt.downloader import GDELTDownloader
-from modules.info.news_stack.gdelt.parser import GDELTParser
 from modules.info.news_stack.url_pool.builder import URLPoolBuilder
 from modules.info.news_stack.news_crawler import NewsCrawler
 from utils.config import Config
@@ -43,6 +42,19 @@ class NewsModule:
         raw_dir = work / "raw" / "gkg"
         processed_dir = work / "processed" / "records"
         url_pool_db = work / "url_pool" / "url_pool.db"
+        date_span_days = max(1, (ctx.date_to.date() - ctx.date_from.date()).days + 1)
+        long_range_mode = date_span_days > 31
+        concurrent_crawls = min(base_cfg.concurrent_crawls, 4) if long_range_mode else base_cfg.concurrent_crawls
+        scrapling_primary_concurrency = int(
+            base_cfg.get("crawler.scrapling_primary_concurrency", base_cfg.concurrent_crawls)
+        )
+        fallback_concurrency = int(
+            base_cfg.get("crawler.fallback_concurrency", base_cfg.concurrent_crawls)
+        )
+        if long_range_mode:
+            scrapling_primary_concurrency = min(scrapling_primary_concurrency, 8)
+            fallback_concurrency = min(fallback_concurrency, 4)
+
         whitelist = [
             {"name": name, "domain": domain}
             for domain, name in base_cfg.media_domains.items()
@@ -53,7 +65,7 @@ class NewsModule:
                 "start_date": ctx.date_from.date().isoformat(),
                 "end_date": ctx.date_to.date().isoformat(),
                 "concurrent_downloads": base_cfg.concurrent_downloads,
-                "concurrent_crawls": base_cfg.concurrent_crawls,
+                "concurrent_crawls": concurrent_crawls,
                 "request_delay_min": base_cfg.request_delay_min,
                 "request_delay_max": base_cfg.request_delay_max,
                 "use_proxy": base_cfg.use_proxy,
@@ -63,22 +75,39 @@ class NewsModule:
             },
             "crawler": {
                 "primary_engine": base_cfg.get("crawler.primary_engine", "crawl4ai"),
-                "scrapling_primary_concurrency": base_cfg.get(
-                    "crawler.scrapling_primary_concurrency",
-                    base_cfg.concurrent_crawls,
-                ),
+                "scrapling_primary_concurrency": scrapling_primary_concurrency,
                 "scrapling_quality_min_chars": base_cfg.get("crawler.scrapling_quality_min_chars", 280),
                 "scrapling_primary_timeout_sec": base_cfg.get("crawler.scrapling_primary_timeout_sec", 12.0),
                 "scrapling_primary_retries": base_cfg.get("crawler.scrapling_primary_retries", 1),
+                "scrapling_primary_chunk_size": base_cfg.get("crawler.scrapling_primary_chunk_size", 64),
+                "scrapling_short_circuit_sample_size": base_cfg.get(
+                    "crawler.scrapling_short_circuit_sample_size",
+                    80,
+                ),
+                "scrapling_short_circuit_fail_ratio": base_cfg.get(
+                    "crawler.scrapling_short_circuit_fail_ratio",
+                    0.85,
+                ),
                 "enable_crawl4ai_rescue_after_scrapling": base_cfg.get(
                     "crawler.enable_crawl4ai_rescue_after_scrapling",
                     True,
                 ),
                 "enable_scrapling_fallback": base_cfg.get("crawler.enable_scrapling_fallback", True),
                 "enable_jina_reader_fallback": base_cfg.get("crawler.enable_jina_reader_fallback", True),
-                "fallback_concurrency": base_cfg.get("crawler.fallback_concurrency", base_cfg.concurrent_crawls),
+                "fallback_concurrency": fallback_concurrency,
                 "fallback_timeout_sec": base_cfg.get("crawler.fallback_timeout_sec", base_cfg.browser_timeout),
                 "jina_reader_prefix": base_cfg.get("crawler.jina_reader_prefix", "https://r.jina.ai/"),
+                "news_crawl_batch_size": base_cfg.get("crawler.news_crawl_batch_size", 250),
+                "news_reset_in_progress_on_start": base_cfg.get(
+                    "crawler.news_reset_in_progress_on_start",
+                    True,
+                ),
+                "gkg_parse_chunk_size": base_cfg.get("crawler.gkg_parse_chunk_size", 10000),
+                "cleanup_raw_gkg_after_build": base_cfg.get(
+                    "crawler.cleanup_raw_gkg_after_build",
+                    True,
+                ),
+                "export_url_pool_jsonl": base_cfg.get("crawler.export_url_pool_jsonl", False),
             },
             "paths": {
                 "raw_data_dir": str(raw_dir),
@@ -95,15 +124,22 @@ class NewsModule:
     def run(self, ctx: RunContext) -> Iterable[dict]:
         config = self._build_config(ctx)
         logger.info(f"[{self.name}] running news pipeline from={ctx.date_from.date()} to={ctx.date_to.date()}")
-
-        downloader = GDELTDownloader(config)
-        downloader.download()
-
-        parser = GDELTParser(config)
-        parser.parse_all()
+        logger.info(
+            f"[{self.name}] tuned config: date_span_days="
+            f"{(ctx.date_to.date() - ctx.date_from.date()).days + 1} "
+            f"concurrent_crawls={config.concurrent_crawls} "
+            f"scrapling_primary_concurrency={config.get('crawler.scrapling_primary_concurrency')} "
+            f"news_crawl_batch_size={config.get('crawler.news_crawl_batch_size')}"
+        )
 
         builder = URLPoolBuilder(config)
-        builder.build()
+        existing_stats = builder.get_statistics() if ctx.resume else {"total": 0}
+        if ctx.resume and int(existing_stats.get("total", 0)) > 0:
+            logger.info(f"[{self.name}] resume mode: reuse existing url pool stats={existing_stats}")
+        else:
+            downloader = GDELTDownloader(config)
+            downloader.download()
+            builder.build()
 
         crawler = NewsCrawler(config, builder)
         loop = asyncio.new_event_loop()
@@ -132,6 +168,8 @@ class NewsModule:
             asyncio.set_event_loop(None)
 
         logger.info(f"[{self.name}] crawled records={crawled}, yielded={yielded}")
+        if yielded == 0:
+            logger.warning(f"[{self.name}] no normalized records emitted")
 
     def _to_text_record(self, rec: Record) -> dict | None:
         payload = {

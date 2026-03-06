@@ -32,6 +32,11 @@ scrapling_quality_min_chars = 280
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
 scrapling_primary_timeout_sec = 12.0
 scrapling_primary_retries = 1
+# Scrapling 主抓取分块；大窗口下按 chunk 评估是否值得继续跑 scrapling
+scrapling_primary_chunk_size = 64
+# 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue
+scrapling_short_circuit_sample_size = 80
+scrapling_short_circuit_fail_ratio = 0.85
 # 当主引擎为 scrapling 时，是否将失败/低质量 URL 交给 Crawl4AI
 enable_crawl4ai_rescue_after_scrapling = true
 
@@ -41,6 +46,14 @@ enable_jina_reader_fallback = true
 fallback_concurrency = 5
 fallback_timeout_sec = 30
 jina_reader_prefix = "https://r.jina.ai/"
+
+# News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
+news_crawl_batch_size = 250
+news_reset_in_progress_on_start = true
+# 直接从原始 GKG CSV 流式构建 URL 池，避免生成 parquet 中间文件
+gkg_parse_chunk_size = 10000
+cleanup_raw_gkg_after_build = true
+export_url_pool_jsonl = false
 
 [paths]
 raw_data_dir = "data/raw/gkg"

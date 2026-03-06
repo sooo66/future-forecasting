@@ -196,5 +196,7 @@ class SubstackModule:
                 count += 1
                 yield row
             logger.info(f"[{self.name}] normalized records={count}")
+            if count == 0:
+                logger.warning(f"[{self.name}] no records emitted; output_file={out_file}")
 
         return _iter()

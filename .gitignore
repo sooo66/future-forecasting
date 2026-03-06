@@ -221,3 +221,5 @@ __marimo__/
 *.db
 
 *.txt
+
+.jsonl

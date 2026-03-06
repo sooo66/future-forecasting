@@ -109,6 +109,9 @@ class Crawler:
 
         # 记录 URL -> 元信息（如 published_at），便于透传到 Record
         self._url_meta: dict[str, dict[str, Any]] = {}
+        self._last_input_urls: set[str] = set()
+        self._last_succeeded_urls: set[str] = set()
+        self._last_failed_urls: set[str] = set()
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -146,6 +149,23 @@ class Crawler:
         self._scrapling_primary_retries = max(
             1,
             int(self.config.get("crawler.scrapling_primary_retries", 1)),
+        )
+        self._scrapling_primary_chunk_size = max(
+            self._scrapling_primary_concurrency,
+            int(
+                self.config.get(
+                    "crawler.scrapling_primary_chunk_size",
+                    max(64, self._scrapling_primary_concurrency * 4),
+                )
+            ),
+        )
+        self._scrapling_short_circuit_sample_size = max(
+            1,
+            int(self.config.get("crawler.scrapling_short_circuit_sample_size", 80)),
+        )
+        self._scrapling_short_circuit_fail_ratio = min(
+            1.0,
+            max(0.0, float(self.config.get("crawler.scrapling_short_circuit_fail_ratio", 0.85))),
         )
         self._enable_crawl4ai_rescue_after_scrapling = bool(
             self.config.get("crawler.enable_crawl4ai_rescue_after_scrapling", True)
@@ -186,6 +206,14 @@ class Crawler:
             records.append(record)
         return records
 
+    @property
+    def last_succeeded_urls(self) -> set[str]:
+        return set(self._last_succeeded_urls)
+
+    @property
+    def last_failed_urls(self) -> set[str]:
+        return set(self._last_failed_urls)
+
     async def run_stream(self) -> AsyncIterator[Record]:
         """运行爬虫并流式产出 `Record`。"""
         if self.urls is not None:
@@ -193,9 +221,11 @@ class Crawler:
         else:
             urls = self._load_urls(self.source_path)
         if not urls:
+            self._reset_run_tracking([])
             logger.warning("输入 URL 为空，跳过爬取")
             return
 
+        self._reset_run_tracking(urls)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.proxy_manager.refresh_env()
         logger.info(
@@ -203,6 +233,9 @@ class Crawler:
             f"(scrapling_qmin={self._scrapling_quality_min_chars}, "
             f"scrapling_timeout={self._scrapling_primary_timeout_sec}s, "
             f"scrapling_retries={self._scrapling_primary_retries}, "
+            f"scrapling_chunk={self._scrapling_primary_chunk_size}, "
+            f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
+            f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
 
@@ -213,6 +246,7 @@ class Crawler:
             async for record, rescue_url in self._crawl_with_scrapling_primary_stream(urls):
                 if record is not None:
                     succeeded_urls.add(record.url)
+                    self._last_succeeded_urls.add(record.url)
                     total_records += 1
                     yield record
                 if rescue_url:
@@ -222,23 +256,31 @@ class Crawler:
             if rescue_urls and should_rescue:
                 logger.info(f"scrapling 主抓取完成，进入 crawl4ai rescue: {len(rescue_urls)} URLs")
                 async for record in self._crawl_with_crawl4ai_stream(rescue_urls, pre_succeeded_urls=succeeded_urls):
+                    self._last_succeeded_urls.add(record.url)
                     total_records += 1
                     yield record
             elif rescue_urls:
                 logger.info(f"scrapling 主抓取完成，未启用 crawl4ai rescue，丢弃 {len(rescue_urls)} URLs")
         else:
             async for record in self._crawl_with_crawl4ai_stream(urls):
+                self._last_succeeded_urls.add(record.url)
                 total_records += 1
                 yield record
 
+        self._last_failed_urls = set(self._last_input_urls) - set(self._last_succeeded_urls)
         logger.info(f"爬取完成，总记录数: {total_records}，输出: {self.output_path}")
+
+    def _reset_run_tracking(self, urls: List[str]) -> None:
+        self._last_input_urls = {str(url).strip() for url in urls if str(url).strip()}
+        self._last_succeeded_urls = set()
+        self._last_failed_urls = set()
 
     async def _crawl_with_scrapling_primary_stream(
         self,
         urls: List[str],
     ) -> AsyncIterator[tuple[Optional[Record], Optional[str]]]:
         semaphore = asyncio.Semaphore(self._scrapling_primary_concurrency)
-        stats = {"ok": 0, "failed": 0, "low_quality": 0}
+        stats = {"ok": 0, "failed": 0, "low_quality": 0, "short_circuited": 0}
 
         async def _one(url: str) -> tuple[str, Optional[Record]]:
             try:
@@ -253,32 +295,54 @@ class Crawler:
                 return url, None
             return url, record
 
-        tasks = [asyncio.create_task(_one(url)) for url in urls]
-        for task in asyncio.as_completed(tasks):
-            url, record = await task
+        for chunk_start in range(0, len(urls), self._scrapling_primary_chunk_size):
+            chunk_urls = urls[chunk_start:chunk_start + self._scrapling_primary_chunk_size]
+            tasks = [asyncio.create_task(_one(url)) for url in chunk_urls]
+            for task in asyncio.as_completed(tasks):
+                url, record = await task
 
-            if record is None:
-                stats["failed"] += 1
-                yield None, url
-                continue
+                if record is None:
+                    stats["failed"] += 1
+                    yield None, url
+                    continue
 
-            content_len = self._record_content_chars(record)
-            if content_len < self._scrapling_quality_min_chars:
-                stats["low_quality"] += 1
-                logger.debug(
-                    f"scrapling 质量不足，转 rescue: {url} "
-                    f"(content_chars={content_len}, min={self._scrapling_quality_min_chars})"
+                content_len = self._record_content_chars(record)
+                if content_len < self._scrapling_quality_min_chars:
+                    stats["low_quality"] += 1
+                    logger.debug(
+                        f"scrapling 质量不足，转 rescue: {url} "
+                        f"(content_chars={content_len}, min={self._scrapling_quality_min_chars})"
+                    )
+                    yield None, url
+                    continue
+
+                self._append_output(record)
+                stats["ok"] += 1
+                yield record, None
+
+            processed = stats["ok"] + stats["failed"] + stats["low_quality"]
+            degraded = stats["failed"] + stats["low_quality"]
+            if (
+                processed >= self._scrapling_short_circuit_sample_size
+                and processed > 0
+                and (degraded / processed) >= self._scrapling_short_circuit_fail_ratio
+                and (chunk_start + self._scrapling_primary_chunk_size) < len(urls)
+            ):
+                remaining_urls = urls[chunk_start + self._scrapling_primary_chunk_size:]
+                stats["short_circuited"] += len(remaining_urls)
+                logger.warning(
+                    "scrapling 主抓取成功率过低，提前短路到 rescue: "
+                    f"processed={processed} degraded={degraded} "
+                    f"ratio={degraded / processed:.2f} remaining={len(remaining_urls)}"
                 )
-                yield None, url
-                continue
-
-            self._append_output(record)
-            stats["ok"] += 1
-            yield record, None
+                for remaining_url in remaining_urls:
+                    yield None, remaining_url
+                break
 
         logger.info(
             f"scrapling 主抓取统计: ok={stats['ok']} "
-            f"low_quality={stats['low_quality']} failed={stats['failed']}"
+            f"low_quality={stats['low_quality']} failed={stats['failed']} "
+            f"short_circuited={stats['short_circuited']}"
         )
 
     async def _crawl_with_crawl4ai_stream(
@@ -559,7 +623,7 @@ class Crawler:
         - 不再尝试从 HTML 中抽取发布时间（pubtime），
           `published_at` 字段使用空字符串占位，后续可以由 URL 池/上游填充。
         """
-        url = str(getattr(result, "url", "") or getattr(result, "input_url", "")).strip()
+        url = str(getattr(result, "input_url", "") or getattr(result, "url", "")).strip()
         success = bool(getattr(result, "success", False))
         error_message = getattr(result, "error_message", None) or getattr(result, "error", None)
 

@@ -94,8 +94,19 @@ def _resolve_module_workers(cfg: RunConfig) -> int:
     if module_count <= 1:
         return 1
     if cfg.module_workers <= 0:
-        return module_count
+        info_span_days = max(1, (cfg.info_date_to.date() - cfg.info_date_from.date()).days + 1)
+        if "info.news" in cfg.modules and info_span_days > 31:
+            return 1
+        return min(module_count, 2)
     return max(1, min(cfg.module_workers, module_count))
+
+
+def _ordered_modules(cfg: RunConfig) -> List[str]:
+    modules = list(cfg.modules)
+    info_span_days = max(1, (cfg.info_date_to.date() - cfg.info_date_from.date()).days + 1)
+    if "info.news" in modules and info_span_days > 31:
+        return [name for name in modules if name != "info.news"] + ["info.news"]
+    return modules
 
 
 def _run_single_module(cfg: RunConfig, paths: SnapshotPaths, name: str) -> dict[str, Any]:
@@ -175,15 +186,18 @@ def run_modules(cfg: RunConfig) -> Dict[str, Any]:
     }
 
     workers = _resolve_module_workers(cfg)
+    ordered_modules = _ordered_modules(cfg)
     logger.info(f"[runner] module parallelism workers={workers}")
+    if ordered_modules != cfg.modules:
+        logger.info(f"[runner] module launch order={ordered_modules}")
 
     if workers == 1:
-        for name in cfg.modules:
+        for name in ordered_modules:
             manifest["results"][name] = _run_single_module(cfg, paths, name)
     else:
         results: Dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_run_single_module, cfg, paths, name): name for name in cfg.modules}
+            futures = {executor.submit(_run_single_module, cfg, paths, name): name for name in ordered_modules}
             for future in as_completed(futures):
                 name = futures[future]
                 try:
