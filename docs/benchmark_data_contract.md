@@ -51,11 +51,15 @@
 入口：`src/cli.py`
 
 ```bash
-python src/cli.py run \
-  --snapshot s2026_03_static \
-  --from 2026-01-01 \
-  --to 2026-01-31 \
-  --modules all
+uv run src/cli.py run \
+  --snapshot s-0306 \
+  --from 2025-10-01 \
+  --to 2026-03-01 \
+  --kb-from 2025-01-01 \
+  --kb-to 2026-03-01 \
+  --modules all \
+  --module-workers 6 \
+  --resume
 ```
 
 参数说明：
