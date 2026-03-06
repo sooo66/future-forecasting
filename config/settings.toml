@@ -26,34 +26,34 @@ timeout = 30
 primary_engine = "hybrid"
 
 # Scrapling 主抓取并发（默认可与 concurrent_crawls 一致）
-scrapling_primary_concurrency = 16
+scrapling_primary_concurrency = 8
 # Scrapling 主抓取的单域名并发上限（降低被同站点限流概率）
-scrapling_primary_per_domain_concurrency = 2
+scrapling_primary_per_domain_concurrency = 1
 # Scrapling 主抓取请求间随机抖动（秒），用于降低无代理场景的封禁概率
-scrapling_primary_delay_min_sec = 0.10
-scrapling_primary_delay_max_sec = 0.50
+scrapling_primary_delay_min_sec = 0.20
+scrapling_primary_delay_max_sec = 0.80
 # Scrapling 结果最小正文长度，低于该阈值会转给 Crawl4AI rescue
-scrapling_quality_min_chars = 280
+scrapling_quality_min_chars = 200
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
-scrapling_primary_timeout_sec = 12.0
-scrapling_primary_retries = 1
+scrapling_primary_timeout_sec = 20.0
+scrapling_primary_retries = 2
 # Scrapling 主抓取分块；大窗口下按 chunk 评估是否值得继续跑 scrapling
-scrapling_primary_chunk_size = 64
+scrapling_primary_chunk_size = 48
 # 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue
-scrapling_short_circuit_sample_size = 80
-scrapling_short_circuit_fail_ratio = 0.85
+scrapling_short_circuit_sample_size = 120
+scrapling_short_circuit_fail_ratio = 0.92
 # 当主引擎为 scrapling 时，是否将失败/低质量 URL 交给 Crawl4AI
 enable_crawl4ai_rescue_after_scrapling = true
 
 # Crawl4AI 失败后的多级 fallback
 enable_scrapling_fallback = true
 enable_jina_reader_fallback = true
-fallback_concurrency = 5
+fallback_concurrency = 4
 fallback_timeout_sec = 30
 jina_reader_prefix = "https://r.jina.ai/"
 
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
-news_crawl_batch_size = 250
+news_crawl_batch_size = 160
 news_reset_in_progress_on_start = true
 # 批次内按域名交错排序，降低同域突发请求
 news_batch_interleave_domains = true
