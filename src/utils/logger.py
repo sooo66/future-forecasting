@@ -1,8 +1,26 @@
 """日志配置模块"""
 import sys
 from pathlib import Path
+
 from loguru import logger
+
 from .config import Config
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is optional at import time
+    tqdm = None  # type: ignore[assignment]
+
+
+def _console_sink(message: object) -> None:
+    text = str(message).rstrip("\n")
+    if not text:
+        return
+    if tqdm is not None:
+        tqdm.write(text, file=sys.stdout)
+        return
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
 
 
 def setup_logger(config: Config, *, verbose: bool = False):
@@ -15,10 +33,11 @@ def setup_logger(config: Config, *, verbose: bool = False):
     
     # 添加控制台输出（默认 INFO，verbose 时 DEBUG）
     logger.add(
-        sys.stdout,
+        _console_sink,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
         level="DEBUG" if verbose else "INFO",
-        colorize=True
+        colorize=True,
+        filter=lambda record: record["extra"].get("trace") is not True,
     )
     
     # 添加文件输出（所有级别）

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from loguru import logger
 
@@ -37,16 +37,26 @@ class ProxyManager:
         return list(self._proxies)
 
     def refresh_env(self) -> List[str]:
-        if not self.use_proxy or not self._proxies:
+        if not self.use_proxy:
             os.environ.pop("PROXIES", None)
             return []
-        os.environ["PROXIES"] = ",".join(self._proxies)
-        logger.info(f"代理池加载完成: {len(self._proxies)} 个可用代理")
-        return list(self._proxies)
+        if self._proxies:
+            os.environ["PROXIES"] = ",".join(self._proxies)
+            logger.debug(f"代理池加载完成: {len(self._proxies)} 个可用代理")
+            return list(self._proxies)
+
+        env_proxies = build_crawl4ai_proxy_list()
+        if env_proxies:
+            os.environ["PROXIES"] = ",".join(env_proxies)
+            logger.debug(f"crawl4ai 复用环境代理: {describe_proxy_mode()}")
+            return env_proxies
+
+        os.environ.pop("PROXIES", None)
+        return []
 
     def _load_proxies(self, proxy_file: Optional[Path]) -> List[str]:
         if not proxy_file:
-            logger.info("未指定代理池文件，使用直连模式")
+            logger.debug("未指定代理池文件，使用直连模式")
             return []
         if not proxy_file.exists():
             logger.warning(f"代理池文件不存在: {proxy_file}")
@@ -94,6 +104,29 @@ def _proxy_env_value(*keys: str) -> str:
         if value:
             return value
     return ""
+
+
+def _redact_proxy_value(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        try:
+            parts = urlsplit(raw)
+            if parts.username or parts.password:
+                host = parts.hostname or ""
+                if parts.port:
+                    host = f"{host}:{parts.port}"
+                netloc = f"***:***@{host}" if host else "***:***"
+                return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        except Exception:
+            return raw
+        return raw
+
+    parts = raw.split(":")
+    if len(parts) >= 4:
+        return f"{parts[0]}:{parts[1]}:***:***"
+    return raw
 
 
 def proxy_spec_to_url(proxy_spec: str, *, scheme: str = "http") -> Optional[str]:
@@ -145,6 +178,37 @@ def build_requests_proxy_map() -> dict[str, str]:
     return {"http": proxy_url, "https": proxy_url}
 
 
+def build_crawl4ai_proxy_list() -> List[str]:
+    raw_pool = _proxy_env_value("PROXIES")
+    if raw_pool:
+        return [part.strip() for part in raw_pool.split(",") if part.strip()]
+
+    https_proxy = _proxy_env_value("HTTPS_PROXY", "https_proxy")
+    http_proxy = _proxy_env_value("HTTP_PROXY", "http_proxy")
+    all_proxy = _proxy_env_value("ALL_PROXY", "all_proxy")
+    selected = https_proxy or http_proxy or all_proxy
+    if not selected:
+        return []
+    return [selected]
+
+
+def describe_proxy_mode() -> str:
+    raw_pool = _proxy_env_value("PROXIES")
+    if raw_pool:
+        proxies = [part.strip() for part in raw_pool.split(",") if part.strip()]
+        if not proxies:
+            return "direct"
+        sample = _redact_proxy_value(proxies[0])
+        extra = "" if len(proxies) == 1 else f" (+{len(proxies) - 1} more)"
+        return f"proxy_pool:{sample}{extra}"
+
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = _proxy_env_value(key)
+        if value:
+            return f"env:{key}={_redact_proxy_value(value)}"
+    return "direct"
+
+
 def configure_requests_session(session: Any) -> bool:
     """Apply proxy settings to a requests session if any are configured."""
     proxy_map = build_requests_proxy_map()
@@ -153,5 +217,8 @@ def configure_requests_session(session: Any) -> bool:
     if not proxy_map:
         return False
     session.proxies.update(proxy_map)
-    logger.info(f"requests 会话已配置代理: {proxy_map.get('https') or proxy_map.get('http')}")
+    logger.info(
+        f"requests 会话已配置代理: "
+        f"{_redact_proxy_value(proxy_map.get('https') or proxy_map.get('http') or '')}"
+    )
     return True

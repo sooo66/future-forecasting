@@ -1,5 +1,6 @@
 """URL 池构建模块"""
 import json
+import sys
 import sqlite3
 import uuid
 from pathlib import Path
@@ -298,7 +299,14 @@ class URLPoolBuilder:
         candidate_count = 0
 
         try:
-            for csv_file in tqdm(csv_files, desc="构建 URL 池", unit="file"):
+            for csv_file in tqdm(
+                csv_files,
+                desc="构建 URL 池",
+                unit="file",
+                dynamic_ncols=True,
+                mininterval=0.5,
+                file=sys.stdout,
+            ):
                 try:
                     batch_rows: List[tuple] = []
                     for candidate in self._iter_csv_candidate_rows(csv_file):

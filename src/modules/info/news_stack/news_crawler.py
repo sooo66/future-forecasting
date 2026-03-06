@@ -1,7 +1,9 @@
 """URL 池爬虫（兼容旧流程）"""
 from __future__ import annotations
 
+import sys
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from typing import AsyncIterator, List, Optional
 
@@ -44,14 +46,40 @@ class NewsCrawler:
         remaining = max(0, int(limit)) if limit is not None else None
         batch_idx = 0
         total_reserved = 0
-        total_success = 0
-        total_failed = 0
         output_path = self._default_output_path()
         initial_stats = self.builder.get_statistics()
+        initial_success = int(initial_stats.get("success", 0))
+        initial_failed = int(initial_stats.get("failed", 0))
+        total_success = initial_success
+        total_failed = initial_failed
+        total_urls = int(initial_stats.get("total", 0))
         pending_total = int(initial_stats.get("pending", 0))
-        progress_total = pending_total if remaining is None else min(pending_total, remaining)
+        initial_completed = initial_success + initial_failed
+        logger.info(
+            f"news URL 池进度基线: done={initial_completed}/{total_urls} "
+            f"success={initial_success} failed={initial_failed} pending={pending_total}"
+        )
+        if remaining is None:
+            progress_total = total_urls
+            progress_initial = initial_completed
+        else:
+            progress_total = min(total_urls, initial_completed + remaining)
+            progress_initial = min(initial_completed, progress_total)
 
-        with tqdm(total=progress_total, desc="爬取 news URLs", unit="url") as pbar:
+        with tqdm(
+            total=progress_total,
+            initial=progress_initial,
+            desc="爬取 news URLs",
+            unit="url",
+            dynamic_ncols=True,
+            mininterval=0.5,
+            file=sys.stdout,
+        ) as pbar:
+            pbar.set_postfix(
+                success=total_success,
+                failed=total_failed,
+                pending=max(0, total_urls - (total_success + total_failed)),
+            )
             while remaining is None or remaining > 0:
                 batch_limit = self.batch_size if remaining is None else min(self.batch_size, remaining)
                 urls = self.builder.reserve_pending_urls(batch_limit)
@@ -63,7 +91,7 @@ class NewsCrawler:
                 batch_idx += 1
                 total_reserved += len(urls)
                 reserved_urls = {str(item.get("url") or "").strip() for item in urls if item.get("url")}
-                logger.info(
+                logger.debug(
                     f"开始爬取 URL 批次: batch={batch_idx} size={len(urls)} "
                     f"remaining_limit={remaining if remaining is not None else 'all'}"
                 )
@@ -76,7 +104,6 @@ class NewsCrawler:
 
                 try:
                     async for record in crawler.run_stream():
-                        total_success += 1
                         yield record
                 except Exception as exc:
                     succeeded_urls = crawler.last_succeeded_urls
@@ -92,14 +119,28 @@ class NewsCrawler:
 
                 succeeded_urls = crawler.last_succeeded_urls
                 failed_urls = crawler.last_failed_urls
-                total_failed += len(failed_urls)
+                failed_reasons = crawler.last_failed_reasons
                 self.builder.bulk_update_status_by_url(list(succeeded_urls), status="success")
                 self.builder.bulk_update_status_by_url(list(failed_urls), status="failed", error="crawl_failed")
                 pbar.update(len(urls))
-                pbar.set_postfix(success=total_success, failed=total_failed)
-                logger.info(
+                batch_failed = len(failed_urls)
+                batch_success = len(succeeded_urls)
+                total_success += batch_success
+                total_failed += batch_failed
+                if failed_urls:
+                    self._apply_failure_reasons(failed_reasons)
+                    logger.warning(
+                        f"URL 批次失败摘要: batch={batch_idx} "
+                        f"failed={batch_failed} top_reasons={self._summarize_failure_reasons(failed_reasons)}"
+                    )
+                pbar.set_postfix(
+                    success=total_success,
+                    failed=total_failed,
+                    pending=max(0, total_urls - (total_success + total_failed)),
+                )
+                logger.debug(
                     f"URL 批次完成: batch={batch_idx} reserved={len(urls)} "
-                    f"success={len(succeeded_urls)} failed={len(failed_urls)}"
+                    f"success={batch_success} failed={batch_failed}"
                 )
 
                 if remaining is not None:
@@ -143,3 +184,18 @@ class NewsCrawler:
 
     def _default_output_path(self) -> Path:
         return self.config.processed_data_dir / "news_crawl_results.jsonl"
+
+    def _apply_failure_reasons(self, failed_reasons: dict[str, str]) -> None:
+        grouped: dict[str, list[str]] = {}
+        for url, reason in failed_reasons.items():
+            grouped.setdefault(reason or "crawl_failed", []).append(url)
+        for reason, urls in grouped.items():
+            self.builder.bulk_update_status_by_url(urls, status="failed", error=reason)
+
+    @staticmethod
+    def _summarize_failure_reasons(failed_reasons: dict[str, str], *, top_k: int = 3) -> str:
+        if not failed_reasons:
+            return "none"
+        counts = Counter(reason or "unknown_failure" for reason in failed_reasons.values())
+        parts = [f"{reason} x{count}" for reason, count in counts.most_common(top_k)]
+        return "; ".join(parts)

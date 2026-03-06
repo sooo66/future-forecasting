@@ -8,6 +8,8 @@ from loguru import logger
 
 from core.runner import build_run_config, run_modules
 from modules import DEFAULT_MODULES
+from utils.config import Config
+from utils.logger import setup_logger
 
 
 def _parse_modules(value: str) -> list[str]:
@@ -32,6 +34,7 @@ def main() -> int:
         help=f"Comma-separated module list or 'all'. default=all ({', '.join(DEFAULT_MODULES)})",
     )
     run.add_argument("--resume", action="store_true", help="Resume from module states")
+    run.add_argument("--verbose", action="store_true", help="Enable DEBUG logs on console")
     run.add_argument(
         "--snapshot-base-dir",
         default="data/benchmark",
@@ -57,6 +60,10 @@ def main() -> int:
         snapshot_base_dir=args.snapshot_base_dir,
         module_workers=args.module_workers,
         project_root=Path(__file__).resolve().parents[1],
+    )
+    setup_logger(
+        Config({"paths": {"log_dir": str(cfg.snapshot_root / "logs")}}),
+        verbose=bool(args.verbose),
     )
     result = run_modules(cfg)
     logger.info(f"run completed: {result['stats']}")

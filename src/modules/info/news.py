@@ -9,6 +9,7 @@ from loguru import logger
 
 from core.contracts import TextRecord, stable_record_id
 from modules.base import RunContext
+from modules.common.proxy_pool import describe_proxy_mode
 from modules.info.news_stack.gdelt.downloader import GDELTDownloader
 from modules.info.news_stack.url_pool.builder import URLPoolBuilder
 from modules.info.news_stack.news_crawler import NewsCrawler
@@ -131,11 +132,20 @@ class NewsModule:
             f"scrapling_primary_concurrency={config.get('crawler.scrapling_primary_concurrency')} "
             f"news_crawl_batch_size={config.get('crawler.news_crawl_batch_size')}"
         )
+        logger.info(f"[{self.name}] proxy mode={describe_proxy_mode()}")
 
         builder = URLPoolBuilder(config)
         existing_stats = builder.get_statistics() if ctx.resume else {"total": 0}
         if ctx.resume and int(existing_stats.get("total", 0)) > 0:
-            logger.info(f"[{self.name}] resume mode: reuse existing url pool stats={existing_stats}")
+            done = int(existing_stats.get("success", 0)) + int(existing_stats.get("failed", 0))
+            logger.info(
+                f"[{self.name}] resume mode: reuse existing url pool "
+                f"done={done}/{existing_stats.get('total', 0)} "
+                f"success={existing_stats.get('success', 0)} "
+                f"failed={existing_stats.get('failed', 0)} "
+                f"pending={existing_stats.get('pending', 0)} "
+                f"in_progress={existing_stats.get('in_progress', 0)}"
+            )
         else:
             downloader = GDELTDownloader(config)
             downloader.download()

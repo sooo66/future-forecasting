@@ -112,6 +112,7 @@ class Crawler:
         self._last_input_urls: set[str] = set()
         self._last_succeeded_urls: set[str] = set()
         self._last_failed_urls: set[str] = set()
+        self._last_failed_reasons: dict[str, str] = {}
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -214,6 +215,10 @@ class Crawler:
     def last_failed_urls(self) -> set[str]:
         return set(self._last_failed_urls)
 
+    @property
+    def last_failed_reasons(self) -> dict[str, str]:
+        return dict(self._last_failed_reasons)
+
     async def run_stream(self) -> AsyncIterator[Record]:
         """运行爬虫并流式产出 `Record`。"""
         if self.urls is not None:
@@ -228,7 +233,7 @@ class Crawler:
         self._reset_run_tracking(urls)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.proxy_manager.refresh_env()
-        logger.info(
+        logger.debug(
             f"爬虫主引擎: {self._primary_engine} "
             f"(scrapling_qmin={self._scrapling_quality_min_chars}, "
             f"scrapling_timeout={self._scrapling_primary_timeout_sec}s, "
@@ -246,7 +251,7 @@ class Crawler:
             async for record, rescue_url in self._crawl_with_scrapling_primary_stream(urls):
                 if record is not None:
                     succeeded_urls.add(record.url)
-                    self._last_succeeded_urls.add(record.url)
+                    self._mark_success(record.url)
                     total_records += 1
                     yield record
                 if rescue_url:
@@ -254,26 +259,53 @@ class Crawler:
 
             should_rescue = self._primary_engine == "hybrid" or self._enable_crawl4ai_rescue_after_scrapling
             if rescue_urls and should_rescue:
-                logger.info(f"scrapling 主抓取完成，进入 crawl4ai rescue: {len(rescue_urls)} URLs")
+                logger.debug(f"scrapling 主抓取完成，进入 crawl4ai rescue: {len(rescue_urls)} URLs")
                 async for record in self._crawl_with_crawl4ai_stream(rescue_urls, pre_succeeded_urls=succeeded_urls):
-                    self._last_succeeded_urls.add(record.url)
+                    self._mark_success(record.url)
                     total_records += 1
                     yield record
             elif rescue_urls:
-                logger.info(f"scrapling 主抓取完成，未启用 crawl4ai rescue，丢弃 {len(rescue_urls)} URLs")
+                logger.debug(f"scrapling 主抓取完成，未启用 crawl4ai rescue，丢弃 {len(rescue_urls)} URLs")
         else:
             async for record in self._crawl_with_crawl4ai_stream(urls):
-                self._last_succeeded_urls.add(record.url)
+                self._mark_success(record.url)
                 total_records += 1
                 yield record
 
         self._last_failed_urls = set(self._last_input_urls) - set(self._last_succeeded_urls)
-        logger.info(f"爬取完成，总记录数: {total_records}，输出: {self.output_path}")
+        self._last_failed_reasons = {
+            url: self._last_failed_reasons.get(url, "unknown_failure")
+            for url in self._last_failed_urls
+        }
+        logger.debug(f"爬取完成，总记录数: {total_records}，输出: {self.output_path}")
 
     def _reset_run_tracking(self, urls: List[str]) -> None:
         self._last_input_urls = {str(url).strip() for url in urls if str(url).strip()}
         self._last_succeeded_urls = set()
         self._last_failed_urls = set()
+        self._last_failed_reasons = {}
+
+    def _mark_success(self, url: str) -> None:
+        clean = str(url or "").strip()
+        if not clean:
+            return
+        self._last_succeeded_urls.add(clean)
+        self._last_failed_reasons.pop(clean, None)
+
+    def _mark_failure(self, url: str, reason: Optional[str]) -> None:
+        clean = str(url or "").strip()
+        if not clean:
+            return
+        summary = self._sanitize_failure_reason(reason)
+        if summary:
+            self._last_failed_reasons[clean] = summary
+
+    @staticmethod
+    def _sanitize_failure_reason(reason: Optional[str], *, limit: int = 240) -> str:
+        text = re.sub(r"\s+", " ", str(reason or "").strip())
+        if not text:
+            return ""
+        return text[:limit]
 
     async def _crawl_with_scrapling_primary_stream(
         self,
@@ -282,36 +314,42 @@ class Crawler:
         semaphore = asyncio.Semaphore(self._scrapling_primary_concurrency)
         stats = {"ok": 0, "failed": 0, "low_quality": 0, "short_circuited": 0}
 
-        async def _one(url: str) -> tuple[str, Optional[Record]]:
+        async def _one(url: str) -> tuple[str, Optional[Record], Optional[str]]:
             try:
                 async with semaphore:
-                    record = await self._try_scrapling(
+                    record, reason = await self._try_scrapling(
                         url,
                         timeout_sec=self._scrapling_primary_timeout_sec,
                         retries=self._scrapling_primary_retries,
                     )
             except Exception as exc:
-                logger.debug(f"scrapling 主抓取异常: {url} | {exc}")
-                return url, None
-            return url, record
+                reason = f"scrapling_primary_exception:{type(exc).__name__}:{exc}"
+                logger.bind(trace=True).warning(f"scrapling 主抓取异常: url={url} reason={reason}")
+                return url, None, self._sanitize_failure_reason(reason)
+            return url, record, self._sanitize_failure_reason(reason)
 
         for chunk_start in range(0, len(urls), self._scrapling_primary_chunk_size):
             chunk_urls = urls[chunk_start:chunk_start + self._scrapling_primary_chunk_size]
             tasks = [asyncio.create_task(_one(url)) for url in chunk_urls]
             for task in asyncio.as_completed(tasks):
-                url, record = await task
+                url, record, reason = await task
 
                 if record is None:
                     stats["failed"] += 1
+                    self._mark_failure(url, reason or "scrapling_primary_failed")
                     yield None, url
                     continue
 
                 content_len = self._record_content_chars(record)
                 if content_len < self._scrapling_quality_min_chars:
                     stats["low_quality"] += 1
-                    logger.debug(
-                        f"scrapling 质量不足，转 rescue: {url} "
-                        f"(content_chars={content_len}, min={self._scrapling_quality_min_chars})"
+                    self._mark_failure(
+                        url,
+                        f"scrapling_primary_low_quality:content_chars={content_len},min={self._scrapling_quality_min_chars}",
+                    )
+                    logger.bind(trace=True).info(
+                        f"scrapling 质量不足，转 rescue: url={url} "
+                        f"content_chars={content_len} min={self._scrapling_quality_min_chars}"
                     )
                     yield None, url
                     continue
@@ -339,7 +377,7 @@ class Crawler:
                     yield None, remaining_url
                 break
 
-        logger.info(
+        logger.debug(
             f"scrapling 主抓取统计: ok={stats['ok']} "
             f"low_quality={stats['low_quality']} failed={stats['failed']} "
             f"short_circuited={stats['short_circuited']}"
@@ -375,10 +413,11 @@ class Crawler:
         async with self._init_crawler(browser_config, use_undetected=True) as crawler:
             stream = await crawler.arun_many(urls=urls, config=run_config, dispatcher=dispatcher)
             async for result in stream:
-                record, retry_url = self._process_result(result)
+                record, retry_url, failure_reason = self._process_result(result)
                 if record is None:
                     if retry_url:
                         failed_urls.append(retry_url)
+                        self._mark_failure(retry_url, failure_reason or "crawl4ai_failed")
                     continue
                 if record.url in succeeded_urls:
                     continue
@@ -616,7 +655,7 @@ class Crawler:
     # ------------------------------------------------------------------
     # 结果处理 & 序列化
     # ------------------------------------------------------------------
-    def _process_result(self, result: Any) -> tuple[Optional[Record], Optional[str]]:
+    def _process_result(self, result: Any) -> tuple[Optional[Record], Optional[str], Optional[str]]:
         """将 Crawl4AI 的结果转换为 `Record`。
 
         - 失败的请求只记录日志，不会输出 `Record`；
@@ -628,8 +667,9 @@ class Crawler:
         error_message = getattr(result, "error_message", None) or getattr(result, "error", None)
 
         if not success:
-            logger.warning(f"爬取失败: {url} | {error_message}")
-            return None, url or None
+            reason = self._sanitize_failure_reason(f"crawl4ai_error:{error_message or 'unknown'}")
+            logger.bind(trace=True).warning(f"爬取失败: url={url} reason={reason}")
+            return None, url or None, reason
 
         cleaned_html = getattr(result, "cleaned_html", None) or ""
         raw_html = getattr(result, "html", None) or ""
@@ -643,9 +683,10 @@ class Crawler:
             allow_markdown_passthrough=False,
         )
         if record is None:
-            logger.warning(f"爬取结果为空，加入 fallback 队列: {url}")
-            return None, url or None
-        return record, None
+            reason = "crawl4ai_empty_record"
+            logger.bind(trace=True).warning(f"爬取结果为空，加入 fallback 队列: url={url}")
+            return None, url or None, reason
+        return record, None, None
 
     def _build_record(
         self,
@@ -747,7 +788,7 @@ class Crawler:
         if not pending_urls:
             return []
 
-        logger.info(
+        logger.debug(
             f"开始 fallback 爬取: pending={len(pending_urls)} "
             f"(scrapling={self._enable_scrapling_fallback}, jina={self._enable_jina_reader_fallback})"
         )
@@ -769,7 +810,7 @@ class Crawler:
 
             for task in asyncio.as_completed(tasks):
                 try:
-                    record, stage = await task
+                    failed_url, record, stage, failure_reason = await task
                 except Exception as exc:
                     logger.warning(f"fallback 任务异常: {exc}")
                     stats["failed"] += 1
@@ -777,11 +818,12 @@ class Crawler:
 
                 stats[stage] = stats.get(stage, 0) + 1
                 if record is None:
+                    self._mark_failure(failed_url, failure_reason or "fallback_failed")
                     continue
                 records.append(record)
                 self._append_output(record)
 
-        logger.info(
+        logger.debug(
             "fallback 完成: "
             f"scrapling={stats.get('scrapling', 0)} "
             f"jina_reader={stats.get('jina_reader', 0)} "
@@ -795,19 +837,26 @@ class Crawler:
         *,
         semaphore: asyncio.Semaphore,
         http_client: httpx.AsyncClient,
-    ) -> tuple[Optional[Record], str]:
+    ) -> tuple[str, Optional[Record], str, Optional[str]]:
         async with semaphore:
+            failure_parts: list[str] = []
             if self._enable_scrapling_fallback:
-                record = await self._try_scrapling(url)
+                record, scrapling_reason = await self._try_scrapling(url)
                 if record is not None:
-                    return record, "scrapling"
+                    return url, record, "scrapling", None
+                if scrapling_reason:
+                    failure_parts.append(f"scrapling_fallback={scrapling_reason}")
 
             if self._enable_jina_reader_fallback:
-                record = await self._try_jina_reader(url, http_client=http_client)
+                record, jina_reason = await self._try_jina_reader(url, http_client=http_client)
                 if record is not None:
-                    return record, "jina_reader"
+                    return url, record, "jina_reader", None
+                if jina_reason:
+                    failure_parts.append(f"jina_reader={jina_reason}")
 
-        return None, "failed"
+        reason = "; ".join(failure_parts) if failure_parts else "fallback_failed"
+        logger.bind(trace=True).warning(f"fallback 最终失败: url={url} reason={reason}")
+        return url, None, "failed", self._sanitize_failure_reason(reason)
 
     async def _try_scrapling(
         self,
@@ -815,9 +864,9 @@ class Crawler:
         *,
         timeout_sec: Optional[float] = None,
         retries: Optional[int] = None,
-    ) -> Optional[Record]:
+    ) -> tuple[Optional[Record], Optional[str]]:
         if AsyncFetcher is None:
-            return None
+            return None, "scrapling_unavailable"
         effective_timeout = float(timeout_sec if timeout_sec is not None else self._fallback_timeout_sec)
         effective_retries = int(retries if retries is not None else max(1, int(self.config.retry_attempts)))
         try:
@@ -829,44 +878,59 @@ class Crawler:
                 stealthy_headers=True,
             )
         except Exception as exc:
-            logger.debug(f"Scrapling 失败: {url} | {exc}")
-            return None
+            reason = self._sanitize_failure_reason(f"scrapling_exception:{type(exc).__name__}:{exc}")
+            logger.bind(trace=True).warning(f"Scrapling 失败: url={url} reason={reason}")
+            return None, reason
 
         status = int(getattr(response, "status", 0) or 0)
         if status >= 400:
-            logger.debug(f"Scrapling HTTP 异常: {url} status={status}")
-            return None
+            reason = f"scrapling_http_{status}"
+            logger.bind(trace=True).warning(f"Scrapling HTTP 异常: url={url} status={status}")
+            return None, reason
 
         html = self._extract_scrapling_html(response)
         text = self._extract_scrapling_text(response)
-        return self._build_record(
+        record = self._build_record(
             url=url,
             html=html,
             markdown_text=text,
             allow_markdown_passthrough=True,
         )
+        if record is None:
+            return None, "scrapling_empty_record"
+        return record, None
 
-    async def _try_jina_reader(self, url: str, *, http_client: httpx.AsyncClient) -> Optional[Record]:
+    async def _try_jina_reader(
+        self,
+        url: str,
+        *,
+        http_client: httpx.AsyncClient,
+    ) -> tuple[Optional[Record], Optional[str]]:
         reader_url = self._jina_reader_prefix + url
         try:
             response = await http_client.get(reader_url)
         except Exception as exc:
-            logger.debug(f"Jina Reader 失败: {url} | {exc}")
-            return None
+            reason = self._sanitize_failure_reason(f"jina_reader_exception:{type(exc).__name__}:{exc}")
+            logger.bind(trace=True).warning(f"Jina Reader 失败: url={url} reason={reason}")
+            return None, reason
 
         if response.status_code >= 400:
-            logger.debug(f"Jina Reader HTTP 异常: {url} status={response.status_code}")
-            return None
+            reason = f"jina_reader_http_{response.status_code}"
+            logger.bind(trace=True).warning(f"Jina Reader HTTP 异常: url={url} status={response.status_code}")
+            return None, reason
 
         text = self._clean_jina_reader_text(response.text)
         if not text:
-            return None
-        return self._build_record(
+            return None, "jina_reader_empty_text"
+        record = self._build_record(
             url=url,
             html="",
             markdown_text=text,
             allow_markdown_passthrough=True,
         )
+        if record is None:
+            return None, "jina_reader_empty_record"
+        return record, None
 
     @staticmethod
     def _extract_scrapling_html(response: Any) -> str:

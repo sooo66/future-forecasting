@@ -1,5 +1,5 @@
 """GDELT GKG 数据下载模块"""
-import os
+import sys
 import zipfile
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -109,7 +109,7 @@ class GDELTDownloader:
             # 验证 CSV 文件是否存在
             if csv_path.exists():
                 self.downloaded_files.add(date_str)
-                logger.info(f"成功下载并解压 {date_str} 的 GKG 文件")
+                logger.debug(f"成功下载并解压 {date_str} 的 GKG 文件")
                 return True
             else:
                 logger.error(f"{date_str} 解压后 CSV 文件不存在")
@@ -139,7 +139,14 @@ class GDELTDownloader:
                 for date in dates
             }
             
-            with tqdm(total=len(dates), desc="下载 GKG 文件") as pbar:
+            with tqdm(
+                total=len(dates),
+                desc="下载 GKG 文件",
+                unit="day",
+                dynamic_ncols=True,
+                mininterval=0.5,
+                file=sys.stdout,
+            ) as pbar:
                 for future in as_completed(future_to_date):
                     date = future_to_date[future]
                     try:
