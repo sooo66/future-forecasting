@@ -50,6 +50,8 @@ jina_reader_prefix = "https://r.jina.ai/"
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
 news_crawl_batch_size = 250
 news_reset_in_progress_on_start = true
+# 新闻 URL 抓取进度条颜色（tqdm colour），可选如 cyan/green/yellow
+news_progress_bar_color = "cyan"
 # 直接从原始 GKG CSV 流式构建 URL 池，避免生成 parquet 中间文件
 gkg_parse_chunk_size = 10000
 cleanup_raw_gkg_after_build = true

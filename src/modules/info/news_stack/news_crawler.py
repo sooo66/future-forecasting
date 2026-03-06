@@ -26,6 +26,8 @@ class NewsCrawler:
         self.reset_in_progress_on_start = bool(
             self.config.get("crawler.news_reset_in_progress_on_start", True)
         )
+        raw_bar_color = str(self.config.get("crawler.news_progress_bar_color", "cyan")).strip()
+        self.progress_bar_color = raw_bar_color or None
 
     async def crawl(self, limit: Optional[int] = None) -> List[Record]:
         records: List[Record] = []
@@ -55,9 +57,11 @@ class NewsCrawler:
         total_urls = int(initial_stats.get("total", 0))
         pending_total = int(initial_stats.get("pending", 0))
         initial_completed = initial_success + initial_failed
+        initial_remaining = max(0, total_urls - initial_completed)
         logger.info(
-            f"news URL 池进度基线: done={initial_completed}/{total_urls} "
-            f"success={initial_success} failed={initial_failed} pending={pending_total}"
+            f"news URL 池进度基线: crawled={initial_completed} "
+            f"remaining={initial_remaining} total={total_urls} "
+            f"(success={initial_success} failed={initial_failed} pending={pending_total})"
         )
         if remaining is None:
             progress_total = total_urls
@@ -74,18 +78,30 @@ class NewsCrawler:
             dynamic_ncols=True,
             mininterval=0.5,
             file=sys.stdout,
+            colour=self.progress_bar_color,
         ) as pbar:
-            pbar.set_postfix(
-                success=total_success,
-                failed=total_failed,
-                pending=max(0, total_urls - (total_success + total_failed)),
-            )
+            def _refresh_postfix() -> None:
+                crawled = total_success + total_failed
+                pbar.set_postfix(
+                    crawled=f"{crawled}/{total_urls}",
+                    remaining=max(0, total_urls - crawled),
+                    total=total_urls,
+                    success=total_success,
+                    failed=total_failed,
+                )
+
+            _refresh_postfix()
             while remaining is None or remaining > 0:
                 batch_limit = self.batch_size if remaining is None else min(self.batch_size, remaining)
                 urls = self.builder.reserve_pending_urls(batch_limit)
                 if not urls:
                     if batch_idx == 0:
-                        logger.warning("URL 池中没有待爬取 URL")
+                        if pending_total == 0 and total_urls > 0:
+                            logger.info(
+                                f"URL 池已无剩余任务: crawled={initial_completed} remaining=0 total={total_urls}"
+                            )
+                        else:
+                            logger.warning("URL 池中没有待爬取 URL")
                     break
 
                 batch_idx += 1
@@ -133,11 +149,7 @@ class NewsCrawler:
                         f"URL 批次失败摘要: batch={batch_idx} "
                         f"failed={batch_failed} top_reasons={self._summarize_failure_reasons(failed_reasons)}"
                     )
-                pbar.set_postfix(
-                    success=total_success,
-                    failed=total_failed,
-                    pending=max(0, total_urls - (total_success + total_failed)),
-                )
+                _refresh_postfix()
                 logger.debug(
                     f"URL 批次完成: batch={batch_idx} reserved={len(urls)} "
                     f"success={batch_success} failed={batch_failed}"

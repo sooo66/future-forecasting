@@ -30,6 +30,14 @@ def setup_logger(config: Config, *, verbose: bool = False):
     
     # 移除默认处理器
     logger.remove()
+
+    # 调整控制台级别配色，避免 INFO 与进度条默认白色混淆
+    logger.level("DEBUG", color="<blue>")
+    logger.level("INFO", color="<cyan>")
+    logger.level("SUCCESS", color="<green>")
+    logger.level("WARNING", color="<yellow>")
+    logger.level("ERROR", color="<red>")
+    logger.level("CRITICAL", color="<red><bold>")
     
     # 添加控制台输出（默认 INFO，verbose 时 DEBUG）
     logger.add(
