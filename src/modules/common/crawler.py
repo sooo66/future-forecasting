@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -32,6 +34,7 @@ from crawl4ai import (
 )
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
+from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.proxy_strategy import RoundRobinProxyStrategy
@@ -151,6 +154,18 @@ class Crawler:
             1,
             int(self.config.get("crawler.scrapling_primary_retries", 1)),
         )
+        self._scrapling_primary_per_domain_concurrency = max(
+            1,
+            int(self.config.get("crawler.scrapling_primary_per_domain_concurrency", 2)),
+        )
+        self._scrapling_primary_delay_min_sec = max(
+            0.0,
+            float(self.config.get("crawler.scrapling_primary_delay_min_sec", 0.0)),
+        )
+        self._scrapling_primary_delay_max_sec = max(
+            self._scrapling_primary_delay_min_sec,
+            float(self.config.get("crawler.scrapling_primary_delay_max_sec", 0.0)),
+        )
         self._scrapling_primary_chunk_size = max(
             self._scrapling_primary_concurrency,
             int(
@@ -238,6 +253,8 @@ class Crawler:
             f"(scrapling_qmin={self._scrapling_quality_min_chars}, "
             f"scrapling_timeout={self._scrapling_primary_timeout_sec}s, "
             f"scrapling_retries={self._scrapling_primary_retries}, "
+            f"scrapling_domain_q={self._scrapling_primary_per_domain_concurrency}, "
+            f"scrapling_delay={self._scrapling_primary_delay_min_sec:.2f}-{self._scrapling_primary_delay_max_sec:.2f}s, "
             f"scrapling_chunk={self._scrapling_primary_chunk_size}, "
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
@@ -307,21 +324,50 @@ class Crawler:
             return ""
         return text[:limit]
 
+    @staticmethod
+    def _domain_key_for_url(url: str) -> str:
+        try:
+            netloc = urlparse(url).netloc or ""
+        except Exception:
+            netloc = ""
+        host = netloc.split("@")[-1].split(":")[0].strip().lower()
+        return host or "unknown"
+
+    def _sample_scrapling_primary_delay(self) -> float:
+        low = self._scrapling_primary_delay_min_sec
+        high = self._scrapling_primary_delay_max_sec
+        if high <= 0:
+            return 0.0
+        if high <= low:
+            return low
+        return random.uniform(low, high)
+
     async def _crawl_with_scrapling_primary_stream(
         self,
         urls: List[str],
     ) -> AsyncIterator[tuple[Optional[Record], Optional[str]]]:
         semaphore = asyncio.Semaphore(self._scrapling_primary_concurrency)
+        domain_semaphores: dict[str, asyncio.Semaphore] = {}
         stats = {"ok": 0, "failed": 0, "low_quality": 0, "short_circuited": 0}
+        failure_reasons: Counter[str] = Counter()
 
         async def _one(url: str) -> tuple[str, Optional[Record], Optional[str]]:
+            domain = self._domain_key_for_url(url)
+            domain_sem = domain_semaphores.get(domain)
+            if domain_sem is None:
+                domain_sem = asyncio.Semaphore(self._scrapling_primary_per_domain_concurrency)
+                domain_semaphores[domain] = domain_sem
             try:
                 async with semaphore:
-                    record, reason = await self._try_scrapling(
-                        url,
-                        timeout_sec=self._scrapling_primary_timeout_sec,
-                        retries=self._scrapling_primary_retries,
-                    )
+                    async with domain_sem:
+                        delay_sec = self._sample_scrapling_primary_delay()
+                        if delay_sec > 0:
+                            await asyncio.sleep(delay_sec)
+                        record, reason = await self._try_scrapling(
+                            url,
+                            timeout_sec=self._scrapling_primary_timeout_sec,
+                            retries=self._scrapling_primary_retries,
+                        )
             except Exception as exc:
                 reason = f"scrapling_primary_exception:{type(exc).__name__}:{exc}"
                 logger.bind(trace=True).warning(f"scrapling 主抓取异常: url={url} reason={reason}")
@@ -336,13 +382,17 @@ class Crawler:
 
                 if record is None:
                     stats["failed"] += 1
-                    self._mark_failure(url, reason or "scrapling_primary_failed")
+                    clean_reason = reason or "scrapling_primary_failed"
+                    failure_reasons[clean_reason] += 1
+                    self._mark_failure(url, clean_reason)
                     yield None, url
                     continue
 
                 content_len = self._record_content_chars(record)
                 if content_len < self._scrapling_quality_min_chars:
                     stats["low_quality"] += 1
+                    reason_key = f"scrapling_primary_low_quality:min={self._scrapling_quality_min_chars}"
+                    failure_reasons[reason_key] += 1
                     self._mark_failure(
                         url,
                         f"scrapling_primary_low_quality:content_chars={content_len},min={self._scrapling_quality_min_chars}",
@@ -382,6 +432,9 @@ class Crawler:
             f"low_quality={stats['low_quality']} failed={stats['failed']} "
             f"short_circuited={stats['short_circuited']}"
         )
+        if failure_reasons:
+            summary = "; ".join(f"{reason} x{count}" for reason, count in failure_reasons.most_common(5))
+            logger.info(f"scrapling 主抓取失败原因TOP: {summary}")
 
     async def _crawl_with_crawl4ai_stream(
         self,
@@ -465,6 +518,8 @@ class Crawler:
         return CrawlerRunConfig(
             cache_mode=CacheMode.DISABLED,
             stream=True,
+            verbose=False,
+            log_console=False,
             proxy_rotation_strategy=proxy_strategy,
             markdown_generator=DefaultMarkdownGenerator(
                 content_filter=PruningContentFilter(threshold=0.48, threshold_type="dynamic"),
@@ -498,6 +553,7 @@ class Crawler:
         return BrowserConfig(
             enable_stealth=True,
             headless=True,
+            verbose=False,
             user_agent_mode="random",
             headers=headers,
         )
@@ -509,12 +565,17 @@ class Crawler:
         - 如果未来需要精简/禁用 undetected，可以将 `use_undetected` 设为 False，
           直接使用默认的 AsyncWebCrawler(config=browser_config)。
         """
+        quiet_logger = AsyncLogger(verbose=False)
         if not use_undetected:
-            return AsyncWebCrawler(config=browser_config)
+            return AsyncWebCrawler(config=browser_config, logger=quiet_logger)
 
         adapter = UndetectedAdapter()
-        strategy = AsyncPlaywrightCrawlerStrategy(browser_config=browser_config, browser_adapter=adapter)
-        return AsyncWebCrawler(crawler_strategy=strategy, config=browser_config)
+        strategy = AsyncPlaywrightCrawlerStrategy(
+            browser_config=browser_config,
+            browser_adapter=adapter,
+            logger=quiet_logger,
+        )
+        return AsyncWebCrawler(crawler_strategy=strategy, config=browser_config, logger=quiet_logger)
 
     def _build_delay_window(self) -> tuple[float, float]:
         minimum = max(0.0, float(self.config.request_delay_min))

@@ -49,12 +49,24 @@ class NewsModule:
         scrapling_primary_concurrency = int(
             base_cfg.get("crawler.scrapling_primary_concurrency", base_cfg.concurrent_crawls)
         )
+        scrapling_primary_per_domain_concurrency = int(
+            base_cfg.get("crawler.scrapling_primary_per_domain_concurrency", 2)
+        )
+        scrapling_primary_delay_min_sec = float(
+            base_cfg.get("crawler.scrapling_primary_delay_min_sec", 0.0)
+        )
+        scrapling_primary_delay_max_sec = float(
+            base_cfg.get("crawler.scrapling_primary_delay_max_sec", 0.0)
+        )
         fallback_concurrency = int(
             base_cfg.get("crawler.fallback_concurrency", base_cfg.concurrent_crawls)
         )
+        news_crawl_batch_size = int(base_cfg.get("crawler.news_crawl_batch_size", 250))
         if long_range_mode:
-            scrapling_primary_concurrency = min(scrapling_primary_concurrency, 8)
+            scrapling_primary_concurrency = min(scrapling_primary_concurrency, 6)
+            scrapling_primary_per_domain_concurrency = min(scrapling_primary_per_domain_concurrency, 2)
             fallback_concurrency = min(fallback_concurrency, 4)
+            news_crawl_batch_size = min(news_crawl_batch_size, 180)
 
         whitelist = [
             {"name": name, "domain": domain}
@@ -77,6 +89,9 @@ class NewsModule:
             "crawler": {
                 "primary_engine": base_cfg.get("crawler.primary_engine", "crawl4ai"),
                 "scrapling_primary_concurrency": scrapling_primary_concurrency,
+                "scrapling_primary_per_domain_concurrency": scrapling_primary_per_domain_concurrency,
+                "scrapling_primary_delay_min_sec": scrapling_primary_delay_min_sec,
+                "scrapling_primary_delay_max_sec": scrapling_primary_delay_max_sec,
                 "scrapling_quality_min_chars": base_cfg.get("crawler.scrapling_quality_min_chars", 280),
                 "scrapling_primary_timeout_sec": base_cfg.get("crawler.scrapling_primary_timeout_sec", 12.0),
                 "scrapling_primary_retries": base_cfg.get("crawler.scrapling_primary_retries", 1),
@@ -98,11 +113,12 @@ class NewsModule:
                 "fallback_concurrency": fallback_concurrency,
                 "fallback_timeout_sec": base_cfg.get("crawler.fallback_timeout_sec", base_cfg.browser_timeout),
                 "jina_reader_prefix": base_cfg.get("crawler.jina_reader_prefix", "https://r.jina.ai/"),
-                "news_crawl_batch_size": base_cfg.get("crawler.news_crawl_batch_size", 250),
+                "news_crawl_batch_size": news_crawl_batch_size,
                 "news_reset_in_progress_on_start": base_cfg.get(
                     "crawler.news_reset_in_progress_on_start",
                     True,
                 ),
+                "news_batch_interleave_domains": base_cfg.get("crawler.news_batch_interleave_domains", True),
                 "news_progress_bar_color": base_cfg.get("crawler.news_progress_bar_color", "yellow"),
                 "gkg_parse_chunk_size": base_cfg.get("crawler.gkg_parse_chunk_size", 10000),
                 "cleanup_raw_gkg_after_build": base_cfg.get(
@@ -131,6 +147,10 @@ class NewsModule:
             f"{(ctx.date_to.date() - ctx.date_from.date()).days + 1} "
             f"concurrent_crawls={config.concurrent_crawls} "
             f"scrapling_primary_concurrency={config.get('crawler.scrapling_primary_concurrency')} "
+            f"scrapling_primary_per_domain={config.get('crawler.scrapling_primary_per_domain_concurrency')} "
+            f"scrapling_primary_delay="
+            f"{config.get('crawler.scrapling_primary_delay_min_sec')}-"
+            f"{config.get('crawler.scrapling_primary_delay_max_sec')} "
             f"news_crawl_batch_size={config.get('crawler.news_crawl_batch_size')}"
         )
         logger.info(f"[{self.name}] proxy mode={describe_proxy_mode()}")
@@ -171,7 +191,7 @@ class NewsModule:
                     continue
                 yielded += 1
                 if yielded % 100 == 0:
-                    logger.info(f"[{self.name}] streaming normalized records={yielded}")
+                    logger.debug(f"[{self.name}] streaming normalized records={yielded}")
                 yield row
         finally:
             loop.run_until_complete(loop.shutdown_asyncgens())

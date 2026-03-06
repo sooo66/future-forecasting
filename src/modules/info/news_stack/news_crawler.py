@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import sys
 import sqlite3
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import AsyncIterator, List, Optional
+from urllib.parse import urlparse
 
 from loguru import logger
 from tqdm import tqdm
@@ -27,6 +28,7 @@ class NewsCrawler:
         self.reset_in_progress_on_start = bool(
             self.config.get("crawler.news_reset_in_progress_on_start", True)
         )
+        self.batch_interleave_domains = bool(self.config.get("crawler.news_batch_interleave_domains", True))
         raw_bar_color = str(self.config.get("crawler.news_progress_bar_color", "yellow")).strip()
         self.progress_bar_color = raw_bar_color or None
         self._bar_color_prefix = self._ansi_color_prefix(self.progress_bar_color)
@@ -126,6 +128,8 @@ class NewsCrawler:
                         else:
                             logger.warning("URL 池中没有待爬取 URL")
                     break
+                if self.batch_interleave_domains and len(urls) > 1:
+                    urls = self._interleave_urls_by_domain(urls)
 
                 batch_idx += 1
                 total_reserved += len(urls)
@@ -227,6 +231,42 @@ class NewsCrawler:
 
     def _default_output_path(self) -> Path:
         return self.config.processed_data_dir / "news_crawl_results.jsonl"
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            netloc = urlparse(url).netloc or ""
+        except Exception:
+            netloc = ""
+        host = netloc.split("@")[-1].split(":")[0].strip().lower()
+        return host or "unknown"
+
+    def _interleave_urls_by_domain(self, urls: List[dict]) -> List[dict]:
+        buckets: dict[str, deque[dict]] = {}
+        for item in urls:
+            domain = str(item.get("domain") or "").strip().lower()
+            if not domain:
+                domain = self._extract_domain(str(item.get("url") or ""))
+            if not domain:
+                domain = "unknown"
+            queue = buckets.get(domain)
+            if queue is None:
+                queue = deque()
+                buckets[domain] = queue
+            queue.append(item)
+
+        ordered_domains = sorted(buckets.keys(), key=lambda key: len(buckets[key]), reverse=True)
+        interleaved: list[dict] = []
+        while ordered_domains:
+            next_round: list[str] = []
+            for domain in ordered_domains:
+                queue = buckets[domain]
+                if queue:
+                    interleaved.append(queue.popleft())
+                if queue:
+                    next_round.append(domain)
+            ordered_domains = next_round
+        return interleaved
 
     def _build_progress_bar_format(self) -> str:
         if self._bar_color_prefix:

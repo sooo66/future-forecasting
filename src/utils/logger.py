@@ -1,4 +1,5 @@
 """日志配置模块"""
+import logging
 import sys
 from pathlib import Path
 
@@ -38,6 +39,11 @@ def setup_logger(config: Config, *, verbose: bool = False):
     logger.level("WARNING", color="<yellow>")
     logger.level("ERROR", color="<red>")
     logger.level("CRITICAL", color="<red><bold>")
+
+    # 压低第三方库默认控制台噪声，详细日志仍走本项目文件日志
+    logging.getLogger("crawl4ai").setLevel(logging.ERROR)
+    logging.getLogger("scrapling").setLevel(logging.ERROR)
+    logging.getLogger("playwright").setLevel(logging.ERROR)
     
     # 添加控制台输出（默认 INFO，verbose 时 DEBUG）
     logger.add(

@@ -27,6 +27,11 @@ primary_engine = "hybrid"
 
 # Scrapling 主抓取并发（默认可与 concurrent_crawls 一致）
 scrapling_primary_concurrency = 16
+# Scrapling 主抓取的单域名并发上限（降低被同站点限流概率）
+scrapling_primary_per_domain_concurrency = 2
+# Scrapling 主抓取请求间随机抖动（秒），用于降低无代理场景的封禁概率
+scrapling_primary_delay_min_sec = 0.10
+scrapling_primary_delay_max_sec = 0.50
 # Scrapling 结果最小正文长度，低于该阈值会转给 Crawl4AI rescue
 scrapling_quality_min_chars = 280
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
@@ -50,6 +55,8 @@ jina_reader_prefix = "https://r.jina.ai/"
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
 news_crawl_batch_size = 250
 news_reset_in_progress_on_start = true
+# 批次内按域名交错排序，降低同域突发请求
+news_batch_interleave_domains = true
 # 新闻 URL 抓取进度条颜色（tqdm colour + ANSI 兜底），可选如 yellow/green/cyan
 news_progress_bar_color = "yellow"
 # 直接从原始 GKG CSV 流式构建 URL 池，避免生成 parquet 中间文件
