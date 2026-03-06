@@ -42,6 +42,9 @@ scrapling_primary_chunk_size = 24
 # 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue
 scrapling_short_circuit_sample_size = 80
 scrapling_short_circuit_fail_ratio = 0.88
+# 单域名连续出现连接类失败（ConnectTimeout/ConnectError）达到阈值后，
+# 当前运行中该域名剩余 URL 直接跳过 scrapling，转到 rescue。
+scrapling_domain_connect_failure_streak_threshold = 3
 # 当主引擎为 scrapling 时，是否将失败/低质量 URL 交给 Crawl4AI
 enable_crawl4ai_rescue_after_scrapling = true
 

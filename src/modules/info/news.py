@@ -104,6 +104,10 @@ class NewsModule:
                     "crawler.scrapling_short_circuit_fail_ratio",
                     0.85,
                 ),
+                "scrapling_domain_connect_failure_streak_threshold": base_cfg.get(
+                    "crawler.scrapling_domain_connect_failure_streak_threshold",
+                    3,
+                ),
                 "enable_crawl4ai_rescue_after_scrapling": base_cfg.get(
                     "crawler.enable_crawl4ai_rescue_after_scrapling",
                     True,

@@ -10,6 +10,16 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from loguru import logger
 
+_DIRECT_MODE_PROXY_KEYS = (
+    "PROXIES",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
 
 @dataclass(frozen=True)
 class ProxyEntry:
@@ -38,7 +48,13 @@ class ProxyManager:
 
     def refresh_env(self) -> List[str]:
         if not self.use_proxy:
-            os.environ.pop("PROXIES", None)
+            removed = []
+            for key in _DIRECT_MODE_PROXY_KEYS:
+                if key in os.environ:
+                    removed.append(key)
+                os.environ.pop(key, None)
+            if removed:
+                logger.debug(f"直连模式已清理代理环境变量: {', '.join(removed)}")
             return []
         if self._proxies:
             os.environ["PROXIES"] = ",".join(self._proxies)

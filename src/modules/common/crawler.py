@@ -186,6 +186,10 @@ class Crawler:
             1.0,
             max(0.0, float(self.config.get("crawler.scrapling_short_circuit_fail_ratio", 0.85))),
         )
+        self._scrapling_domain_connect_failure_streak_threshold = max(
+            0,
+            int(self.config.get("crawler.scrapling_domain_connect_failure_streak_threshold", 3)),
+        )
         self._enable_crawl4ai_rescue_after_scrapling = bool(
             self.config.get("crawler.enable_crawl4ai_rescue_after_scrapling", True)
         )
@@ -261,6 +265,7 @@ class Crawler:
             f"scrapling_chunk={self._scrapling_primary_chunk_size}, "
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
+            f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
 
@@ -364,14 +369,34 @@ class Crawler:
             return low
         return random.uniform(low, high)
 
+    @staticmethod
+    def _is_scrapling_connect_failure_reason(reason: str) -> bool:
+        text = str(reason or "").strip().lower()
+        if not text.startswith("scrapling_exception:"):
+            return False
+        return (
+            "connecttimeout" in text
+            or "connecterror" in text
+            or "all connection attempts failed" in text
+        )
+
     async def _crawl_with_scrapling_primary_stream(
         self,
         urls: List[str],
     ) -> AsyncIterator[tuple[Optional[Record], Optional[str]]]:
         semaphore = asyncio.Semaphore(self._scrapling_primary_concurrency)
         domain_semaphores: dict[str, asyncio.Semaphore] = {}
-        stats = {"ok": 0, "failed": 0, "low_quality": 0, "short_circuited": 0}
+        stats = {
+            "ok": 0,
+            "failed": 0,
+            "low_quality": 0,
+            "short_circuited": 0,
+            "domain_short_circuited": 0,
+        }
         failure_reasons: Counter[str] = Counter()
+        domain_connect_streak: dict[str, int] = {}
+        runtime_skip_domains: set[str] = set()
+        domain_skip_counts: Counter[str] = Counter()
 
         async def _one(url: str, domain: str) -> tuple[str, str, Optional[Record], Optional[str]]:
             domain_sem = domain_semaphores.get(domain)
@@ -400,6 +425,18 @@ class Crawler:
             active_pairs: list[tuple[str, str]] = []
             for url in chunk_urls:
                 domain = self._domain_key_for_url(url)
+                if (
+                    self._scrapling_domain_connect_failure_streak_threshold > 0
+                    and domain in runtime_skip_domains
+                ):
+                    stats["domain_short_circuited"] += 1
+                    domain_skip_counts[domain] += 1
+                    self._mark_failure(
+                        url,
+                        "scrapling_primary_domain_connect_short_circuit",
+                    )
+                    yield None, url
+                    continue
                 active_pairs.append((url, domain))
 
             if not active_pairs:
@@ -414,9 +451,26 @@ class Crawler:
                     clean_reason = reason or "scrapling_primary_failed"
                     failure_reasons[clean_reason] += 1
                     self._mark_failure(url, clean_reason)
+                    if self._is_scrapling_connect_failure_reason(clean_reason):
+                        streak = domain_connect_streak.get(domain, 0) + 1
+                        domain_connect_streak[domain] = streak
+                        if (
+                            self._scrapling_domain_connect_failure_streak_threshold > 0
+                            and streak >= self._scrapling_domain_connect_failure_streak_threshold
+                            and domain not in runtime_skip_domains
+                        ):
+                            runtime_skip_domains.add(domain)
+                            logger.warning(
+                                "scrapling 域名连接失败触发短路: "
+                                f"domain={domain} streak={streak} "
+                                f"threshold={self._scrapling_domain_connect_failure_streak_threshold}"
+                            )
+                    else:
+                        domain_connect_streak.pop(domain, None)
                     yield None, url
                     continue
 
+                domain_connect_streak.pop(domain, None)
                 content_len = self._record_content_chars(record)
                 if content_len < self._scrapling_quality_min_chars:
                     stats["low_quality"] += 1
@@ -459,11 +513,15 @@ class Crawler:
         logger.debug(
             f"scrapling 主抓取统计: ok={stats['ok']} "
             f"low_quality={stats['low_quality']} failed={stats['failed']} "
-            f"short_circuited={stats['short_circuited']}"
+            f"short_circuited={stats['short_circuited']} "
+            f"domain_short_circuited={stats['domain_short_circuited']}"
         )
         if failure_reasons:
             summary = "; ".join(f"{reason} x{count}" for reason, count in failure_reasons.most_common(5))
             logger.info(f"scrapling 主抓取失败原因TOP: {summary}")
+        if domain_skip_counts:
+            skip_summary = "; ".join(f"{domain} x{count}" for domain, count in domain_skip_counts.most_common(5))
+            logger.info(f"scrapling 域名短路统计TOP: {skip_summary}")
 
     async def _crawl_with_crawl4ai_stream(
         self,
