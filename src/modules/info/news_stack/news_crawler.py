@@ -139,10 +139,26 @@ class NewsCrawler:
                     f"remaining_limit={remaining if remaining is not None else 'all'}"
                 )
 
+                batch_success_counted = 0
+                batch_failed_counted = 0
+
+                def _on_url_finalized(_url: str, status: str) -> None:
+                    nonlocal total_success, total_failed, batch_success_counted, batch_failed_counted
+                    if status == "success":
+                        total_success += 1
+                        batch_success_counted += 1
+                    else:
+                        total_failed += 1
+                        batch_failed_counted += 1
+                    if progress_total > 0 and pbar.n < progress_total:
+                        pbar.update(1)
+                    _refresh_postfix()
+
                 crawler = Crawler(
                     config=self.config,
                     urls=urls,
                     output_path=output_path,
+                    on_url_finalized=_on_url_finalized,
                 )
 
                 try:
@@ -165,13 +181,17 @@ class NewsCrawler:
                 failed_reasons = crawler.last_failed_reasons
                 self.builder.bulk_update_status_by_url(list(succeeded_urls), status="success")
                 self.builder.bulk_update_status_by_url(list(failed_urls), status="failed", error="crawl_failed")
-                progress_room = max(0, progress_total - pbar.n)
-                if progress_room > 0:
-                    pbar.update(min(len(urls), progress_room))
                 batch_failed = len(failed_urls)
                 batch_success = len(succeeded_urls)
-                total_success += batch_success
-                total_failed += batch_failed
+                reconcile_success = max(0, batch_success - batch_success_counted)
+                reconcile_failed = max(0, batch_failed - batch_failed_counted)
+                if reconcile_success or reconcile_failed:
+                    total_success += reconcile_success
+                    total_failed += reconcile_failed
+                    progress_room = max(0, progress_total - pbar.n)
+                    reconcile_done = reconcile_success + reconcile_failed
+                    if progress_room > 0 and reconcile_done > 0:
+                        pbar.update(min(reconcile_done, progress_room))
                 if failed_urls:
                     self._apply_failure_reasons(failed_reasons)
                     logger.warning(

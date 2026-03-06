@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -94,6 +94,7 @@ class Crawler:
         output_path: Optional[Path] = None,
         proxy_file: Optional[Path] = None,
         use_proxy: Optional[bool] = None,
+        on_url_finalized: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         # Config 支持 dict，便于测试；字符串/Path 时走原来的 TOML 加载流程
         if isinstance(config, Config):
@@ -116,6 +117,8 @@ class Crawler:
         self._last_succeeded_urls: set[str] = set()
         self._last_failed_urls: set[str] = set()
         self._last_failed_reasons: dict[str, str] = {}
+        self._last_finalized_urls: set[str] = set()
+        self._on_url_finalized = on_url_finalized
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -269,6 +272,7 @@ class Crawler:
                 if record is not None:
                     succeeded_urls.add(record.url)
                     self._mark_success(record.url)
+                    self._mark_finalized(record.url, "success")
                     total_records += 1
                     yield record
                 if rescue_url:
@@ -279,6 +283,7 @@ class Crawler:
                 logger.debug(f"scrapling 主抓取完成，进入 crawl4ai rescue: {len(rescue_urls)} URLs")
                 async for record in self._crawl_with_crawl4ai_stream(rescue_urls, pre_succeeded_urls=succeeded_urls):
                     self._mark_success(record.url)
+                    self._mark_finalized(record.url, "success")
                     total_records += 1
                     yield record
             elif rescue_urls:
@@ -286,10 +291,13 @@ class Crawler:
         else:
             async for record in self._crawl_with_crawl4ai_stream(urls):
                 self._mark_success(record.url)
+                self._mark_finalized(record.url, "success")
                 total_records += 1
                 yield record
 
         self._last_failed_urls = set(self._last_input_urls) - set(self._last_succeeded_urls)
+        for failed_url in self._last_failed_urls:
+            self._mark_finalized(failed_url, "failed")
         self._last_failed_reasons = {
             url: self._last_failed_reasons.get(url, "unknown_failure")
             for url in self._last_failed_urls
@@ -301,6 +309,7 @@ class Crawler:
         self._last_succeeded_urls = set()
         self._last_failed_urls = set()
         self._last_failed_reasons = {}
+        self._last_finalized_urls = set()
 
     def _mark_success(self, url: str) -> None:
         clean = str(url or "").strip()
@@ -316,6 +325,19 @@ class Crawler:
         summary = self._sanitize_failure_reason(reason)
         if summary:
             self._last_failed_reasons[clean] = summary
+
+    def _mark_finalized(self, url: str, status: str) -> None:
+        clean = str(url or "").strip()
+        if not clean or clean in self._last_finalized_urls:
+            return
+        self._last_finalized_urls.add(clean)
+        callback = self._on_url_finalized
+        if callback is None:
+            return
+        try:
+            callback(clean, status)
+        except Exception as exc:
+            logger.debug(f"on_url_finalized 回调异常: {exc}")
 
     @staticmethod
     def _sanitize_failure_reason(reason: Optional[str], *, limit: int = 240) -> str:
@@ -351,8 +373,7 @@ class Crawler:
         stats = {"ok": 0, "failed": 0, "low_quality": 0, "short_circuited": 0}
         failure_reasons: Counter[str] = Counter()
 
-        async def _one(url: str) -> tuple[str, Optional[Record], Optional[str]]:
-            domain = self._domain_key_for_url(url)
+        async def _one(url: str, domain: str) -> tuple[str, str, Optional[Record], Optional[str]]:
             domain_sem = domain_semaphores.get(domain)
             if domain_sem is None:
                 domain_sem = asyncio.Semaphore(self._scrapling_primary_per_domain_concurrency)
@@ -371,14 +392,22 @@ class Crawler:
             except Exception as exc:
                 reason = f"scrapling_primary_exception:{type(exc).__name__}:{exc}"
                 logger.bind(trace=True).warning(f"scrapling 主抓取异常: url={url} reason={reason}")
-                return url, None, self._sanitize_failure_reason(reason)
-            return url, record, self._sanitize_failure_reason(reason)
+                return url, domain, None, self._sanitize_failure_reason(reason)
+            return url, domain, record, self._sanitize_failure_reason(reason)
 
         for chunk_start in range(0, len(urls), self._scrapling_primary_chunk_size):
             chunk_urls = urls[chunk_start:chunk_start + self._scrapling_primary_chunk_size]
-            tasks = [asyncio.create_task(_one(url)) for url in chunk_urls]
+            active_pairs: list[tuple[str, str]] = []
+            for url in chunk_urls:
+                domain = self._domain_key_for_url(url)
+                active_pairs.append((url, domain))
+
+            if not active_pairs:
+                continue
+
+            tasks = [asyncio.create_task(_one(url, domain)) for url, domain in active_pairs]
             for task in asyncio.as_completed(tasks):
-                url, record, reason = await task
+                url, domain, record, reason = await task
 
                 if record is None:
                     stats["failed"] += 1
