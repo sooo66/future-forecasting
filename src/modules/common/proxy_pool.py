@@ -45,12 +45,23 @@ class ProxyManager:
         *,
         proxy_sample_size: int = 0,
         proxy_min_quality_score: float = 0.0,
+        proxy_specs: Optional[List[str]] = None,
     ) -> None:
         self.proxy_file = proxy_file
         self.use_proxy = use_proxy
         self.proxy_sample_size = max(0, int(proxy_sample_size))
         self.proxy_min_quality_score = max(0.0, float(proxy_min_quality_score))
-        self._proxies = self._load_proxies(proxy_file) if use_proxy else []
+        self._proxy_source = "direct"
+        explicit_specs = self._normalize_proxy_specs(proxy_specs)
+        if not use_proxy:
+            self._proxies = []
+            self._proxy_source = "direct"
+        elif explicit_specs:
+            self._proxies = explicit_specs
+            self._proxy_source = "explicit"
+        else:
+            self._proxies = self._load_proxies(proxy_file)
+            self._proxy_source = "file" if self._proxies else "env"
 
     @property
     def proxies(self) -> List[str]:
@@ -70,7 +81,7 @@ class ProxyManager:
             active_proxies = self._sample_proxies(self._proxies)
             os.environ["PROXIES"] = ",".join(active_proxies)
             logger.info(
-                f"代理池加载完成: total={len(self._proxies)} active={len(active_proxies)} "
+                f"代理加载完成: source={self._proxy_source} total={len(self._proxies)} active={len(active_proxies)} "
                 f"sample_size={self.proxy_sample_size or 'all'} min_score={self.proxy_min_quality_score:.2f}"
             )
             return list(active_proxies)
@@ -89,6 +100,13 @@ class ProxyManager:
 
         os.environ.pop("PROXIES", None)
         return []
+
+    @staticmethod
+    def _normalize_proxy_specs(proxy_specs: Optional[List[str]]) -> List[str]:
+        if not proxy_specs:
+            return []
+        normalized = [str(item).strip() for item in proxy_specs if str(item).strip()]
+        return list(dict.fromkeys(normalized))
 
     def _sample_proxies(self, proxies: List[str]) -> List[str]:
         candidates = list(dict.fromkeys(str(item).strip() for item in proxies if str(item).strip()))

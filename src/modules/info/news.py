@@ -141,6 +141,18 @@ class NewsModule:
                 "fallback_concurrency": fallback_concurrency,
                 "fallback_timeout_sec": base_cfg.get("crawler.fallback_timeout_sec", base_cfg.browser_timeout),
                 "jina_reader_prefix": base_cfg.get("crawler.jina_reader_prefix", "https://r.jina.ai/"),
+                "use_paid_proxy": base_cfg.get("crawler.use_paid_proxy", False),
+                "paid_proxy_provider": base_cfg.get("crawler.paid_proxy_provider", ""),
+                "paid_proxy_spec": base_cfg.get("crawler.paid_proxy_spec", ""),
+                "paid_proxy_host": base_cfg.get("crawler.paid_proxy_host", ""),
+                "paid_proxy_port": base_cfg.get("crawler.paid_proxy_port", ""),
+                "paid_proxy_username": base_cfg.get("crawler.paid_proxy_username", ""),
+                "paid_proxy_password": base_cfg.get("crawler.paid_proxy_password", ""),
+                "paid_proxy_session_count": base_cfg.get("crawler.paid_proxy_session_count", 1),
+                "paid_proxy_enable_session_suffix": base_cfg.get(
+                    "crawler.paid_proxy_enable_session_suffix",
+                    False,
+                ),
                 "proxy_file": base_cfg.get("crawler.proxy_file", ""),
                 "proxy_sample_size": base_cfg.get("crawler.proxy_sample_size", 0),
                 "proxy_min_quality_score": base_cfg.get("crawler.proxy_min_quality_score", 0.0),
@@ -187,6 +199,7 @@ class NewsModule:
             f"scrapling_headers={config.get('crawler.scrapling_stealthy_headers')} "
             f"scrapling_http3={config.get('crawler.scrapling_http3_mode')} "
             f"scrapling_status_retry={config.get('crawler.scrapling_status_retry_attempts')} "
+            f"use_paid_proxy={config.get('crawler.use_paid_proxy')} "
             f"proxy_sample_size={config.get('crawler.proxy_sample_size')} "
             f"proxy_min_score={config.get('crawler.proxy_min_quality_score')} "
             f"network_debug={config.get('crawler.enable_network_debug_logs')} "

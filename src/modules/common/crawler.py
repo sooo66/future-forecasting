@@ -264,12 +264,21 @@ class Crawler:
             raw_proxy_file = str(self.config.get("crawler.proxy_file", "") or "").strip()
             if raw_proxy_file:
                 resolved_proxy_file = Path(raw_proxy_file)
+        paid_proxy_specs = self._resolve_paid_proxy_specs()
+        if paid_proxy_specs:
+            resolved_proxy_file = None
+            logger.info(
+                "启用付费代理: "
+                f"provider={self.config.get('crawler.paid_proxy_provider', 'custom')} "
+                f"total={len(paid_proxy_specs)} sample={self._mask_proxy_value(paid_proxy_specs[0])}"
+            )
 
         self.proxy_manager = ProxyManager(
             proxy_file=resolved_proxy_file,
             use_proxy=self.config.use_proxy if use_proxy is None else use_proxy,
             proxy_sample_size=int(self.config.get("crawler.proxy_sample_size", 0)),
             proxy_min_quality_score=float(self.config.get("crawler.proxy_min_quality_score", 0.0)),
+            proxy_specs=paid_proxy_specs,
         )
 
         self._scrapling_get_signature = self._resolve_scrapling_get_signature()
@@ -354,6 +363,8 @@ class Crawler:
             f"scrapling_status_retry={self._scrapling_status_retry_attempts}/"
             f"{sorted(self._scrapling_status_retry_codes)}, "
             f"scrapling_direct_retry={self._scrapling_connect_direct_retry}, "
+            f"paid_proxy={self.config.get('crawler.use_paid_proxy', False)}/"
+            f"{self.config.get('crawler.paid_proxy_provider', '')}, "
             f"network_debug={self._enable_network_debug_logs}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
@@ -563,6 +574,43 @@ class Crawler:
         if high <= low:
             return low
         return random.uniform(low, high)
+
+    def _resolve_paid_proxy_specs(self) -> List[str]:
+        def _first_non_empty(value: Any, env_key: str = "") -> str:
+            text = str(value or "").strip()
+            if text:
+                return text
+            if env_key:
+                return str(os.getenv(env_key, "") or "").strip()
+            return ""
+
+        if not bool(self.config.get("crawler.use_paid_proxy", False)):
+            return []
+        raw_spec = _first_non_empty(
+            self.config.get("crawler.paid_proxy_spec", ""),
+            "BRIGHT_PROXY_SPEC",
+        )
+        if raw_spec:
+            return [raw_spec]
+
+        host = _first_non_empty(self.config.get("crawler.paid_proxy_host", ""), "BRIGHT_PROXY_HOST")
+        port = _first_non_empty(self.config.get("crawler.paid_proxy_port", ""), "BRIGHT_PROXY_PORT")
+        username = _first_non_empty(self.config.get("crawler.paid_proxy_username", ""), "BRIGHT_PROXY_USERNAME")
+        password = _first_non_empty(self.config.get("crawler.paid_proxy_password", ""), "BRIGHT_PROXY_PASSWORD")
+        if not (host and port and username and password):
+            logger.warning("use_paid_proxy=true 但 paid_proxy 配置不完整，回退到现有代理来源")
+            return []
+
+        session_count = max(1, int(self.config.get("crawler.paid_proxy_session_count", 1)))
+        enable_session_suffix = bool(self.config.get("crawler.paid_proxy_enable_session_suffix", False))
+        if not enable_session_suffix or session_count <= 1 or "-session-" in username:
+            return [f"{host}:{port}:{username}:{password}"]
+
+        specs: List[str] = []
+        for _ in range(session_count):
+            session_id = uuid.uuid4().hex[:10]
+            specs.append(f"{host}:{port}:{username}-session-{session_id}:{password}")
+        return specs
 
     def _next_scrapling_proxy_url(self) -> Optional[str]:
         if not self.config.use_proxy:

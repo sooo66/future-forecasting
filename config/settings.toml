@@ -72,12 +72,22 @@ enable_jina_reader_fallback = true
 fallback_concurrency = 2
 fallback_timeout_sec = 20
 jina_reader_prefix = "https://r.jina.ai/"
-# 高质量代理池文件（建议由脚本筛选生成）；为空时可回退环境变量代理
-proxy_file = "config/proxy_pool/high_quality_proxies.json"
-# 每次运行从高质量池随机采样的代理数量（0 表示使用全部并随机打乱顺序）
-proxy_sample_size = 24
-# 仅使用 quality_score >= 该值的代理（0 表示不过滤评分）
-proxy_min_quality_score = 0.15
+# 付费代理（Bright.cn）配置；启用后优先于 proxy_file
+use_paid_proxy = true
+paid_proxy_provider = "bright"
+paid_proxy_host = "brd.superproxy.io"
+paid_proxy_port = 33335
+# 敏感信息不要入库：请使用环境变量 BRIGHT_PROXY_USERNAME / BRIGHT_PROXY_PASSWORD
+paid_proxy_username = ""
+paid_proxy_password = ""
+# 如需构建多会话代理池，可开启 session suffix
+paid_proxy_session_count = 1
+paid_proxy_enable_session_suffix = false
+
+# 免费代理池已关闭
+proxy_file = ""
+proxy_sample_size = 0
+proxy_min_quality_score = 0.0
 
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
 news_crawl_batch_size = 96
