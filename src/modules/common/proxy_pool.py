@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
@@ -37,9 +38,18 @@ class ProxyEntry:
 class ProxyManager:
     """读取代理池并输出 Crawl4AI 需要的环境变量格式"""
 
-    def __init__(self, proxy_file: Optional[Path], use_proxy: bool = True) -> None:
+    def __init__(
+        self,
+        proxy_file: Optional[Path],
+        use_proxy: bool = True,
+        *,
+        proxy_sample_size: int = 0,
+        proxy_min_quality_score: float = 0.0,
+    ) -> None:
         self.proxy_file = proxy_file
         self.use_proxy = use_proxy
+        self.proxy_sample_size = max(0, int(proxy_sample_size))
+        self.proxy_min_quality_score = max(0.0, float(proxy_min_quality_score))
         self._proxies = self._load_proxies(proxy_file) if use_proxy else []
 
     @property
@@ -57,9 +67,19 @@ class ProxyManager:
                 logger.debug(f"直连模式已清理代理环境变量: {', '.join(removed)}")
             return []
         if self._proxies:
-            os.environ["PROXIES"] = ",".join(self._proxies)
-            logger.debug(f"代理池加载完成: {len(self._proxies)} 个可用代理")
-            return list(self._proxies)
+            active_proxies = self._sample_proxies(self._proxies)
+            os.environ["PROXIES"] = ",".join(active_proxies)
+            logger.info(
+                f"代理池加载完成: total={len(self._proxies)} active={len(active_proxies)} "
+                f"sample_size={self.proxy_sample_size or 'all'} min_score={self.proxy_min_quality_score:.2f}"
+            )
+            return list(active_proxies)
+
+        # 显式指定了代理池文件但未加载到可用代理时，不回退环境代理，避免误用系统代理。
+        if self.proxy_file is not None:
+            os.environ.pop("PROXIES", None)
+            logger.warning("指定 proxy_file 但代理池为空，当前运行回退直连模式")
+            return []
 
         env_proxies = build_crawl4ai_proxy_list()
         if env_proxies:
@@ -70,6 +90,71 @@ class ProxyManager:
         os.environ.pop("PROXIES", None)
         return []
 
+    def _sample_proxies(self, proxies: List[str]) -> List[str]:
+        candidates = list(dict.fromkeys(str(item).strip() for item in proxies if str(item).strip()))
+        if not candidates:
+            return []
+        random.shuffle(candidates)
+        if self.proxy_sample_size <= 0 or self.proxy_sample_size >= len(candidates):
+            return candidates
+        return random.sample(candidates, self.proxy_sample_size)
+
+    def _extract_proxy_spec_and_score(self, item: Any) -> tuple[Optional[str], Optional[float]]:
+        if isinstance(item, str):
+            spec = item.strip()
+            return (spec or None), None
+
+        if not isinstance(item, dict):
+            return None, None
+
+        score: Optional[float] = None
+        for key in ("quality_score", "score", "success_rate", "health_score"):
+            raw_score = item.get(key)
+            if raw_score is None:
+                continue
+            try:
+                score = float(raw_score)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        proxy_spec = str(
+            item.get("proxy")
+            or item.get("proxy_spec")
+            or item.get("spec")
+            or item.get("proxy_url")
+            or ""
+        ).strip()
+        if proxy_spec:
+            return proxy_spec, score
+
+        host = str(item.get("ip") or item.get("host") or item.get("proxy_ip") or "").strip()
+        port = str(item.get("port") or item.get("proxy_port") or "").strip()
+        if not host or not port:
+            return None, score
+
+        username = str(item.get("user") or item.get("username") or "").strip()
+        password = str(item.get("pass") or item.get("password") or "").strip()
+        if username and password:
+            return f"{host}:{port}:{username}:{password}", score
+        return f"{host}:{port}", score
+
+    @staticmethod
+    def _expand_raw_proxy_items(raw: Any) -> List[Any]:
+        if isinstance(raw, list):
+            return list(raw)
+        if not isinstance(raw, dict):
+            return []
+        if isinstance(raw.get("proxies"), list):
+            return list(raw.get("proxies") or [])
+        raw_items: List[Any] = []
+        for value in raw.values():
+            if isinstance(value, list):
+                raw_items.extend(value)
+            elif isinstance(value, dict):
+                raw_items.append(value)
+        return raw_items
+
     def _load_proxies(self, proxy_file: Optional[Path]) -> List[str]:
         if not proxy_file:
             logger.debug("未指定代理池文件，使用直连模式")
@@ -79,36 +164,28 @@ class ProxyManager:
             return []
 
         raw = json.loads(proxy_file.read_text(encoding="utf-8"))
-        entries: List[ProxyEntry] = []
-
-        if isinstance(raw, list):
-            raw_items = raw
-        elif isinstance(raw, dict):
-            raw_items = []
-            for value in raw.values():
-                if isinstance(value, list):
-                    raw_items.extend(value)
-        else:
-            raw_items = []
-
+        raw_items = self._expand_raw_proxy_items(raw)
+        proxies: List[str] = []
+        skipped_low_score = 0
+        skipped_unscored = 0
         for item in raw_items:
-            if not isinstance(item, dict):
+            spec, score = self._extract_proxy_spec_and_score(item)
+            if not spec:
                 continue
-            host = str(item.get("ip") or item.get("host") or item.get("proxy_ip") or "")
-            port = str(item.get("port") or item.get("proxy_port") or "")
-            if not host or not port:
-                continue
-            entry = ProxyEntry(
-                host=host,
-                port=port,
-                username=item.get("user") or item.get("username"),
-                password=item.get("pass") or item.get("password"),
-            )
-            entries.append(entry)
-
-        proxies = [entry.to_env() for entry in entries]
+            if self.proxy_min_quality_score > 0:
+                if score is None:
+                    skipped_unscored += 1
+                    continue
+                if score < self.proxy_min_quality_score:
+                    skipped_low_score += 1
+                    continue
+            proxies.append(spec)
+        proxies = list(dict.fromkeys(proxies))
         if proxies:
-            logger.info(f"代理池读取完成: {len(proxies)} 个")
+            logger.info(
+                f"代理池读取完成: kept={len(proxies)} "
+                f"low_score_skipped={skipped_low_score} unscored_skipped={skipped_unscored}"
+            )
         else:
             logger.warning("代理池为空，使用直连模式")
         return proxies

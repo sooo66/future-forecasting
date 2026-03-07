@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - 旧版本 crawl4ai 没有 hub 时兜底
             """Placeholder BaseCrawler when crawl4ai.hub is unavailable."""
             raise RuntimeError("crawl4ai.hub.BaseCrawler is not available")
 
-from modules.common.proxy_pool import ProxyManager
+from modules.common.proxy_pool import ProxyManager, describe_proxy_mode
 from modules.common.extractor import Extractor
 from utils.config import Config
 from utils.models import Record
@@ -119,6 +119,10 @@ class Crawler:
         self._last_failed_reasons: dict[str, str] = {}
         self._last_finalized_urls: set[str] = set()
         self._on_url_finalized = on_url_finalized
+        self._enable_network_debug_logs = bool(self.config.get("crawler.enable_network_debug_logs", False))
+        self._proxy_mode_hint = "direct"
+        self._active_proxy_count = 0
+        self._active_proxy_hint = "direct"
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -204,9 +208,17 @@ class Crawler:
             )
             self._primary_engine = "crawl4ai"
 
+        resolved_proxy_file = proxy_file
+        if resolved_proxy_file is None:
+            raw_proxy_file = str(self.config.get("crawler.proxy_file", "") or "").strip()
+            if raw_proxy_file:
+                resolved_proxy_file = Path(raw_proxy_file)
+
         self.proxy_manager = ProxyManager(
-            proxy_file=proxy_file,
+            proxy_file=resolved_proxy_file,
             use_proxy=self.config.use_proxy if use_proxy is None else use_proxy,
+            proxy_sample_size=int(self.config.get("crawler.proxy_sample_size", 0)),
+            proxy_min_quality_score=float(self.config.get("crawler.proxy_min_quality_score", 0.0)),
         )
 
         # 从独立配置文件加载域名 -> main content CSS selectors 映射
@@ -254,7 +266,20 @@ class Crawler:
 
         self._reset_run_tracking(urls)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.proxy_manager.refresh_env()
+        active_proxies = self.proxy_manager.refresh_env()
+        self._active_proxy_count = len(active_proxies)
+        self._active_proxy_hint = (
+            self._mask_proxy_value(active_proxies[0]) if active_proxies else "direct"
+        )
+        self._proxy_mode_hint = describe_proxy_mode()
+        if self._enable_network_debug_logs:
+            logger.info(
+                "network-debug context: "
+                f"use_proxy={self.config.use_proxy} "
+                f"proxy_mode={self._proxy_mode_hint} "
+                f"active_proxy_count={self._active_proxy_count} "
+                f"active_proxy_hint={self._active_proxy_hint}"
+            )
         logger.debug(
             f"爬虫主引擎: {self._primary_engine} "
             f"(scrapling_qmin={self._scrapling_quality_min_chars}, "
@@ -266,6 +291,7 @@ class Crawler:
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
             f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
+            f"network_debug={self._enable_network_debug_logs}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
 
@@ -323,13 +349,14 @@ class Crawler:
         self._last_succeeded_urls.add(clean)
         self._last_failed_reasons.pop(clean, None)
 
-    def _mark_failure(self, url: str, reason: Optional[str]) -> None:
+    def _mark_failure(self, url: str, reason: Optional[str], *, engine: str = "unknown") -> None:
         clean = str(url or "").strip()
         if not clean:
             return
         summary = self._sanitize_failure_reason(reason)
         if summary:
             self._last_failed_reasons[clean] = summary
+            self._maybe_log_network_debug(url=clean, reason=summary, engine=engine)
 
     def _mark_finalized(self, url: str, status: str) -> None:
         clean = str(url or "").strip()
@@ -350,6 +377,56 @@ class Crawler:
         if not text:
             return ""
         return text[:limit]
+
+    @staticmethod
+    def _mask_proxy_value(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return "direct"
+        if "://" in raw and "@" in raw:
+            prefix, suffix = raw.rsplit("@", 1)
+            scheme = prefix.split("://", 1)[0] if "://" in prefix else "http"
+            return f"{scheme}://***:***@{suffix}"
+        parts = raw.split(":")
+        if len(parts) >= 4:
+            return f"{parts[0]}:{parts[1]}:***:***"
+        return raw
+
+    @staticmethod
+    def _classify_failure_stage(reason: str) -> str:
+        text = str(reason or "").strip().lower()
+        if any(
+            marker in text
+            for marker in (
+                "connecttimeout",
+                "connecterror",
+                "all connection attempts failed",
+                "connection refused",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "nxdomain",
+                "dns",
+            )
+        ):
+            return "connect"
+        if any(marker in text for marker in ("readtimeout", "read timeout", "timed out while reading")):
+            return "read"
+        if any(marker in text for marker in ("http_", "status=", "403", "429", "500", "502", "503", "504")):
+            return "http"
+        return "other"
+
+    def _maybe_log_network_debug(self, *, url: str, reason: str, engine: str) -> None:
+        if not self._enable_network_debug_logs:
+            return
+        stage = self._classify_failure_stage(reason)
+        logger.warning(
+            "network-debug failure: "
+            f"engine={engine} stage={stage} "
+            f"use_proxy={self.config.use_proxy} "
+            f"proxy_mode={self._proxy_mode_hint} "
+            f"proxy_hint={self._active_proxy_hint} "
+            f"url={url} reason={reason}"
+        )
 
     @staticmethod
     def _domain_key_for_url(url: str) -> str:
@@ -434,6 +511,7 @@ class Crawler:
                     self._mark_failure(
                         url,
                         "scrapling_primary_domain_connect_short_circuit",
+                        engine="scrapling_primary",
                     )
                     yield None, url
                     continue
@@ -450,7 +528,7 @@ class Crawler:
                     stats["failed"] += 1
                     clean_reason = reason or "scrapling_primary_failed"
                     failure_reasons[clean_reason] += 1
-                    self._mark_failure(url, clean_reason)
+                    self._mark_failure(url, clean_reason, engine="scrapling_primary")
                     if self._is_scrapling_connect_failure_reason(clean_reason):
                         streak = domain_connect_streak.get(domain, 0) + 1
                         domain_connect_streak[domain] = streak
@@ -479,6 +557,7 @@ class Crawler:
                     self._mark_failure(
                         url,
                         f"scrapling_primary_low_quality:content_chars={content_len},min={self._scrapling_quality_min_chars}",
+                        engine="scrapling_primary",
                     )
                     logger.bind(trace=True).info(
                         f"scrapling 质量不足，转 rescue: url={url} "
@@ -557,7 +636,11 @@ class Crawler:
                 if record is None:
                     if retry_url:
                         failed_urls.append(retry_url)
-                        self._mark_failure(retry_url, failure_reason or "crawl4ai_failed")
+                        self._mark_failure(
+                            retry_url,
+                            failure_reason or "crawl4ai_failed",
+                            engine="crawl4ai",
+                        )
                     continue
                 if record.url in succeeded_urls:
                     continue
@@ -966,7 +1049,11 @@ class Crawler:
 
                 stats[stage] = stats.get(stage, 0) + 1
                 if record is None:
-                    self._mark_failure(failed_url, failure_reason or "fallback_failed")
+                    self._mark_failure(
+                        failed_url,
+                        failure_reason or "fallback_failed",
+                        engine="fallback",
+                    )
                     continue
                 records.append(record)
                 self._append_output(record)

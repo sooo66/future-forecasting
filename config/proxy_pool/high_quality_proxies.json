@@ -1,0 +1,64 @@
+{
+  "generated_at": "2026-03-07T12:19:43.650684+00:00",
+  "input_candidates": 800,
+  "tested_candidates": 800,
+  "kept_candidates": 5,
+  "test_urls": [
+    "https://www.dailymail.co.uk/",
+    "https://www.csmonitor.com/",
+    "https://www.propublica.org/",
+    "https://www.cnn.com/",
+    "https://us.cnn.com/",
+    "https://edition.cnn.com/",
+    "https://www.bbc.com/"
+  ],
+  "min_success_rate": 0.14,
+  "max_mean_latency_sec": 12.0,
+  "proxies": [
+    {
+      "proxy": "120.92.212.16:7890",
+      "quality_score": 0.3942,
+      "success_rate": 0.4286,
+      "mean_latency_sec": 8.5055,
+      "successes": 3,
+      "attempts": 7,
+      "error_top": "ConnectError"
+    },
+    {
+      "proxy": "59.46.216.131:30001",
+      "quality_score": 0.3543,
+      "success_rate": 0.2857,
+      "mean_latency_sec": 5.2781,
+      "successes": 2,
+      "attempts": 7,
+      "error_top": "RemoteProtocolError"
+    },
+    {
+      "proxy": "59.36.239.108:21133",
+      "quality_score": 0.2069,
+      "success_rate": 0.1429,
+      "mean_latency_sec": 7.2108,
+      "successes": 1,
+      "attempts": 7,
+      "error_top": "RemoteProtocolError"
+    },
+    {
+      "proxy": "221.202.27.194:10810",
+      "quality_score": 0.1679,
+      "success_rate": 0.1429,
+      "mean_latency_sec": 9.0849,
+      "successes": 1,
+      "attempts": 7,
+      "error_top": "RemoteProtocolError"
+    },
+    {
+      "proxy": "124.77.45.157:8000",
+      "quality_score": 0.1542,
+      "success_rate": 0.1429,
+      "mean_latency_sec": 9.7436,
+      "successes": 1,
+      "attempts": 7,
+      "error_top": "ReadTimeout"
+    }
+  ]
+}

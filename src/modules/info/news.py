@@ -117,6 +117,10 @@ class NewsModule:
                 "fallback_concurrency": fallback_concurrency,
                 "fallback_timeout_sec": base_cfg.get("crawler.fallback_timeout_sec", base_cfg.browser_timeout),
                 "jina_reader_prefix": base_cfg.get("crawler.jina_reader_prefix", "https://r.jina.ai/"),
+                "proxy_file": base_cfg.get("crawler.proxy_file", ""),
+                "proxy_sample_size": base_cfg.get("crawler.proxy_sample_size", 0),
+                "proxy_min_quality_score": base_cfg.get("crawler.proxy_min_quality_score", 0.0),
+                "enable_network_debug_logs": base_cfg.get("crawler.enable_network_debug_logs", False),
                 "news_crawl_batch_size": news_crawl_batch_size,
                 "news_reset_in_progress_on_start": base_cfg.get(
                     "crawler.news_reset_in_progress_on_start",
@@ -155,6 +159,9 @@ class NewsModule:
             f"scrapling_primary_delay="
             f"{config.get('crawler.scrapling_primary_delay_min_sec')}-"
             f"{config.get('crawler.scrapling_primary_delay_max_sec')} "
+            f"proxy_sample_size={config.get('crawler.proxy_sample_size')} "
+            f"proxy_min_score={config.get('crawler.proxy_min_quality_score')} "
+            f"network_debug={config.get('crawler.enable_network_debug_logs')} "
             f"news_crawl_batch_size={config.get('crawler.news_crawl_batch_size')}"
         )
         logger.info(f"[{self.name}] proxy mode={describe_proxy_mode()}")

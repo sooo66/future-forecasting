@@ -12,7 +12,7 @@ request_delay_min = 0.8
 request_delay_max = 2.2
 
 # 是否使用代理（如果代理获取失败，会回退到直连）
-use_proxy = false
+use_proxy = true
 
 # 浏览器配置
 [browser]
@@ -54,6 +54,12 @@ enable_jina_reader_fallback = true
 fallback_concurrency = 2
 fallback_timeout_sec = 20
 jina_reader_prefix = "https://r.jina.ai/"
+# 高质量代理池文件（建议由脚本筛选生成）；为空时可回退环境变量代理
+proxy_file = "config/proxy_pool/high_quality_proxies.json"
+# 每次运行从高质量池随机采样的代理数量（0 表示使用全部并随机打乱顺序）
+proxy_sample_size = 24
+# 仅使用 quality_score >= 该值的代理（0 表示不过滤评分）
+proxy_min_quality_score = 0.15
 
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
 news_crawl_batch_size = 96
@@ -62,6 +68,8 @@ news_reset_in_progress_on_start = true
 news_batch_interleave_domains = true
 # 新闻 URL 抓取进度条颜色（tqdm colour + ANSI 兜底），可选如 yellow/green/cyan
 news_progress_bar_color = "yellow"
+# 输出网络失败定位日志（用于排查“curl 可用但代码超时/连接失败”）
+enable_network_debug_logs = true
 # 直接从原始 GKG CSV 流式构建 URL 池，避免生成 parquet 中间文件
 gkg_parse_chunk_size = 10000
 cleanup_raw_gkg_after_build = true
