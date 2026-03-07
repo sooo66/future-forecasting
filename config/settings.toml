@@ -37,6 +37,8 @@ scrapling_quality_min_chars = 200
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
 scrapling_primary_timeout_sec = 8.0
 scrapling_primary_retries = 1
+# Scrapling 走代理连接失败时，自动直连重试一次（仅 connect 类失败触发）
+scrapling_connect_direct_retry = true
 # Scrapling 主抓取分块；大窗口下按 chunk 评估是否值得继续跑 scrapling
 scrapling_primary_chunk_size = 24
 # 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue

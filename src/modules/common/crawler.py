@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - 旧版本 crawl4ai 没有 hub 时兜底
             """Placeholder BaseCrawler when crawl4ai.hub is unavailable."""
             raise RuntimeError("crawl4ai.hub.BaseCrawler is not available")
 
-from modules.common.proxy_pool import ProxyManager, describe_proxy_mode
+from modules.common.proxy_pool import ProxyManager, describe_proxy_mode, proxy_spec_to_url
 from modules.common.extractor import Extractor
 from utils.config import Config
 from utils.models import Record
@@ -123,6 +123,11 @@ class Crawler:
         self._proxy_mode_hint = "direct"
         self._active_proxy_count = 0
         self._active_proxy_hint = "direct"
+        self._active_proxy_specs: List[str] = []
+        self._scrapling_proxy_rr_cursor = 0
+        self._scrapling_connect_direct_retry = bool(
+            self.config.get("crawler.scrapling_connect_direct_retry", True)
+        )
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -267,6 +272,10 @@ class Crawler:
         self._reset_run_tracking(urls)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         active_proxies = self.proxy_manager.refresh_env()
+        self._active_proxy_specs = list(active_proxies)
+        self._scrapling_proxy_rr_cursor = (
+            random.randrange(len(self._active_proxy_specs)) if self._active_proxy_specs else 0
+        )
         self._active_proxy_count = len(active_proxies)
         self._active_proxy_hint = (
             self._mask_proxy_value(active_proxies[0]) if active_proxies else "direct"
@@ -291,6 +300,7 @@ class Crawler:
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
             f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
+            f"scrapling_direct_retry={self._scrapling_connect_direct_retry}, "
             f"network_debug={self._enable_network_debug_logs}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
@@ -349,14 +359,21 @@ class Crawler:
         self._last_succeeded_urls.add(clean)
         self._last_failed_reasons.pop(clean, None)
 
-    def _mark_failure(self, url: str, reason: Optional[str], *, engine: str = "unknown") -> None:
+    def _mark_failure(
+        self,
+        url: str,
+        reason: Optional[str],
+        *,
+        engine: str = "unknown",
+        proxy_hint: Optional[str] = None,
+    ) -> None:
         clean = str(url or "").strip()
         if not clean:
             return
         summary = self._sanitize_failure_reason(reason)
         if summary:
             self._last_failed_reasons[clean] = summary
-            self._maybe_log_network_debug(url=clean, reason=summary, engine=engine)
+            self._maybe_log_network_debug(url=clean, reason=summary, engine=engine, proxy_hint=proxy_hint)
 
     def _mark_finalized(self, url: str, status: str) -> None:
         clean = str(url or "").strip()
@@ -392,6 +409,21 @@ class Crawler:
             return f"{parts[0]}:{parts[1]}:***:***"
         return raw
 
+    def _next_scrapling_proxy_url(self) -> Optional[str]:
+        if not self.config.use_proxy:
+            return None
+        candidates = self._active_proxy_specs if self._active_proxy_specs else self.proxy_manager.proxies
+        if not candidates:
+            return None
+        total = len(candidates)
+        for _ in range(total):
+            idx = self._scrapling_proxy_rr_cursor % total
+            self._scrapling_proxy_rr_cursor += 1
+            proxy_url = proxy_spec_to_url(candidates[idx])
+            if proxy_url:
+                return proxy_url
+        return None
+
     @staticmethod
     def _classify_failure_stage(reason: str) -> str:
         text = str(reason or "").strip().lower()
@@ -415,16 +447,24 @@ class Crawler:
             return "http"
         return "other"
 
-    def _maybe_log_network_debug(self, *, url: str, reason: str, engine: str) -> None:
+    def _maybe_log_network_debug(
+        self,
+        *,
+        url: str,
+        reason: str,
+        engine: str,
+        proxy_hint: Optional[str] = None,
+    ) -> None:
         if not self._enable_network_debug_logs:
             return
         stage = self._classify_failure_stage(reason)
+        effective_proxy_hint = self._mask_proxy_value(proxy_hint) if proxy_hint else self._active_proxy_hint
         logger.warning(
             "network-debug failure: "
             f"engine={engine} stage={stage} "
             f"use_proxy={self.config.use_proxy} "
             f"proxy_mode={self._proxy_mode_hint} "
-            f"proxy_hint={self._active_proxy_hint} "
+            f"proxy_hint={effective_proxy_hint} "
             f"url={url} reason={reason}"
         )
 
@@ -475,7 +515,7 @@ class Crawler:
         runtime_skip_domains: set[str] = set()
         domain_skip_counts: Counter[str] = Counter()
 
-        async def _one(url: str, domain: str) -> tuple[str, str, Optional[Record], Optional[str]]:
+        async def _one(url: str, domain: str) -> tuple[str, str, Optional[Record], Optional[str], Optional[str]]:
             domain_sem = domain_semaphores.get(domain)
             if domain_sem is None:
                 domain_sem = asyncio.Semaphore(self._scrapling_primary_per_domain_concurrency)
@@ -486,7 +526,7 @@ class Crawler:
                         delay_sec = self._sample_scrapling_primary_delay()
                         if delay_sec > 0:
                             await asyncio.sleep(delay_sec)
-                        record, reason = await self._try_scrapling(
+                        record, reason, proxy_hint = await self._try_scrapling(
                             url,
                             timeout_sec=self._scrapling_primary_timeout_sec,
                             retries=self._scrapling_primary_retries,
@@ -494,8 +534,8 @@ class Crawler:
             except Exception as exc:
                 reason = f"scrapling_primary_exception:{type(exc).__name__}:{exc}"
                 logger.bind(trace=True).warning(f"scrapling 主抓取异常: url={url} reason={reason}")
-                return url, domain, None, self._sanitize_failure_reason(reason)
-            return url, domain, record, self._sanitize_failure_reason(reason)
+                return url, domain, None, self._sanitize_failure_reason(reason), None
+            return url, domain, record, self._sanitize_failure_reason(reason), proxy_hint
 
         for chunk_start in range(0, len(urls), self._scrapling_primary_chunk_size):
             chunk_urls = urls[chunk_start:chunk_start + self._scrapling_primary_chunk_size]
@@ -522,13 +562,18 @@ class Crawler:
 
             tasks = [asyncio.create_task(_one(url, domain)) for url, domain in active_pairs]
             for task in asyncio.as_completed(tasks):
-                url, domain, record, reason = await task
+                url, domain, record, reason, proxy_hint = await task
 
                 if record is None:
                     stats["failed"] += 1
                     clean_reason = reason or "scrapling_primary_failed"
                     failure_reasons[clean_reason] += 1
-                    self._mark_failure(url, clean_reason, engine="scrapling_primary")
+                    self._mark_failure(
+                        url,
+                        clean_reason,
+                        engine="scrapling_primary",
+                        proxy_hint=proxy_hint,
+                    )
                     if self._is_scrapling_connect_failure_reason(clean_reason):
                         streak = domain_connect_streak.get(domain, 0) + 1
                         domain_connect_streak[domain] = streak
@@ -1076,7 +1121,7 @@ class Crawler:
         async with semaphore:
             failure_parts: list[str] = []
             if self._enable_scrapling_fallback:
-                record, scrapling_reason = await self._try_scrapling(url)
+                record, scrapling_reason, _ = await self._try_scrapling(url)
                 if record is not None:
                     return url, record, "scrapling", None
                 if scrapling_reason:
@@ -1099,29 +1144,59 @@ class Crawler:
         *,
         timeout_sec: Optional[float] = None,
         retries: Optional[int] = None,
-    ) -> tuple[Optional[Record], Optional[str]]:
+    ) -> tuple[Optional[Record], Optional[str], Optional[str]]:
         if AsyncFetcher is None:
-            return None, "scrapling_unavailable"
+            return None, "scrapling_unavailable", None
         effective_timeout = float(timeout_sec if timeout_sec is not None else self._fallback_timeout_sec)
         effective_retries = int(retries if retries is not None else max(1, int(self.config.retry_attempts)))
+        proxy_url = self._next_scrapling_proxy_url()
+        proxy_hint = self._mask_proxy_value(proxy_url or "direct")
+
+        async def _fetch(*, selected_proxy: Optional[str], request_retries: int) -> Any:
+            kwargs: dict[str, Any] = {
+                "follow_redirects": True,
+                "timeout": effective_timeout,
+                "retries": max(1, request_retries),
+                "stealthy_headers": True,
+            }
+            if selected_proxy:
+                kwargs["proxy"] = selected_proxy
+            return await AsyncFetcher.get(url, **kwargs)
+
         try:
-            response = await AsyncFetcher.get(
-                url,
-                follow_redirects=True,
-                timeout=effective_timeout,
-                retries=max(1, effective_retries),
-                stealthy_headers=True,
-            )
+            response = await _fetch(selected_proxy=proxy_url, request_retries=effective_retries)
         except Exception as exc:
             reason = self._sanitize_failure_reason(f"scrapling_exception:{type(exc).__name__}:{exc}")
-            logger.bind(trace=True).warning(f"Scrapling 失败: url={url} reason={reason}")
-            return None, reason
+            logger.bind(trace=True).warning(
+                f"Scrapling 失败: url={url} proxy={proxy_hint} reason={reason}"
+            )
+            if (
+                proxy_url
+                and self._scrapling_connect_direct_retry
+                and self._classify_failure_stage(reason) == "connect"
+            ):
+                try:
+                    response = await _fetch(selected_proxy=None, request_retries=1)
+                    proxy_hint = "direct(retry_after_proxy_connect_failure)"
+                except Exception as direct_exc:
+                    direct_reason = self._sanitize_failure_reason(
+                        f"scrapling_direct_retry_exception:{type(direct_exc).__name__}:{direct_exc}"
+                    )
+                    merged_reason = self._sanitize_failure_reason(f"{reason}; {direct_reason}")
+                    logger.bind(trace=True).warning(
+                        f"Scrapling 直连重试失败: url={url} reason={merged_reason}"
+                    )
+                    return None, merged_reason, proxy_hint
+            else:
+                return None, reason, proxy_hint
 
         status = int(getattr(response, "status", 0) or 0)
         if status >= 400:
             reason = f"scrapling_http_{status}"
-            logger.bind(trace=True).warning(f"Scrapling HTTP 异常: url={url} status={status}")
-            return None, reason
+            logger.bind(trace=True).warning(
+                f"Scrapling HTTP 异常: url={url} proxy={proxy_hint} status={status}"
+            )
+            return None, reason, proxy_hint
 
         html = self._extract_scrapling_html(response)
         text = self._extract_scrapling_text(response)
@@ -1132,8 +1207,8 @@ class Crawler:
             allow_markdown_passthrough=True,
         )
         if record is None:
-            return None, "scrapling_empty_record"
-        return record, None
+            return None, "scrapling_empty_record", proxy_hint
+        return record, None, proxy_hint
 
     async def _try_jina_reader(
         self,

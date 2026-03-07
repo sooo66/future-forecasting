@@ -95,6 +95,7 @@ class NewsModule:
                 "scrapling_quality_min_chars": base_cfg.get("crawler.scrapling_quality_min_chars", 280),
                 "scrapling_primary_timeout_sec": base_cfg.get("crawler.scrapling_primary_timeout_sec", 12.0),
                 "scrapling_primary_retries": base_cfg.get("crawler.scrapling_primary_retries", 1),
+                "scrapling_connect_direct_retry": base_cfg.get("crawler.scrapling_connect_direct_retry", True),
                 "scrapling_primary_chunk_size": base_cfg.get("crawler.scrapling_primary_chunk_size", 64),
                 "scrapling_short_circuit_sample_size": base_cfg.get(
                     "crawler.scrapling_short_circuit_sample_size",
@@ -159,6 +160,7 @@ class NewsModule:
             f"scrapling_primary_delay="
             f"{config.get('crawler.scrapling_primary_delay_min_sec')}-"
             f"{config.get('crawler.scrapling_primary_delay_max_sec')} "
+            f"scrapling_direct_retry={config.get('crawler.scrapling_connect_direct_retry')} "
             f"proxy_sample_size={config.get('crawler.proxy_sample_size')} "
             f"proxy_min_score={config.get('crawler.proxy_min_quality_score')} "
             f"network_debug={config.get('crawler.enable_network_debug_logs')} "
