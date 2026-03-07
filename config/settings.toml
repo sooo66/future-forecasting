@@ -39,6 +39,8 @@ scrapling_primary_timeout_sec = 8.0
 scrapling_primary_retries = 1
 # Scrapling 走代理连接失败时，自动直连重试一次（仅 connect 类失败触发）
 scrapling_connect_direct_retry = true
+# 当代理是本地转发（127.0.0.1/localhost）时，跳过直连重试避免无效超时
+scrapling_connect_direct_retry_skip_local_proxy = true
 # Scrapling 反爬参数
 scrapling_stealthy_headers = true
 scrapling_follow_redirects = true
@@ -47,8 +49,11 @@ scrapling_verify_tls = true
 # Scrapling 内部重试抖动（秒）
 scrapling_retry_delay_sec = 0.8
 # 针对风控状态码额外重试次数（每次会换指纹/代理并退避）
-scrapling_status_retry_attempts = 2
+scrapling_status_retry_attempts = 1
 scrapling_status_retry_codes = [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524]
+# 单域名连续出现以下 HTTP 状态达到阈值后，剩余 URL 直接转 rescue（提速）
+scrapling_domain_http_failure_streak_threshold = 2
+scrapling_domain_http_failure_statuses = [403, 429]
 scrapling_status_retry_backoff_min_sec = 0.6
 scrapling_status_retry_backoff_max_sec = 1.8
 # 指纹池（每请求随机 impersonate）

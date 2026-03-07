@@ -46,9 +46,11 @@ class ProxyManager:
         proxy_sample_size: int = 0,
         proxy_min_quality_score: float = 0.0,
         proxy_specs: Optional[List[str]] = None,
+        disable_env_fallback: bool = False,
     ) -> None:
         self.proxy_file = proxy_file
         self.use_proxy = use_proxy
+        self.disable_env_fallback = bool(disable_env_fallback)
         self.proxy_sample_size = max(0, int(proxy_sample_size))
         self.proxy_min_quality_score = max(0.0, float(proxy_min_quality_score))
         self._proxy_source = "direct"
@@ -61,7 +63,10 @@ class ProxyManager:
             self._proxy_source = "explicit"
         else:
             self._proxies = self._load_proxies(proxy_file)
-            self._proxy_source = "file" if self._proxies else "env"
+            if self._proxies:
+                self._proxy_source = "file"
+            else:
+                self._proxy_source = "direct(no_env_fallback)" if self.disable_env_fallback else "env"
 
     @property
     def proxies(self) -> List[str]:
@@ -90,6 +95,17 @@ class ProxyManager:
         if self.proxy_file is not None:
             os.environ.pop("PROXIES", None)
             logger.warning("指定 proxy_file 但代理池为空，当前运行回退直连模式")
+            return []
+        if self.disable_env_fallback:
+            removed = []
+            for key in _DIRECT_MODE_PROXY_KEYS:
+                if key in os.environ:
+                    removed.append(key)
+                os.environ.pop(key, None)
+            logger.warning(
+                "代理未就绪且已禁用环境代理回退，当前运行回退直连模式"
+                + (f"（已清理: {', '.join(removed)}）" if removed else "")
+            )
             return []
 
         env_proxies = build_crawl4ai_proxy_list()

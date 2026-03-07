@@ -220,13 +220,23 @@ class Crawler:
         )
         self._scrapling_status_retry_attempts = max(
             0,
-            int(self.config.get("crawler.scrapling_status_retry_attempts", 2)),
+            int(self.config.get("crawler.scrapling_status_retry_attempts", 1)),
         )
         self._scrapling_status_retry_codes = self._normalize_status_retry_codes(
             self.config.get(
                 "crawler.scrapling_status_retry_codes",
                 [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524],
             )
+        )
+        self._scrapling_domain_http_failure_streak_threshold = max(
+            0,
+            int(self.config.get("crawler.scrapling_domain_http_failure_streak_threshold", 2)),
+        )
+        self._scrapling_domain_http_failure_statuses = self._normalize_status_retry_codes(
+            self.config.get("crawler.scrapling_domain_http_failure_statuses", [403, 429])
+        )
+        self._scrapling_connect_direct_retry_skip_local_proxy = bool(
+            self.config.get("crawler.scrapling_connect_direct_retry_skip_local_proxy", True)
         )
         self._scrapling_status_retry_backoff_min_sec = max(
             0.0,
@@ -264,6 +274,10 @@ class Crawler:
             raw_proxy_file = str(self.config.get("crawler.proxy_file", "") or "").strip()
             if raw_proxy_file:
                 resolved_proxy_file = Path(raw_proxy_file)
+        use_paid_proxy = bool(self.config.get("crawler.use_paid_proxy", False))
+        if use_paid_proxy:
+            # 显式启用付费代理时，强制禁用代理池文件路径，避免误用免费代理池
+            resolved_proxy_file = None
         paid_proxy_specs = self._resolve_paid_proxy_specs()
         if paid_proxy_specs:
             resolved_proxy_file = None
@@ -279,6 +293,7 @@ class Crawler:
             proxy_sample_size=int(self.config.get("crawler.proxy_sample_size", 0)),
             proxy_min_quality_score=float(self.config.get("crawler.proxy_min_quality_score", 0.0)),
             proxy_specs=paid_proxy_specs,
+            disable_env_fallback=use_paid_proxy,
         )
 
         self._scrapling_get_signature = self._resolve_scrapling_get_signature()
@@ -357,12 +372,15 @@ class Crawler:
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
             f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
+            f"scrapling_domain_http_streak={self._scrapling_domain_http_failure_streak_threshold}/"
+            f"{sorted(self._scrapling_domain_http_failure_statuses)}, "
             f"scrapling_headers={self._scrapling_stealthy_headers}, "
             f"scrapling_http3={self._scrapling_http3_mode}, "
             f"scrapling_impersonate_pool={len(self._scrapling_impersonate_pool)}, "
             f"scrapling_status_retry={self._scrapling_status_retry_attempts}/"
             f"{sorted(self._scrapling_status_retry_codes)}, "
-            f"scrapling_direct_retry={self._scrapling_connect_direct_retry}, "
+            f"scrapling_direct_retry={self._scrapling_connect_direct_retry}/"
+            f"skip_local={self._scrapling_connect_direct_retry_skip_local_proxy}, "
             f"paid_proxy={self.config.get('crawler.use_paid_proxy', False)}/"
             f"{self.config.get('crawler.paid_proxy_provider', '')}, "
             f"network_debug={self._enable_network_debug_logs}, "
@@ -598,7 +616,7 @@ class Crawler:
         username = _first_non_empty(self.config.get("crawler.paid_proxy_username", ""), "BRIGHT_PROXY_USERNAME")
         password = _first_non_empty(self.config.get("crawler.paid_proxy_password", ""), "BRIGHT_PROXY_PASSWORD")
         if not (host and port and username and password):
-            logger.warning("use_paid_proxy=true 但 paid_proxy 配置不完整，回退到现有代理来源")
+            logger.warning("use_paid_proxy=true 但 paid_proxy 配置不完整，已禁用环境代理回退，当前将走直连")
             return []
 
         session_count = max(1, int(self.config.get("crawler.paid_proxy_session_count", 1)))
@@ -700,6 +718,28 @@ class Crawler:
             or "all connection attempts failed" in text
         )
 
+    @staticmethod
+    def _extract_scrapling_http_status(reason: str) -> Optional[int]:
+        match = re.search(r"scrapling_http_(\d{3})", str(reason or "").lower())
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_local_proxy_url(proxy_url: Optional[str]) -> bool:
+        raw = str(proxy_url or "").strip()
+        if not raw:
+            return False
+        target = raw if "://" in raw else f"http://{raw}"
+        try:
+            host = (urlparse(target).hostname or "").strip().lower()
+        except Exception:
+            return False
+        return host in {"127.0.0.1", "localhost", "::1"}
+
     async def _crawl_with_scrapling_primary_stream(
         self,
         urls: List[str],
@@ -715,6 +755,7 @@ class Crawler:
         }
         failure_reasons: Counter[str] = Counter()
         domain_connect_streak: dict[str, int] = {}
+        domain_http_streak: dict[str, int] = {}
         runtime_skip_domains: set[str] = set()
         domain_skip_counts: Counter[str] = Counter()
 
@@ -745,15 +786,12 @@ class Crawler:
             active_pairs: list[tuple[str, str]] = []
             for url in chunk_urls:
                 domain = self._domain_key_for_url(url)
-                if (
-                    self._scrapling_domain_connect_failure_streak_threshold > 0
-                    and domain in runtime_skip_domains
-                ):
+                if domain in runtime_skip_domains:
                     stats["domain_short_circuited"] += 1
                     domain_skip_counts[domain] += 1
                     self._mark_failure(
                         url,
-                        "scrapling_primary_domain_connect_short_circuit",
+                        "scrapling_primary_domain_short_circuit",
                         engine="scrapling_primary",
                     )
                     yield None, url
@@ -777,6 +815,7 @@ class Crawler:
                         engine="scrapling_primary",
                         proxy_hint=proxy_hint,
                     )
+                    http_status = self._extract_scrapling_http_status(clean_reason)
                     if self._is_scrapling_connect_failure_reason(clean_reason):
                         streak = domain_connect_streak.get(domain, 0) + 1
                         domain_connect_streak[domain] = streak
@@ -793,10 +832,30 @@ class Crawler:
                             )
                     else:
                         domain_connect_streak.pop(domain, None)
+                    if (
+                        http_status is not None
+                        and http_status in self._scrapling_domain_http_failure_statuses
+                    ):
+                        http_streak = domain_http_streak.get(domain, 0) + 1
+                        domain_http_streak[domain] = http_streak
+                        if (
+                            self._scrapling_domain_http_failure_streak_threshold > 0
+                            and http_streak >= self._scrapling_domain_http_failure_streak_threshold
+                            and domain not in runtime_skip_domains
+                        ):
+                            runtime_skip_domains.add(domain)
+                            logger.warning(
+                                "scrapling 域名HTTP失败触发短路: "
+                                f"domain={domain} status={http_status} streak={http_streak} "
+                                f"threshold={self._scrapling_domain_http_failure_streak_threshold}"
+                            )
+                    else:
+                        domain_http_streak.pop(domain, None)
                     yield None, url
                     continue
 
                 domain_connect_streak.pop(domain, None)
+                domain_http_streak.pop(domain, None)
                 content_len = self._record_content_chars(record)
                 if content_len < self._scrapling_quality_min_chars:
                     stats["low_quality"] += 1
@@ -1411,10 +1470,22 @@ class Crawler:
                     f"Scrapling 失败: url={url} proxy={proxy_hint} impersonate={impersonate or 'none'} "
                     f"http3={use_http3} reason={reason}"
                 )
-                if (
+                should_try_direct = (
                     proxy_url
                     and self._scrapling_connect_direct_retry
                     and self._classify_failure_stage(reason) == "connect"
+                )
+                if (
+                    should_try_direct
+                    and self._scrapling_connect_direct_retry_skip_local_proxy
+                    and self._is_local_proxy_url(proxy_url)
+                ):
+                    should_try_direct = False
+                    logger.bind(trace=True).info(
+                        f"Scrapling 跳过直连重试: 检测到本地代理 {proxy_hint}"
+                    )
+                if (
+                    should_try_direct
                 ):
                     direct_impersonate = self._choose_scrapling_impersonate(exclude=impersonate)
                     direct_http3 = self._should_scrapling_use_http3(direct_impersonate)

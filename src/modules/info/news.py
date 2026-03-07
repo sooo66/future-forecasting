@@ -96,15 +96,27 @@ class NewsModule:
                 "scrapling_primary_timeout_sec": base_cfg.get("crawler.scrapling_primary_timeout_sec", 12.0),
                 "scrapling_primary_retries": base_cfg.get("crawler.scrapling_primary_retries", 1),
                 "scrapling_connect_direct_retry": base_cfg.get("crawler.scrapling_connect_direct_retry", True),
+                "scrapling_connect_direct_retry_skip_local_proxy": base_cfg.get(
+                    "crawler.scrapling_connect_direct_retry_skip_local_proxy",
+                    True,
+                ),
                 "scrapling_stealthy_headers": base_cfg.get("crawler.scrapling_stealthy_headers", True),
                 "scrapling_follow_redirects": base_cfg.get("crawler.scrapling_follow_redirects", True),
                 "scrapling_max_redirects": base_cfg.get("crawler.scrapling_max_redirects", 8),
                 "scrapling_verify_tls": base_cfg.get("crawler.scrapling_verify_tls", True),
                 "scrapling_retry_delay_sec": base_cfg.get("crawler.scrapling_retry_delay_sec", 0.8),
-                "scrapling_status_retry_attempts": base_cfg.get("crawler.scrapling_status_retry_attempts", 2),
+                "scrapling_status_retry_attempts": base_cfg.get("crawler.scrapling_status_retry_attempts", 1),
                 "scrapling_status_retry_codes": base_cfg.get(
                     "crawler.scrapling_status_retry_codes",
                     [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524],
+                ),
+                "scrapling_domain_http_failure_streak_threshold": base_cfg.get(
+                    "crawler.scrapling_domain_http_failure_streak_threshold",
+                    2,
+                ),
+                "scrapling_domain_http_failure_statuses": base_cfg.get(
+                    "crawler.scrapling_domain_http_failure_statuses",
+                    [403, 429],
                 ),
                 "scrapling_status_retry_backoff_min_sec": base_cfg.get(
                     "crawler.scrapling_status_retry_backoff_min_sec",
@@ -196,9 +208,11 @@ class NewsModule:
             f"{config.get('crawler.scrapling_primary_delay_min_sec')}-"
             f"{config.get('crawler.scrapling_primary_delay_max_sec')} "
             f"scrapling_direct_retry={config.get('crawler.scrapling_connect_direct_retry')} "
+            f"skip_local_proxy={config.get('crawler.scrapling_connect_direct_retry_skip_local_proxy')} "
             f"scrapling_headers={config.get('crawler.scrapling_stealthy_headers')} "
             f"scrapling_http3={config.get('crawler.scrapling_http3_mode')} "
             f"scrapling_status_retry={config.get('crawler.scrapling_status_retry_attempts')} "
+            f"scrapling_domain_http_streak={config.get('crawler.scrapling_domain_http_failure_streak_threshold')} "
             f"use_paid_proxy={config.get('crawler.use_paid_proxy')} "
             f"proxy_sample_size={config.get('crawler.proxy_sample_size')} "
             f"proxy_min_score={config.get('crawler.proxy_min_quality_score')} "
