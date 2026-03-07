@@ -39,6 +39,22 @@ scrapling_primary_timeout_sec = 8.0
 scrapling_primary_retries = 1
 # Scrapling 走代理连接失败时，自动直连重试一次（仅 connect 类失败触发）
 scrapling_connect_direct_retry = true
+# Scrapling 反爬参数
+scrapling_stealthy_headers = true
+scrapling_follow_redirects = true
+scrapling_max_redirects = 8
+scrapling_verify_tls = true
+# Scrapling 内部重试抖动（秒）
+scrapling_retry_delay_sec = 0.8
+# 针对风控状态码额外重试次数（每次会换指纹/代理并退避）
+scrapling_status_retry_attempts = 2
+scrapling_status_retry_codes = [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524]
+scrapling_status_retry_backoff_min_sec = 0.6
+scrapling_status_retry_backoff_max_sec = 1.8
+# 指纹池（每请求随机 impersonate）
+scrapling_impersonate_pool = ["chrome", "edge", "safari", "firefox"]
+# http3 模式: off / auto / on（auto 下当 impersonate 生效时默认关闭 http3）
+scrapling_http3_mode = "auto"
 # Scrapling 主抓取分块；大窗口下按 chunk 评估是否值得继续跑 scrapling
 scrapling_primary_chunk_size = 24
 # 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue

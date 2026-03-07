@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+import inspect
 import json
 import os
 import random
@@ -128,6 +129,7 @@ class Crawler:
         self._scrapling_connect_direct_retry = bool(
             self.config.get("crawler.scrapling_connect_direct_retry", True)
         )
+        self._scrapling_unsupported_fetch_kwargs: set[str] = set()
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
         self._enable_jina_reader_fallback = bool(self.config.get("crawler.enable_jina_reader_fallback", True))
@@ -199,6 +201,50 @@ class Crawler:
             0,
             int(self.config.get("crawler.scrapling_domain_connect_failure_streak_threshold", 3)),
         )
+        self._scrapling_stealthy_headers = bool(
+            self.config.get("crawler.scrapling_stealthy_headers", True)
+        )
+        self._scrapling_follow_redirects = bool(
+            self.config.get("crawler.scrapling_follow_redirects", True)
+        )
+        self._scrapling_max_redirects = max(
+            1,
+            int(self.config.get("crawler.scrapling_max_redirects", 8)),
+        )
+        self._scrapling_verify_tls = bool(
+            self.config.get("crawler.scrapling_verify_tls", True)
+        )
+        self._scrapling_retry_delay_sec = max(
+            0.0,
+            float(self.config.get("crawler.scrapling_retry_delay_sec", 0.8)),
+        )
+        self._scrapling_status_retry_attempts = max(
+            0,
+            int(self.config.get("crawler.scrapling_status_retry_attempts", 2)),
+        )
+        self._scrapling_status_retry_codes = self._normalize_status_retry_codes(
+            self.config.get(
+                "crawler.scrapling_status_retry_codes",
+                [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524],
+            )
+        )
+        self._scrapling_status_retry_backoff_min_sec = max(
+            0.0,
+            float(self.config.get("crawler.scrapling_status_retry_backoff_min_sec", 0.6)),
+        )
+        self._scrapling_status_retry_backoff_max_sec = max(
+            self._scrapling_status_retry_backoff_min_sec,
+            float(self.config.get("crawler.scrapling_status_retry_backoff_max_sec", 1.8)),
+        )
+        self._scrapling_impersonate_pool = self._normalize_impersonate_pool(
+            self.config.get(
+                "crawler.scrapling_impersonate_pool",
+                ["chrome", "edge", "safari", "firefox"],
+            )
+        )
+        self._scrapling_http3_mode = self._normalize_http3_mode(
+            self.config.get("crawler.scrapling_http3_mode", "auto")
+        )
         self._enable_crawl4ai_rescue_after_scrapling = bool(
             self.config.get("crawler.enable_crawl4ai_rescue_after_scrapling", True)
         )
@@ -225,6 +271,8 @@ class Crawler:
             proxy_sample_size=int(self.config.get("crawler.proxy_sample_size", 0)),
             proxy_min_quality_score=float(self.config.get("crawler.proxy_min_quality_score", 0.0)),
         )
+
+        self._scrapling_get_signature = self._resolve_scrapling_get_signature()
 
         # 从独立配置文件加载域名 -> main content CSS selectors 映射
         # 配置文件路径: config/main_content_selectors.json
@@ -300,6 +348,11 @@ class Crawler:
             f"scrapling_short_circuit={self._scrapling_short_circuit_sample_size}/"
             f"{self._scrapling_short_circuit_fail_ratio:.2f}, "
             f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
+            f"scrapling_headers={self._scrapling_stealthy_headers}, "
+            f"scrapling_http3={self._scrapling_http3_mode}, "
+            f"scrapling_impersonate_pool={len(self._scrapling_impersonate_pool)}, "
+            f"scrapling_status_retry={self._scrapling_status_retry_attempts}/"
+            f"{sorted(self._scrapling_status_retry_codes)}, "
             f"scrapling_direct_retry={self._scrapling_connect_direct_retry}, "
             f"network_debug={self._enable_network_debug_logs}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
@@ -408,6 +461,108 @@ class Crawler:
         if len(parts) >= 4:
             return f"{parts[0]}:{parts[1]}:***:***"
         return raw
+
+    @staticmethod
+    def _normalize_status_retry_codes(raw: Any) -> set[int]:
+        if raw is None:
+            return set()
+        values: List[Any]
+        if isinstance(raw, str):
+            values = [part.strip() for part in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = [raw]
+        codes: set[int] = set()
+        for item in values:
+            try:
+                code = int(str(item).strip())
+            except Exception:
+                continue
+            if 100 <= code <= 599:
+                codes.add(code)
+        return codes
+
+    @staticmethod
+    def _normalize_impersonate_pool(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        values: List[Any]
+        if isinstance(raw, str):
+            values = [part.strip() for part in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = [raw]
+        normalized: List[str] = []
+        for item in values:
+            text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _normalize_http3_mode(raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"true", "1", "yes", "on"}:
+            return "on"
+        if value in {"false", "0", "no", "off"}:
+            return "off"
+        if value not in {"auto", "on", "off"}:
+            return "auto"
+        return value
+
+    @staticmethod
+    def _resolve_scrapling_get_signature() -> Optional[set[str]]:
+        if AsyncFetcher is None:
+            return None
+        try:
+            signature = inspect.signature(AsyncFetcher.get)
+        except Exception:
+            return None
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if accepts_kwargs:
+            return None
+        return set(signature.parameters.keys())
+
+    def _filter_scrapling_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if not kwargs:
+            return kwargs
+        signature = self._scrapling_get_signature
+        if signature is None:
+            return kwargs
+        return {key: value for key, value in kwargs.items() if key in signature}
+
+    def _choose_scrapling_impersonate(self, *, exclude: Optional[str] = None) -> Optional[str]:
+        pool = self._scrapling_impersonate_pool
+        if not pool:
+            return None
+        if exclude and len(pool) > 1:
+            candidates = [item for item in pool if item != exclude]
+            if candidates:
+                return random.choice(candidates)
+        return random.choice(pool)
+
+    def _should_scrapling_use_http3(self, impersonate: Optional[str]) -> bool:
+        mode = self._scrapling_http3_mode
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        # auto: 官方提示 impersonate 与 http3 可能冲突；同时存在时优先禁用 http3
+        return impersonate is None
+
+    def _sample_scrapling_status_retry_backoff(self) -> float:
+        low = self._scrapling_status_retry_backoff_min_sec
+        high = self._scrapling_status_retry_backoff_max_sec
+        if high <= 0:
+            return 0.0
+        if high <= low:
+            return low
+        return random.uniform(low, high)
 
     def _next_scrapling_proxy_url(self) -> Optional[str]:
         if not self.config.use_proxy:
@@ -1151,50 +1306,114 @@ class Crawler:
         effective_retries = int(retries if retries is not None else max(1, int(self.config.retry_attempts)))
         proxy_url = self._next_scrapling_proxy_url()
         proxy_hint = self._mask_proxy_value(proxy_url or "direct")
+        http_status_retries_left = self._scrapling_status_retry_attempts
 
-        async def _fetch(*, selected_proxy: Optional[str], request_retries: int) -> Any:
+        async def _fetch(
+            *,
+            selected_proxy: Optional[str],
+            request_retries: int,
+            impersonate: Optional[str],
+            use_http3: bool,
+        ) -> Any:
             kwargs: dict[str, Any] = {
-                "follow_redirects": True,
+                "follow_redirects": self._scrapling_follow_redirects,
                 "timeout": effective_timeout,
                 "retries": max(1, request_retries),
-                "stealthy_headers": True,
+                "stealthy_headers": self._scrapling_stealthy_headers,
+                "verify": self._scrapling_verify_tls,
+                "max_redirects": self._scrapling_max_redirects,
+                "http3": use_http3,
             }
+            if self._scrapling_retry_delay_sec > 0:
+                kwargs["retry_delay"] = self._scrapling_retry_delay_sec
+            if impersonate:
+                kwargs["impersonate"] = impersonate
             if selected_proxy:
                 kwargs["proxy"] = selected_proxy
-            return await AsyncFetcher.get(url, **kwargs)
-
-        try:
-            response = await _fetch(selected_proxy=proxy_url, request_retries=effective_retries)
-        except Exception as exc:
-            reason = self._sanitize_failure_reason(f"scrapling_exception:{type(exc).__name__}:{exc}")
-            logger.bind(trace=True).warning(
-                f"Scrapling 失败: url={url} proxy={proxy_hint} reason={reason}"
-            )
-            if (
-                proxy_url
-                and self._scrapling_connect_direct_retry
-                and self._classify_failure_stage(reason) == "connect"
-            ):
+            kwargs = self._filter_scrapling_kwargs(kwargs)
+            while True:
                 try:
-                    response = await _fetch(selected_proxy=None, request_retries=1)
-                    proxy_hint = "direct(retry_after_proxy_connect_failure)"
-                except Exception as direct_exc:
-                    direct_reason = self._sanitize_failure_reason(
-                        f"scrapling_direct_retry_exception:{type(direct_exc).__name__}:{direct_exc}"
-                    )
-                    merged_reason = self._sanitize_failure_reason(f"{reason}; {direct_reason}")
-                    logger.bind(trace=True).warning(
-                        f"Scrapling 直连重试失败: url={url} reason={merged_reason}"
-                    )
-                    return None, merged_reason, proxy_hint
-            else:
-                return None, reason, proxy_hint
+                    return await AsyncFetcher.get(url, **kwargs)
+                except TypeError as type_exc:
+                    message = str(type_exc or "")
+                    match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", message)
+                    if not match:
+                        raise
+                    bad_key = match.group(1).strip()
+                    if not bad_key or bad_key not in kwargs:
+                        raise
+                    if bad_key not in self._scrapling_unsupported_fetch_kwargs:
+                        self._scrapling_unsupported_fetch_kwargs.add(bad_key)
+                        logger.warning(f"当前 scrapling 版本不支持参数 `{bad_key}`，自动降级继续")
+                    kwargs.pop(bad_key, None)
 
-        status = int(getattr(response, "status", 0) or 0)
-        if status >= 400:
+        while True:
+            impersonate = self._choose_scrapling_impersonate()
+            use_http3 = self._should_scrapling_use_http3(impersonate)
+            try:
+                response = await _fetch(
+                    selected_proxy=proxy_url,
+                    request_retries=effective_retries,
+                    impersonate=impersonate,
+                    use_http3=use_http3,
+                )
+            except Exception as exc:
+                reason = self._sanitize_failure_reason(f"scrapling_exception:{type(exc).__name__}:{exc}")
+                logger.bind(trace=True).warning(
+                    f"Scrapling 失败: url={url} proxy={proxy_hint} impersonate={impersonate or 'none'} "
+                    f"http3={use_http3} reason={reason}"
+                )
+                if (
+                    proxy_url
+                    and self._scrapling_connect_direct_retry
+                    and self._classify_failure_stage(reason) == "connect"
+                ):
+                    direct_impersonate = self._choose_scrapling_impersonate(exclude=impersonate)
+                    direct_http3 = self._should_scrapling_use_http3(direct_impersonate)
+                    try:
+                        response = await _fetch(
+                            selected_proxy=None,
+                            request_retries=1,
+                            impersonate=direct_impersonate,
+                            use_http3=direct_http3,
+                        )
+                        proxy_url = None
+                        proxy_hint = "direct(retry_after_proxy_connect_failure)"
+                        impersonate = direct_impersonate
+                        use_http3 = direct_http3
+                    except Exception as direct_exc:
+                        direct_reason = self._sanitize_failure_reason(
+                            f"scrapling_direct_retry_exception:{type(direct_exc).__name__}:{direct_exc}"
+                        )
+                        merged_reason = self._sanitize_failure_reason(f"{reason}; {direct_reason}")
+                        logger.bind(trace=True).warning(
+                            f"Scrapling 直连重试失败: url={url} reason={merged_reason}"
+                        )
+                        return None, merged_reason, proxy_hint
+                else:
+                    return None, reason, proxy_hint
+
+            status = int(getattr(response, "status", 0) or 0)
+            if status < 400:
+                break
             reason = f"scrapling_http_{status}"
+            is_retryable_http = status in self._scrapling_status_retry_codes and http_status_retries_left > 0
+            if is_retryable_http:
+                logger.bind(trace=True).info(
+                    f"Scrapling HTTP 可重试: url={url} status={status} "
+                    f"proxy={proxy_hint} impersonate={impersonate or 'none'} "
+                    f"remaining={http_status_retries_left}"
+                )
+                http_status_retries_left -= 1
+                backoff_sec = self._sample_scrapling_status_retry_backoff()
+                if backoff_sec > 0:
+                    await asyncio.sleep(backoff_sec)
+                proxy_url = self._next_scrapling_proxy_url()
+                proxy_hint = self._mask_proxy_value(proxy_url or "direct")
+                continue
             logger.bind(trace=True).warning(
-                f"Scrapling HTTP 异常: url={url} proxy={proxy_hint} status={status}"
+                f"Scrapling HTTP 异常: url={url} proxy={proxy_hint} "
+                f"impersonate={impersonate or 'none'} status={status}"
             )
             return None, reason, proxy_hint
 
