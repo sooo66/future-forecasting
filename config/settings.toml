@@ -4,8 +4,8 @@ start_date = "2025-12-10"
 end_date = "2025-12-31"
 
 # 并发控制
-concurrent_downloads = 8
-concurrent_crawls = 3
+concurrent_downloads = 12
+concurrent_crawls = 8
 
 # 请求延迟（秒）- 随机延迟范围
 request_delay_min = 0.8
@@ -16,7 +16,7 @@ use_proxy = true
 
 # 浏览器配置
 [browser]
-timeout = 30
+timeout = 12
 
 [crawler]
 # 主抓取引擎:
@@ -26,56 +26,60 @@ timeout = 30
 primary_engine = "hybrid"
 
 # Scrapling 主抓取并发（默认可与 concurrent_crawls 一致）
-scrapling_primary_concurrency = 2
+scrapling_primary_concurrency = 6
 # Scrapling 主抓取的单域名并发上限（降低被同站点限流概率）
-scrapling_primary_per_domain_concurrency = 1
+scrapling_primary_per_domain_concurrency = 2
 # Scrapling 主抓取请求间随机抖动（秒），用于降低无代理场景的封禁概率
-scrapling_primary_delay_min_sec = 0.50
-scrapling_primary_delay_max_sec = 1.50
+scrapling_primary_delay_min_sec = 0.10
+scrapling_primary_delay_max_sec = 0.60
 # Scrapling 结果最小正文长度，低于该阈值会转给 Crawl4AI rescue
 scrapling_quality_min_chars = 200
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
-scrapling_primary_timeout_sec = 8.0
+scrapling_primary_timeout_sec = 3.5
 scrapling_primary_retries = 1
 # Scrapling 走代理连接失败时，自动直连重试一次（仅 connect 类失败触发）
 scrapling_connect_direct_retry = true
 # 当代理是本地转发（127.0.0.1/localhost）时，跳过直连重试避免无效超时
 scrapling_connect_direct_retry_skip_local_proxy = true
+# 兼容旧版 scrapling：默认关闭扩展参数，避免启动期大量“不支持参数”降级开销
+scrapling_enable_extended_args = false
 # Scrapling 反爬参数
 scrapling_stealthy_headers = true
 scrapling_follow_redirects = true
-scrapling_max_redirects = 8
+scrapling_max_redirects = 0
 scrapling_verify_tls = true
 # Scrapling 内部重试抖动（秒）
-scrapling_retry_delay_sec = 0.8
+scrapling_retry_delay_sec = 0.0
 # 针对风控状态码额外重试次数（每次会换指纹/代理并退避）
-scrapling_status_retry_attempts = 1
+scrapling_status_retry_attempts = 0
 scrapling_status_retry_codes = [403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524]
 # 单域名连续出现以下 HTTP 状态达到阈值后，剩余 URL 直接转 rescue（提速）
 scrapling_domain_http_failure_streak_threshold = 2
 scrapling_domain_http_failure_statuses = [403, 429]
+# 单域名连续出现 read 类失败达到阈值后，剩余 URL 直接转 rescue
+scrapling_domain_read_failure_streak_threshold = 1
 scrapling_status_retry_backoff_min_sec = 0.6
 scrapling_status_retry_backoff_max_sec = 1.8
 # 指纹池（每请求随机 impersonate）
-scrapling_impersonate_pool = ["chrome", "edge", "safari", "firefox"]
+scrapling_impersonate_pool = []
 # http3 模式: off / auto / on（auto 下当 impersonate 生效时默认关闭 http3）
-scrapling_http3_mode = "auto"
+scrapling_http3_mode = "off"
 # Scrapling 主抓取分块；大窗口下按 chunk 评估是否值得继续跑 scrapling
 scrapling_primary_chunk_size = 24
 # 当 scrapling 在足够样本上失败/低质量比率过高时，剩余 URL 直接短路到 rescue
-scrapling_short_circuit_sample_size = 80
-scrapling_short_circuit_fail_ratio = 0.88
+scrapling_short_circuit_sample_size = 20
+scrapling_short_circuit_fail_ratio = 0.55
 # 单域名连续出现连接类失败（ConnectTimeout/ConnectError）达到阈值后，
 # 当前运行中该域名剩余 URL 直接跳过 scrapling，转到 rescue。
-scrapling_domain_connect_failure_streak_threshold = 3
+scrapling_domain_connect_failure_streak_threshold = 1
 # 当主引擎为 scrapling 时，是否将失败/低质量 URL 交给 Crawl4AI
 enable_crawl4ai_rescue_after_scrapling = true
 
 # Crawl4AI 失败后的多级 fallback
-enable_scrapling_fallback = true
-enable_jina_reader_fallback = true
-fallback_concurrency = 2
-fallback_timeout_sec = 20
+enable_scrapling_fallback = false
+enable_jina_reader_fallback = false
+fallback_concurrency = 6
+fallback_timeout_sec = 10
 jina_reader_prefix = "https://r.jina.ai/"
 # 付费代理（Bright.cn）配置；启用后优先于 proxy_file
 use_paid_proxy = true
@@ -95,7 +99,7 @@ proxy_sample_size = 0
 proxy_min_quality_score = 0.0
 
 # News URL 池按批次爬取，避免长时间窗一次性装载全部 URL
-news_crawl_batch_size = 96
+news_crawl_batch_size = 160
 news_reset_in_progress_on_start = true
 # 批次内按域名交错排序，降低同域突发请求
 news_batch_interleave_domains = true

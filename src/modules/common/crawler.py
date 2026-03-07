@@ -211,15 +211,18 @@ class Crawler:
             self.config.get("crawler.scrapling_follow_redirects", True)
         )
         self._scrapling_max_redirects = max(
-            1,
-            int(self.config.get("crawler.scrapling_max_redirects", 8)),
+            0,
+            int(self.config.get("crawler.scrapling_max_redirects", 0)),
         )
         self._scrapling_verify_tls = bool(
             self.config.get("crawler.scrapling_verify_tls", True)
         )
         self._scrapling_retry_delay_sec = max(
             0.0,
-            float(self.config.get("crawler.scrapling_retry_delay_sec", 0.8)),
+            float(self.config.get("crawler.scrapling_retry_delay_sec", 0.0)),
+        )
+        self._scrapling_enable_extended_args = bool(
+            self.config.get("crawler.scrapling_enable_extended_args", False)
         )
         self._scrapling_status_retry_attempts = max(
             0,
@@ -237,6 +240,10 @@ class Crawler:
         )
         self._scrapling_domain_http_failure_statuses = self._normalize_status_retry_codes(
             self.config.get("crawler.scrapling_domain_http_failure_statuses", [403, 429])
+        )
+        self._scrapling_domain_read_failure_streak_threshold = max(
+            0,
+            int(self.config.get("crawler.scrapling_domain_read_failure_streak_threshold", 2)),
         )
         self._scrapling_connect_direct_retry_skip_local_proxy = bool(
             self.config.get("crawler.scrapling_connect_direct_retry_skip_local_proxy", True)
@@ -377,7 +384,9 @@ class Crawler:
             f"scrapling_domain_connect_streak={self._scrapling_domain_connect_failure_streak_threshold}, "
             f"scrapling_domain_http_streak={self._scrapling_domain_http_failure_streak_threshold}/"
             f"{sorted(self._scrapling_domain_http_failure_statuses)}, "
+            f"scrapling_domain_read_streak={self._scrapling_domain_read_failure_streak_threshold}, "
             f"scrapling_headers={self._scrapling_stealthy_headers}, "
+            f"scrapling_extended_args={self._scrapling_enable_extended_args}, "
             f"scrapling_http3={self._scrapling_http3_mode}, "
             f"scrapling_impersonate_pool={len(self._scrapling_impersonate_pool)}, "
             f"scrapling_status_retry={self._scrapling_status_retry_attempts}/"
@@ -766,6 +775,7 @@ class Crawler:
         failure_reasons: Counter[str] = Counter()
         domain_connect_streak: dict[str, int] = {}
         domain_http_streak: dict[str, int] = {}
+        domain_read_streak: dict[str, int] = {}
         runtime_skip_domains: set[str] = set()
         domain_skip_counts: Counter[str] = Counter()
 
@@ -826,6 +836,7 @@ class Crawler:
                         proxy_hint=proxy_hint,
                     )
                     http_status = self._extract_scrapling_http_status(clean_reason)
+                    failure_stage = self._classify_failure_stage(clean_reason)
                     if self._is_scrapling_connect_failure_reason(clean_reason):
                         streak = domain_connect_streak.get(domain, 0) + 1
                         domain_connect_streak[domain] = streak
@@ -861,11 +872,28 @@ class Crawler:
                             )
                     else:
                         domain_http_streak.pop(domain, None)
+                    if failure_stage == "read":
+                        read_streak = domain_read_streak.get(domain, 0) + 1
+                        domain_read_streak[domain] = read_streak
+                        if (
+                            self._scrapling_domain_read_failure_streak_threshold > 0
+                            and read_streak >= self._scrapling_domain_read_failure_streak_threshold
+                            and domain not in runtime_skip_domains
+                        ):
+                            runtime_skip_domains.add(domain)
+                            logger.warning(
+                                "scrapling 域名读超时触发短路: "
+                                f"domain={domain} streak={read_streak} "
+                                f"threshold={self._scrapling_domain_read_failure_streak_threshold}"
+                            )
+                    else:
+                        domain_read_streak.pop(domain, None)
                     yield None, url
                     continue
 
                 domain_connect_streak.pop(domain, None)
                 domain_http_streak.pop(domain, None)
+                domain_read_streak.pop(domain, None)
                 content_len = self._record_content_chars(record)
                 if content_len < self._scrapling_quality_min_chars:
                     stats["low_quality"] += 1
@@ -965,15 +993,16 @@ class Crawler:
                 self._append_output(record)
                 yield record
 
-        fallback_records = await self._crawl_failed_urls_with_fallback(
-            failed_urls,
-            succeeded_urls=succeeded_urls,
-        )
-        for record in fallback_records:
-            if record.url in succeeded_urls:
-                continue
-            succeeded_urls.add(record.url)
-            yield record
+        if self._enable_scrapling_fallback or self._enable_jina_reader_fallback:
+            fallback_records = await self._crawl_failed_urls_with_fallback(
+                failed_urls,
+                succeeded_urls=succeeded_urls,
+            )
+            for record in fallback_records:
+                if record.url in succeeded_urls:
+                    continue
+                succeeded_urls.add(record.url)
+                yield record
 
     @staticmethod
     def _record_content_chars(record: Record) -> int:
@@ -1437,16 +1466,22 @@ class Crawler:
                 "timeout": effective_timeout,
                 "retries": max(1, request_retries),
                 "stealthy_headers": self._scrapling_stealthy_headers,
-                "verify": self._scrapling_verify_tls,
-                "max_redirects": self._scrapling_max_redirects,
-                "http3": use_http3,
             }
-            if self._scrapling_retry_delay_sec > 0:
-                kwargs["retry_delay"] = self._scrapling_retry_delay_sec
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+            if self._scrapling_enable_extended_args:
+                kwargs["verify"] = self._scrapling_verify_tls
+                if self._scrapling_max_redirects > 0:
+                    kwargs["max_redirects"] = self._scrapling_max_redirects
+                if use_http3:
+                    kwargs["http3"] = True
+                if self._scrapling_retry_delay_sec > 0:
+                    kwargs["retry_delay"] = self._scrapling_retry_delay_sec
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
             if selected_proxy:
                 kwargs["proxy"] = selected_proxy
+            if self._scrapling_unsupported_fetch_kwargs:
+                for bad_key in tuple(self._scrapling_unsupported_fetch_kwargs):
+                    kwargs.pop(bad_key, None)
             kwargs = self._filter_scrapling_kwargs(kwargs)
             while True:
                 try:
@@ -1465,8 +1500,11 @@ class Crawler:
                     kwargs.pop(bad_key, None)
 
         while True:
-            impersonate = self._choose_scrapling_impersonate()
-            use_http3 = self._should_scrapling_use_http3(impersonate)
+            impersonate: Optional[str] = None
+            use_http3 = False
+            if self._scrapling_enable_extended_args:
+                impersonate = self._choose_scrapling_impersonate()
+                use_http3 = self._should_scrapling_use_http3(impersonate)
             try:
                 response = await _fetch(
                     selected_proxy=proxy_url,
@@ -1497,8 +1535,11 @@ class Crawler:
                 if (
                     should_try_direct
                 ):
-                    direct_impersonate = self._choose_scrapling_impersonate(exclude=impersonate)
-                    direct_http3 = self._should_scrapling_use_http3(direct_impersonate)
+                    direct_impersonate: Optional[str] = None
+                    direct_http3 = False
+                    if self._scrapling_enable_extended_args:
+                        direct_impersonate = self._choose_scrapling_impersonate(exclude=impersonate)
+                        direct_http3 = self._should_scrapling_use_http3(direct_impersonate)
                     try:
                         response = await _fetch(
                             selected_proxy=None,

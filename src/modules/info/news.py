@@ -45,7 +45,7 @@ class NewsModule:
         url_pool_db = work / "url_pool" / "url_pool.db"
         date_span_days = max(1, (ctx.date_to.date() - ctx.date_from.date()).days + 1)
         long_range_mode = date_span_days > 31
-        concurrent_crawls = min(base_cfg.concurrent_crawls, 4) if long_range_mode else base_cfg.concurrent_crawls
+        concurrent_crawls = min(base_cfg.concurrent_crawls, 8) if long_range_mode else base_cfg.concurrent_crawls
         scrapling_primary_concurrency = int(
             base_cfg.get("crawler.scrapling_primary_concurrency", base_cfg.concurrent_crawls)
         )
@@ -63,10 +63,10 @@ class NewsModule:
         )
         news_crawl_batch_size = int(base_cfg.get("crawler.news_crawl_batch_size", 250))
         if long_range_mode:
-            scrapling_primary_concurrency = min(scrapling_primary_concurrency, 6)
+            scrapling_primary_concurrency = min(scrapling_primary_concurrency, 8)
             scrapling_primary_per_domain_concurrency = min(scrapling_primary_per_domain_concurrency, 2)
-            fallback_concurrency = min(fallback_concurrency, 4)
-            news_crawl_batch_size = min(news_crawl_batch_size, 180)
+            fallback_concurrency = min(fallback_concurrency, 6)
+            news_crawl_batch_size = min(news_crawl_batch_size, 240)
 
         whitelist = [
             {"name": name, "domain": domain}
@@ -100,11 +100,12 @@ class NewsModule:
                     "crawler.scrapling_connect_direct_retry_skip_local_proxy",
                     True,
                 ),
+                "scrapling_enable_extended_args": base_cfg.get("crawler.scrapling_enable_extended_args", False),
                 "scrapling_stealthy_headers": base_cfg.get("crawler.scrapling_stealthy_headers", True),
                 "scrapling_follow_redirects": base_cfg.get("crawler.scrapling_follow_redirects", True),
-                "scrapling_max_redirects": base_cfg.get("crawler.scrapling_max_redirects", 8),
+                "scrapling_max_redirects": base_cfg.get("crawler.scrapling_max_redirects", 0),
                 "scrapling_verify_tls": base_cfg.get("crawler.scrapling_verify_tls", True),
-                "scrapling_retry_delay_sec": base_cfg.get("crawler.scrapling_retry_delay_sec", 0.8),
+                "scrapling_retry_delay_sec": base_cfg.get("crawler.scrapling_retry_delay_sec", 0.0),
                 "scrapling_status_retry_attempts": base_cfg.get("crawler.scrapling_status_retry_attempts", 1),
                 "scrapling_status_retry_codes": base_cfg.get(
                     "crawler.scrapling_status_retry_codes",
@@ -117,6 +118,10 @@ class NewsModule:
                 "scrapling_domain_http_failure_statuses": base_cfg.get(
                     "crawler.scrapling_domain_http_failure_statuses",
                     [403, 429],
+                ),
+                "scrapling_domain_read_failure_streak_threshold": base_cfg.get(
+                    "crawler.scrapling_domain_read_failure_streak_threshold",
+                    2,
                 ),
                 "scrapling_status_retry_backoff_min_sec": base_cfg.get(
                     "crawler.scrapling_status_retry_backoff_min_sec",
@@ -209,10 +214,12 @@ class NewsModule:
             f"{config.get('crawler.scrapling_primary_delay_max_sec')} "
             f"scrapling_direct_retry={config.get('crawler.scrapling_connect_direct_retry')} "
             f"skip_local_proxy={config.get('crawler.scrapling_connect_direct_retry_skip_local_proxy')} "
+            f"scrapling_extended_args={config.get('crawler.scrapling_enable_extended_args')} "
             f"scrapling_headers={config.get('crawler.scrapling_stealthy_headers')} "
             f"scrapling_http3={config.get('crawler.scrapling_http3_mode')} "
             f"scrapling_status_retry={config.get('crawler.scrapling_status_retry_attempts')} "
             f"scrapling_domain_http_streak={config.get('crawler.scrapling_domain_http_failure_streak_threshold')} "
+            f"scrapling_domain_read_streak={config.get('crawler.scrapling_domain_read_failure_streak_threshold')} "
             f"use_paid_proxy={config.get('crawler.use_paid_proxy')} "
             f"proxy_sample_size={config.get('crawler.proxy_sample_size')} "
             f"proxy_min_score={config.get('crawler.proxy_min_quality_score')} "
