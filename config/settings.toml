@@ -5,18 +5,18 @@ end_date = "2025-12-31"
 
 # 并发控制
 concurrent_downloads = 12
-concurrent_crawls = 8
+concurrent_crawls = 7
 
 # 请求延迟（秒）- 随机延迟范围
-request_delay_min = 0.8
-request_delay_max = 2.2
+request_delay_min = 0.4
+request_delay_max = 1.0
 
 # 是否使用代理（如果代理获取失败，会回退到直连）
 use_proxy = true
 
 # 浏览器配置
 [browser]
-timeout = 12
+timeout = 14
 
 [crawler]
 # 主抓取引擎:
@@ -26,16 +26,16 @@ timeout = 12
 primary_engine = "hybrid"
 
 # Scrapling 主抓取并发（默认可与 concurrent_crawls 一致）
-scrapling_primary_concurrency = 6
+scrapling_primary_concurrency = 7
 # Scrapling 主抓取的单域名并发上限（降低被同站点限流概率）
-scrapling_primary_per_domain_concurrency = 2
+scrapling_primary_per_domain_concurrency = 1
 # Scrapling 主抓取请求间随机抖动（秒），用于降低无代理场景的封禁概率
 scrapling_primary_delay_min_sec = 0.10
 scrapling_primary_delay_max_sec = 0.60
 # Scrapling 结果最小正文长度，低于该阈值会转给 Crawl4AI rescue
 scrapling_quality_min_chars = 200
 # Scrapling 主抓取超时与重试（建议短超时、少重试，快速转 rescue）
-scrapling_primary_timeout_sec = 3.5
+scrapling_primary_timeout_sec = 3.0
 scrapling_primary_retries = 1
 # Scrapling 走代理连接失败时，自动直连重试一次（仅 connect 类失败触发）
 scrapling_connect_direct_retry = true
@@ -78,8 +78,8 @@ enable_crawl4ai_rescue_after_scrapling = true
 # Crawl4AI 失败后的多级 fallback
 enable_scrapling_fallback = false
 enable_jina_reader_fallback = false
-fallback_concurrency = 6
-fallback_timeout_sec = 10
+fallback_concurrency = 4
+fallback_timeout_sec = 8
 jina_reader_prefix = "https://r.jina.ai/"
 # 付费代理（Bright.cn）配置；启用后优先于 proxy_file
 use_paid_proxy = true
