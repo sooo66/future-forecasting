@@ -129,6 +129,9 @@ class Crawler:
         self._scrapling_connect_direct_retry = bool(
             self.config.get("crawler.scrapling_connect_direct_retry", True)
         )
+        self._use_paid_proxy = bool(self.config.get("crawler.use_paid_proxy", False))
+        self._paid_proxy_provider = str(self.config.get("crawler.paid_proxy_provider", "") or "").strip()
+        self._paid_proxy_strict = bool(self.config.get("crawler.paid_proxy_strict", True))
         self._scrapling_unsupported_fetch_kwargs: set[str] = set()
 
         self._enable_scrapling_fallback = bool(self.config.get("crawler.enable_scrapling_fallback", True))
@@ -274,7 +277,7 @@ class Crawler:
             raw_proxy_file = str(self.config.get("crawler.proxy_file", "") or "").strip()
             if raw_proxy_file:
                 resolved_proxy_file = Path(raw_proxy_file)
-        use_paid_proxy = bool(self.config.get("crawler.use_paid_proxy", False))
+        use_paid_proxy = self._use_paid_proxy
         if use_paid_proxy:
             # 显式启用付费代理时，强制禁用代理池文件路径，避免误用免费代理池
             resolved_proxy_file = None
@@ -283,7 +286,7 @@ class Crawler:
             resolved_proxy_file = None
             logger.info(
                 "启用付费代理: "
-                f"provider={self.config.get('crawler.paid_proxy_provider', 'custom')} "
+                f"provider={self._paid_proxy_provider or 'custom'} "
                 f"total={len(paid_proxy_specs)} sample={self._mask_proxy_value(paid_proxy_specs[0])}"
             )
 
@@ -381,8 +384,8 @@ class Crawler:
             f"{sorted(self._scrapling_status_retry_codes)}, "
             f"scrapling_direct_retry={self._scrapling_connect_direct_retry}/"
             f"skip_local={self._scrapling_connect_direct_retry_skip_local_proxy}, "
-            f"paid_proxy={self.config.get('crawler.use_paid_proxy', False)}/"
-            f"{self.config.get('crawler.paid_proxy_provider', '')}, "
+            f"paid_proxy={self._use_paid_proxy}/"
+            f"{self._paid_proxy_provider}, "
             f"network_debug={self._enable_network_debug_logs}, "
             f"crawl4ai_rescue={self._enable_crawl4ai_rescue_after_scrapling})"
         )
@@ -602,7 +605,7 @@ class Crawler:
                 return str(os.getenv(env_key, "") or "").strip()
             return ""
 
-        if not bool(self.config.get("crawler.use_paid_proxy", False)):
+        if not self._use_paid_proxy:
             return []
         raw_spec = _first_non_empty(
             self.config.get("crawler.paid_proxy_spec", ""),
@@ -616,7 +619,14 @@ class Crawler:
         username = _first_non_empty(self.config.get("crawler.paid_proxy_username", ""), "BRIGHT_PROXY_USERNAME")
         password = _first_non_empty(self.config.get("crawler.paid_proxy_password", ""), "BRIGHT_PROXY_PASSWORD")
         if not (host and port and username and password):
-            logger.warning("use_paid_proxy=true 但 paid_proxy 配置不完整，已禁用环境代理回退，当前将走直连")
+            message = (
+                "use_paid_proxy=true 但付费代理配置不完整。"
+                "请设置 BRIGHT_PROXY_USERNAME/BRIGHT_PROXY_PASSWORD"
+                "（或 crawler.paid_proxy_spec），当前不会使用免费/环境代理回退。"
+            )
+            if self._paid_proxy_strict:
+                raise RuntimeError(message)
+            logger.warning(message + " paid_proxy_strict=false，当前将走直连。")
             return []
 
         session_count = max(1, int(self.config.get("crawler.paid_proxy_session_count", 1)))
