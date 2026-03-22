@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections import Counter
 from dataclasses import asdict, is_dataclass
@@ -19,6 +20,7 @@ from forecasting.memory import FlexExperience
 EPS = 1e-6
 DEFAULT_SEARCH_TOP_K = 3
 DEFAULT_SEARCH_CONTENT_CHARS = 512
+DEFAULT_AGENT_SEARCH_MAX_CALLS = 2
 
 
 def coerce_config(value: Any, config_cls: type[Any]) -> Any:
@@ -140,26 +142,34 @@ def run_agentic_forecast(
     code_interpreter_tool: Any | None = None,
 ) -> ForecastResult:
     started = time.perf_counter()
-    if code_interpreter_tool is not None and hasattr(
+    code_interpreter_enabled = _question_requires_code_interpreter(question)
+    if code_interpreter_enabled and code_interpreter_tool is not None and hasattr(
         code_interpreter_tool, "begin_question"
     ):
         code_interpreter_tool.begin_question(str(question["market_id"]))
-    tools: list[Any] = [
-        code_interpreter_tool
-        or {
-            "name": "code_interpreter",
-            "work_dir": str(
-                (
-                    project_root / ".qwen_agent_workspace" / "forecasting" / method_name
-                ).resolve()
+    tools: list[Any] = []
+    if code_interpreter_enabled:
+        tools.append(
+            code_interpreter_tool
+            or {
+                "name": "code_interpreter",
+                "work_dir": str(
+                    (
+                        project_root / ".qwen_agent_workspace" / "forecasting" / method_name
+                    ).resolve()
+                ),
+            }
+        )
+    tools.extend(
+        [
+            SearchTool(
+                search_client=search_engine,
+                limit=search_top_k,
+                max_calls=DEFAULT_AGENT_SEARCH_MAX_CALLS,
             ),
-        },
-        SearchTool(
-            search_client=search_engine,
-            limit=search_top_k,
-        ),
-        OpenBBTool(),
-    ]
+            OpenBBTool(),
+        ]
+    )
     if flex_memory_tool is not None:
         tools.append(flex_memory_tool)
     agent = Agent(
@@ -170,6 +180,7 @@ def run_agentic_forecast(
             method_name=method_name,
             injected_memories=injected_memories or [],
             flex_preloaded=flex_preloaded or [],
+            code_interpreter_enabled=code_interpreter_enabled,
         ),
         max_steps=agent_max_steps,
         raise_on_tool_error=False,
@@ -180,7 +191,7 @@ def run_agentic_forecast(
     )
     extracted = _extract_agent_outputs(responses, tool_events=agent.get_last_tool_events())
     final_text = Agent.extract_final_content(responses)
-    parsed = _normalize_final_payload({}, final_text)
+    parsed = _normalize_final_payload(_try_parse_json_dict(final_text), final_text)
     usage = LLMUsage(**agent.get_last_usage())
     if _needs_forced_final_answer(final_text):
         forced_payload, forced_text, forced_usage = _force_final_answer(
@@ -203,7 +214,7 @@ def run_agentic_forecast(
         usage=usage,
         latency_sec=elapsed,
         retrieved_source_types=extracted["retrieved_source_types"],
-        steps_count=len(extracted["trajectory"]),
+        steps_count=agent.get_last_llm_call_count(),
         tool_usage_counts=extracted["tool_usage_counts"],
     )
 
@@ -344,6 +355,7 @@ def _agent_system_prompt(
     method_name: str,
     injected_memories: list[Any],
     flex_preloaded: list[FlexExperience],
+    code_interpreter_enabled: bool,
 ) -> str:
     parts = [
         "You are a forecasting research agent.",
@@ -353,17 +365,25 @@ def _agent_system_prompt(
         "Use tools when they materially improve the forecast instead of relying on unsupported intuition.",
         "For structured historical price, index, FX, or crypto data, openbb is usually the most reliable and structured option.",
         "For textual background, policy, people, events, or narrative evidence, search is usually the best starting point.",
-        "Use code_interpreter when you need calculations, probability adjustments, interval comparisons, or to organize retrieved evidence.",
         "When using search, prefer named entities and concrete event descriptions over vague terms, and use source filters when a result set is clearly off-topic.",
-        "Search is capped to 3 calls total, each returning at most 3 truncated content snippets. Repeated or low-yield searches will be blocked.",
+        "Search is capped to 2 calls total, each returning at most 3 truncated content snippets. Repeated or low-yield searches will be blocked.",
         "Do not keep calling the same tool with near-duplicate queries if the returned evidence is off-topic; switch tools, narrow the source, or finalize with lower confidence.",
         "If the question mentions a ticker, price level, percentage move, index, FX pair, or crypto symbol, seriously consider openbb before additional broad search.",
-        "Aim to stay within about 5 tool calls total. Use more only if a single unresolved uncertainty still materially changes the probability.",
-        "Keep tool interactions concise. Especially with code_interpreter, request only the minimum calculations and only report compact final outputs.",
+        "Aim to stay within at most 5 LLM reasoning steps and keep the tool path short.",
+        "Keep tool interactions concise. Do not use tools to restate qualitative reasoning you could express directly.",
         "Before each tool call, keep your discussion to one short sentence rather than a long plan.",
         "Return the final answer as JSON only with keys predicted_prob and reasoning_summary.",
         "If evidence remains weak, lower confidence instead of inventing facts.",
     ]
+    if code_interpreter_enabled:
+        parts.append(
+            "code_interpreter is available only because this question has an explicit numeric or interval-comparison component. "
+            "Use it only for a concrete calculation you cannot do reliably in plain text, and call it at most once."
+        )
+    else:
+        parts.append(
+            "Do not use code_interpreter for this question. This is not an explicit numeric-calculation task; reason directly from search/openbb evidence."
+        )
     if injected_memories:
         if method_name == "reasoningbank":
             parts.append(
@@ -471,16 +491,19 @@ def _format_flex_experiences(items: list[FlexExperience]) -> str:
 
 
 def _normalize_final_payload(payload: dict[str, Any], raw_text: str) -> dict[str, Any]:
-    prob = payload.get("predicted_prob")
-    if prob is None and isinstance(payload.get("probability"), (int, float, str)):
-        prob = payload.get("probability")
+    normalized_payload = payload if isinstance(payload, dict) else {}
+    if not normalized_payload:
+        normalized_payload = _try_parse_json_dict(raw_text)
+    prob = normalized_payload.get("predicted_prob")
+    if prob is None and isinstance(normalized_payload.get("probability"), (int, float, str)):
+        prob = normalized_payload.get("probability")
     try:
         prob_value = float(prob)
     except (TypeError, ValueError):
         prob_value = _extract_probability_from_text(raw_text)
     prob_value = min(1.0, max(0.0, prob_value))
     reasoning = str(
-        payload.get("reasoning_summary") or payload.get("summary") or ""
+        normalized_payload.get("reasoning_summary") or normalized_payload.get("summary") or ""
     ).strip()
     if not reasoning:
         reasoning = raw_text.strip()[:400]
@@ -595,6 +618,9 @@ def _extract_agent_outputs(
                         source_type = _hit_source_type(hit)
                         if source_type:
                             retrieved_source_types.append(source_type)
+                warning = str(payload.get("warning") or "").strip() if isinstance(payload, dict) else ""
+                if warning:
+                    result_entry["warning"] = warning
             elif tool_name == "memory":
                 hits = payload.get("hits") if isinstance(payload, dict) else None
                 if isinstance(hits, list):
@@ -750,11 +776,111 @@ def _try_parse_json_dict(text: str) -> dict[str, Any]:
     text = (text or "").strip()
     if not text:
         return {}
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    candidates = [text]
+    fenced = _extract_fenced_json(text)
+    if fenced:
+        candidates.append(fenced)
+    first_object = _extract_first_json_object(text)
+    if first_object:
+        candidates.append(first_object)
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _extract_fenced_json(text: str) -> str:
+    marker = "```json"
+    lowered = text.lower()
+    start = lowered.find(marker)
+    if start < 0:
+        return ""
+    remainder = text[start + len(marker) :]
+    end = remainder.find("```")
+    if end < 0:
+        return remainder.strip()
+    return remainder[:end].strip()
+
+
+def _extract_first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
+
+
+def _question_requires_code_interpreter(question: QuestionRecord) -> bool:
+    text = " ".join(
+        str(question.get(key) or "")
+        for key in ("question", "description", "resolution_criteria")
+    ).lower()
+    numeric_patterns = [
+        r"\bprice\b",
+        r"\bclose\b",
+        r"\btrade\b",
+        r"\bpercent(?:age)?\b",
+        r"\bbasis points?\b",
+        r"\bbps\b",
+        r"\bmarket cap\b",
+        r"\brevenue\b",
+        r"\beps\b",
+        r"\bshare\b",
+        r"\bprobability\b",
+        r"\bodds\b",
+        r"\binterval\b",
+        r"\brange\b",
+        r"\bratio\b",
+        r"\bspread\b",
+        r"\bcount\b",
+        r"\bnumber of\b",
+        r"\bmedals?\b",
+        r"\bgoals?\b",
+        r"\bwins?\b",
+        r"\bpoints?\b",
+        r"\bfewer than\b",
+        r"\bmore than\b",
+        r"\bless than\b",
+        r"\bat least\b",
+        r"\bat most\b",
+        r"\babove\b",
+        r"\bbelow\b",
+        r"\bunder\b",
+        r"\bover\b",
+        r"\bbetween\b",
+        r"[%$€£¥]",
+    ]
+    return any(re.search(pattern, text) for pattern in numeric_patterns)
 
 
 def _log_loss(prob: float, label: int) -> float:

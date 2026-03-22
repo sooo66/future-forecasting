@@ -111,6 +111,7 @@ class Agent:
         self.raise_on_tool_error = raise_on_tool_error
         self._last_usage = _empty_usage_dict()
         self._last_tool_events: list[dict[str, Any]] = []
+        self._last_llm_call_count = 0
         if llm is None:
             raise AgentError("LLM config or instance is required for qwen_agent.")
 
@@ -143,6 +144,7 @@ class Agent:
         cuttime: str | None = None,
     ) -> list[dict[str, Any]]:
         self._reset_run_state()
+        self._apply_max_steps()
         history = list(messages or [])
         history.append({"role": "user", "content": user_input})
         responses = self._collect_final_responses(
@@ -155,8 +157,10 @@ class Agent:
     def _apply_max_steps(self) -> None:
         try:
             from qwen_agent import settings as qwen_settings
+            from qwen_agent.agents import fncall_agent as fncall_agent_module
 
             qwen_settings.MAX_LLM_CALL_PER_RUN = self.max_steps
+            fncall_agent_module.MAX_LLM_CALL_PER_RUN = self.max_steps
         except Exception:
             return
 
@@ -217,6 +221,9 @@ class Agent:
     def get_last_tool_events(self) -> list[dict[str, Any]]:
         return [dict(event) for event in self._last_tool_events]
 
+    def get_last_llm_call_count(self) -> int:
+        return int(self._last_llm_call_count)
+
     @staticmethod
     def _runtime_kwargs(*, cuttime: str | None) -> dict[str, Any]:
         runtime_kwargs: dict[str, Any] = {}
@@ -227,6 +234,7 @@ class Agent:
     def _reset_run_state(self) -> None:
         self._last_usage = _empty_usage_dict()
         self._last_tool_events = []
+        self._last_llm_call_count = 0
 
     def _record_tool_event(
         self,
@@ -250,6 +258,7 @@ class Agent:
         functions: Optional[List[Dict[str, Any]]],
         response: List[Any],
     ) -> None:
+        self._last_llm_call_count += 1
         prompt_tokens = _estimate_tokens(
             {
                 "messages": [_usage_payload_from_message(message) for message in messages],
