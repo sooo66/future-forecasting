@@ -60,7 +60,7 @@ task>
 
 @dataclass(frozen=True)
 class ReasoningBankConfig:
-    agent_max_steps: int = 7
+    agent_max_steps: int = 5
     top_k: int = 1
     search_top_k: int = 3
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL

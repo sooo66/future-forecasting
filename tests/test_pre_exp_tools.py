@@ -174,3 +174,36 @@ def test_resident_code_interpreter_initializes_once_and_resets_between_questions
     assert calls[1]["params"] == {"code": "print(1)"}
     assert "_FF_BASELINE_GLOBALS" in json.loads(calls[2]["params"])["code"]
     assert calls[3]["params"] == {"code": "print(2)"}
+
+
+def test_resident_code_interpreter_repairs_truncated_json_arguments(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_call(self, params, files=None, timeout=30, **kwargs):
+        calls.append({"params": params, "timeout": timeout})
+        return "ok"
+
+    monkeypatch.setattr("forecasting.question_tools.CodeInterpreter.call", fake_call)
+    tool = ResidentCodeInterpreterTool(work_dir=tmp_path / "ci")
+
+    result = tool.call('{"code":"import math\\nprint(math.sqrt(9))')
+
+    assert result == "ok"
+    assert len(calls) == 2
+    assert calls[1]["params"] == {"code": "import math\nprint(math.sqrt(9))"}
+
+
+def test_resident_code_interpreter_returns_retry_message_for_unrecoverable_arguments(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_call(self, params, files=None, timeout=30, **kwargs):
+        calls.append({"params": params, "timeout": timeout})
+        return "ok"
+
+    monkeypatch.setattr("forecasting.question_tools.CodeInterpreter.call", fake_call)
+    tool = ResidentCodeInterpreterTool(work_dir=tmp_path / "ci")
+
+    result = tool.call('{"foo":"bar"}')
+
+    assert "Malformed code_interpreter arguments" in result
+    assert len(calls) == 1

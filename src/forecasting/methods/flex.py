@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
@@ -12,28 +13,44 @@ from forecasting.memory import FlexExperience, FlexLibrary
 from forecasting.methods._agentic_shared import build_memory_query, coerce_config, run_agentic_forecast
 from forecasting.question_tools import FlexMemoryTool, ResidentCodeInterpreterTool
 
-_SUCCESS_DISTILL_PROMPT = """You are a professional expert analyzing a solver's successful problem-solving process.
-Your goal is to extract a generalizable recipe for success from this experience and organize it into three levels:
-1. strategy: high-level, reusable guidance for similar problems.
-2. pattern: mid-level reasoning template or methodological pattern.
-3. case: concrete case-level insight from this task.
+_SUCCESS_DISTILL_PROMPT = """You are building a FLEX experience library from a successful forecasting run.
+Extract reusable experience blocks at three levels:
+1. strategy: a high-level rule that transfers across similar forecasting questions.
+2. pattern: a reusable evidence-gathering or reasoning workflow.
+3. case: a short task-shaped cue that helps retrieve this experience for similar situations.
 
-Return JSON only with keys strategy, pattern, case.
-Each value must be an object with keys title, summary, content."""
+Requirements:
+- Return JSON only with keys strategy, pattern, case.
+- Each value must be an object with keys title, summary, content.
+- Focus on reusable guidance from the trajectory, not the final market answer itself.
+- Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
+- Do not use generic titles like "golden strategy" or "case note".
+- strategy should be broadly reusable and action-oriented.
+- pattern should describe what evidence to gather and in what order.
+- case should capture the shape of the task or the distinctive cue, but still avoid ids and exact dates.
+- Keep summary to one sentence and content to 2-4 short sentences."""
 
-_FAILURE_DISTILL_PROMPT = """You are a professional expert diagnosing a solver's failed problem-solving process.
-Your goal is to identify reusable warnings and corrective guidance from this experience and organize it into three levels:
-1. strategy: high-level warning or corrective guidance for similar problems.
-2. pattern: mid-level failure pattern or corrective template.
-3. case: concrete case-level warning from this task.
+_FAILURE_DISTILL_PROMPT = """You are building a FLEX experience library from a failed forecasting run.
+Extract reusable warning blocks at three levels:
+1. strategy: a high-level warning or corrective rule for similar questions.
+2. pattern: a reusable failure mode or corrective workflow.
+3. case: a short task-shaped cue that helps retrieve this warning for similar situations.
 
-Return JSON only with keys strategy, pattern, case.
-Each value must be an object with keys title, summary, content."""
+Requirements:
+- Return JSON only with keys strategy, pattern, case.
+- Each value must be an object with keys title, summary, content.
+- Focus on reusable lessons from the trajectory, not the final market answer itself.
+- Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
+- Do not use generic titles like "warning strategy" or "case note".
+- strategy should state the corrective principle.
+- pattern should explain which evidence path failed or should have been prioritized instead.
+- case should capture the shape of the failure so it can be recognized later.
+- Keep summary to one sentence and content to 2-4 short sentences."""
 
 
 @dataclass(frozen=True)
 class FlexConfig:
-    agent_max_steps: int = 7
+    agent_max_steps: int = 5
     search_top_k: int = 3
     strategy_top_k: int = 5
     pattern_top_k: int = 5
@@ -115,6 +132,7 @@ def _build_flex_experiences(
     payload = _distill_flex(question, result, correctness=correctness, llm=llm)
     if not payload:
         payload = _default_flex_distillation(question, result, correctness=correctness)
+    payload = _sanitize_flex_payload(payload, question=question, correctness=correctness, result=result)
     items: list[FlexExperience] = []
     for level in ["strategy", "pattern", "case"]:
         block = payload.get(level) or {}
@@ -152,21 +170,22 @@ def _distill_flex(
             "role": "system",
             "content": _SUCCESS_DISTILL_PROMPT if correctness else _FAILURE_DISTILL_PROMPT,
         },
-        {"role": "user", "content": _flex_context(question, result)},
+        {"role": "user", "content": _flex_context(question, result, correctness=correctness)},
     ]
     payload, _raw, _usage = llm.chat_json(messages, max_tokens=500, temperature=0.0)
     return payload
 
 
-def _flex_context(question: QuestionRecord, result: dict[str, Any]) -> str:
+def _flex_context(question: QuestionRecord, result: dict[str, Any], *, correctness: bool) -> str:
     return (
-        f"Original Query: {question['question']}\n"
+        f"Question: {question['question']}\n"
+        f"Domain: {question['domain']}\n"
         f"Description: {' '.join(question['description'].split())[:800]}\n"
         f"Resolution Criteria: {' '.join(question['resolution_criteria'].split())[:800]}\n"
-        f"Ground Truth Label: {question['label']}\n"
-        f"Predicted Probability: {result.get('predicted_prob')}\n"
-        f"Reasoning Summary: {result.get('reasoning_summary')}\n"
-        f"Trajectory: {json.dumps(result.get('trajectory') or [], ensure_ascii=False)}\n"
+        f"Outcome Label: {question['label']}\n"
+        f"Prediction Correctness: {'correct' if correctness else 'incorrect'}\n"
+        f"Reasoning Summary: {_clean_flex_text(str(result.get('reasoning_summary') or ''))}\n"
+        f"Trajectory Highlights:\n{_format_flex_trajectory(result.get('trajectory') or [])}\n"
     )
 
 
@@ -180,17 +199,17 @@ def _default_flex_distillation(
     reasoning = " ".join(str(result.get("reasoning_summary") or "").split())
     return {
         "strategy": {
-            "title": f"{question['domain']} {zone} strategy",
+            "title": _default_flex_title(question, level="strategy", correctness=correctness),
             "summary": _default_summary(question, "strategy", zone),
             "content": reasoning or _default_content(result, zone),
         },
         "pattern": {
-            "title": f"{question['domain']} {zone} pattern",
+            "title": _default_flex_title(question, level="pattern", correctness=correctness),
             "summary": _default_summary(question, "pattern", zone),
             "content": _default_content(result, zone),
         },
         "case": {
-            "title": f"{question['domain']} {zone} case note",
+            "title": _default_flex_title(question, level="case", correctness=correctness),
             "summary": _default_summary(question, "case", zone),
             "content": reasoning or _default_content(result, zone),
         },
@@ -208,6 +227,147 @@ def _default_content(result: dict[str, Any], zone: str) -> str:
     if zone == "golden":
         return "Preserve the successful evidence-weighting pattern and reuse it on similar questions."
     return "Preserve this warning so similar questions avoid repeating the same mistake."
+
+
+def _sanitize_flex_payload(
+    payload: dict[str, Any],
+    *,
+    question: QuestionRecord,
+    correctness: bool,
+    result: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    sanitized: dict[str, dict[str, str]] = {}
+    for level in ("strategy", "pattern", "case"):
+        raw_block = payload.get(level)
+        block = raw_block if isinstance(raw_block, dict) else {}
+        title = _clean_flex_text(str(block.get("title") or ""))
+        summary = _clean_flex_text(str(block.get("summary") or ""))
+        content = _clean_flex_text(str(block.get("content") or ""))
+        if not title or _looks_generic_flex_title(title):
+            title = _default_flex_title(question, level=level, correctness=correctness)
+        if not summary:
+            summary = _default_summary(question, level, "golden" if correctness else "warning")
+        if not content:
+            content = _default_content(result, "golden" if correctness else "warning")
+        sanitized[level] = {
+            "title": title,
+            "summary": summary,
+            "content": content,
+        }
+    return sanitized
+
+
+def _clean_flex_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    fenced = _extract_fenced_json(text)
+    if fenced:
+        text = fenced
+    parsed = _parse_json_like_reasoning(text)
+    if parsed:
+        text = parsed
+    text = re.sub(r"\bmarket[_ ]?id\b\s*[:=]\s*\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bpredicted_prob(?:ability)?\b\s*[:=]\s*[-+]?[0-9.]+", "", text, flags=re.IGNORECASE)
+    text = " ".join(text.replace("```", " ").split())
+    return text[:600].strip(" ,;:-")
+
+
+def _format_flex_trajectory(trajectory: list[dict[str, Any]]) -> str:
+    if not trajectory:
+        return "(none)"
+    lines: list[str] = []
+    for step in trajectory[-10:]:
+        step_name = str(step.get("step") or "step")
+        if step_name.startswith("tool_call"):
+            lines.append(
+                f"- {step_name}: called {step.get('tool_name')} with {str(step.get('arguments') or '')[:180]}"
+            )
+            continue
+        if step_name.startswith("search_result"):
+            hits = step.get("hits") if isinstance(step.get("hits"), list) else []
+            titles = ", ".join(str(hit.get("title") or "") for hit in hits[:2] if isinstance(hit, dict))
+            warning = str(step.get("warning") or "").strip()
+            note = warning or titles or "no useful hits"
+            lines.append(f"- {step_name}: search outcome -> {note}")
+            continue
+        if step_name.startswith("memory_result"):
+            hits = step.get("hits") if isinstance(step.get("hits"), list) else []
+            cues = ", ".join(str(hit.get("title") or "") for hit in hits[:2] if isinstance(hit, dict))
+            lines.append(f"- {step_name}: memory retrieval -> {cues or 'no useful memories'}")
+            continue
+        if step_name.startswith("openbb_result"):
+            lines.append(f"- {step_name}: openbb preview -> {json.dumps(step, ensure_ascii=False)[:220]}")
+            continue
+        if step_name.startswith("code_interpreter_result"):
+            lines.append(f"- {step_name}: code output -> {_clean_flex_text(str(step.get('content') or ''))[:220]}")
+            continue
+        if step_name == "assistant":
+            lines.append(f"- assistant: {_clean_flex_text(str(step.get('content') or ''))[:220]}")
+    return "\n".join(lines)
+
+
+def _default_flex_title(question: QuestionRecord, *, level: str, correctness: bool) -> str:
+    task_shape = _infer_task_shape(question)
+    if level == "strategy":
+        return "Prioritize task-specific evidence before base-rate extrapolation" if correctness else "Do not confuse missing confirmation with low event probability"
+    if level == "pattern":
+        return "Sequence targeted evidence checks before numeric estimation" if correctness else "Stop broad search when results stay off-topic and switch approach"
+    if level == "case":
+        return task_shape
+    return f"{question['domain']} experience"
+
+
+def _infer_task_shape(question: QuestionRecord) -> str:
+    title = " ".join(str(question.get("question") or "").split())
+    title = re.sub(r"\bby\s+[A-Z][a-z]+\s+\d{1,2}\b.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" ?")
+    return title[:90] or f"{question['domain']} forecasting case"
+
+
+def _looks_generic_flex_title(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    generic_tokens = {
+        "golden strategy",
+        "golden pattern",
+        "golden case",
+        "warning strategy",
+        "warning pattern",
+        "warning case",
+        "case note",
+    }
+    if lowered in generic_tokens:
+        return True
+    if lowered.endswith("case note"):
+        return True
+    return False
+
+
+def _extract_fenced_json(text: str) -> str:
+    marker = "```json"
+    lowered = text.lower()
+    start = lowered.find(marker)
+    if start < 0:
+        return ""
+    remainder = text[start + len(marker) :]
+    end = remainder.find("```")
+    if end < 0:
+        return remainder.strip()
+    return remainder[:end].strip()
+
+
+def _parse_json_like_reasoning(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("{"):
+        return ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    reasoning = str(payload.get("reasoning_summary") or payload.get("summary") or "").strip()
+    return reasoning
 
 
 def _is_correct_prediction(question: QuestionRecord, result: dict[str, Any]) -> bool:

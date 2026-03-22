@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
+import json5
 from qwen_agent.tools.base import BaseTool
 from qwen_agent.tools.code_interpreter import CodeInterpreter
 
@@ -35,10 +37,20 @@ _RESIDENT_RESET_CODE = (
 class ResidentCodeInterpreterTool(CodeInterpreter):
     """Reuse one code-interpreter kernel within a method run while resetting state per question."""
 
+    description = (
+        "Python 代码沙盒。参数必须是 JSON 对象，且只包含一个字符串字段："
+        ' {"code": "..."}。不要使用 Markdown 代码块，不要附加解释文字。'
+    )
+    parameters = [{"name": "code", "type": "string", "description": "待执行的 Python 代码", "required": True}]
+
     def __init__(self, *, work_dir: str | Path):
         super().__init__({"work_dir": str(Path(work_dir).resolve())})
         self._initialized = False
         self._active_question_key: str | None = None
+
+    @property
+    def args_format(self) -> str:
+        return '将参数格式化为 JSON 对象，且只包含一个字段：{"code": "..."}。不要使用 Markdown 代码块。'
 
     def begin_question(self, question_key: str) -> None:
         if self._active_question_key == question_key:
@@ -51,7 +63,13 @@ class ResidentCodeInterpreterTool(CodeInterpreter):
         if not self._initialized:
             super().call(json.dumps({"code": _RESIDENT_INIT_CODE}), timeout=20)
             self._initialized = True
-        return super().call(params, files=files, timeout=timeout, **kwargs)
+        normalized = _normalize_code_interpreter_params(params)
+        if normalized is None:
+            return (
+                "Malformed code_interpreter arguments. "
+                'Call code_interpreter again with a valid JSON object of the form {"code": "..."} only.'
+            )
+        return super().call(normalized, files=files, timeout=timeout, **kwargs)
 
 
 class FlexMemoryTool(BaseTool):
@@ -110,3 +128,100 @@ class FlexMemoryTool(BaseTool):
                 for hit in hits
             ],
         }
+
+
+def _normalize_code_interpreter_params(params: str | dict) -> dict[str, str] | None:
+    if isinstance(params, dict):
+        code = params.get("code")
+        if isinstance(code, str) and code.strip():
+            return {"code": code}
+        return None
+    text = str(params or "").strip()
+    if not text:
+        return None
+
+    direct = _extract_code_from_json_payload(text)
+    if direct is not None:
+        return {"code": direct}
+
+    fenced = _extract_code_block(text)
+    if fenced is not None:
+        return {"code": fenced}
+
+    recovered = _recover_truncated_code_payload(text)
+    if recovered is not None:
+        return {"code": recovered}
+    return None
+
+
+def _extract_code_from_json_payload(text: str) -> str | None:
+    try:
+        payload = json5.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if not isinstance(code, str):
+        return None
+    code = code.strip()
+    return code or None
+
+
+def _extract_code_block(text: str) -> str | None:
+    match = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    code = match.group(1).strip()
+    return code or None
+
+
+def _recover_truncated_code_payload(text: str) -> str | None:
+    match = re.search(r'["\']code["\']\s*:\s*', text)
+    if not match:
+        return None
+    remainder = text[match.end():].lstrip()
+    if not remainder or remainder[0] not in {'"', "'"}:
+        return None
+    quote = remainder[0]
+    body = remainder[1:]
+
+    terminated_index = _find_unescaped_quote(body, quote)
+    candidates: list[str] = []
+    if terminated_index is not None:
+        candidates.append(body[: terminated_index + 1])
+
+    trimmed = body.rstrip()
+    candidates.append(trimmed + quote)
+    stripped_backslashes = trimmed.rstrip("\\")
+    if stripped_backslashes != trimmed:
+        candidates.append(stripped_backslashes + quote)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            code = json5.loads(quote + candidate)
+        except Exception:
+            continue
+        if isinstance(code, str):
+            code = code.strip()
+            if code:
+                return code
+    return None
+
+
+def _find_unescaped_quote(text: str, quote: str) -> int | None:
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            return index
+    return None

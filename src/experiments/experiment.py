@@ -17,10 +17,10 @@ DEFAULT_METHOD_CONFIGS = {
         "search_content_chars": 1024,
         "rag_max_per_source_type": 10,
     },
-    "agentic_nomem": {"agent_max_steps": 7, "search_top_k": 3},
-    "reasoningbank": {"agent_max_steps": 7, "top_k": 1, "search_top_k": 3},
+    "agentic_nomem": {"agent_max_steps": 5, "search_top_k": 3},
+    "reasoningbank": {"agent_max_steps": 5, "top_k": 1, "search_top_k": 3},
     "flex": {
-        "agent_max_steps": 7,
+        "agent_max_steps": 5,
         "search_top_k": 3,
         "strategy_top_k": 3,
         "pattern_top_k": 3,

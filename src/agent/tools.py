@@ -16,7 +16,7 @@ from tools.search import SearchClient, resolve_search_api_base
 
 DEFAULT_SEARCH_LIMIT = 3
 DEFAULT_SEARCH_CONTENT_TOKENS = 256
-DEFAULT_SEARCH_MAX_CALLS = 3
+DEFAULT_SEARCH_MAX_CALLS = 2
 _DEFAULT_OPENBB_WINDOW_DAYS = 90
 _ALLOWED_HISTORICAL_FUNCTIONS = {
     "equity.price.historical",

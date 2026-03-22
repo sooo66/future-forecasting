@@ -72,7 +72,7 @@ class OpenAIChatModel:
             config["api_key"] = self.api_key
         config["generate_cfg"] = {
             "max_input_tokens": 32000,
-            "max_tokens": 400,
+            "max_tokens": 1200,
             "temperature": 0.0,
         }
         return config
