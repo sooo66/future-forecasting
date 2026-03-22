@@ -1,0 +1,71 @@
+"""Forecasting experiment build functions."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+from experiments.base import ExperimentSpec
+
+DEFAULT_METHOD_IDS = ["direct_io", "bm25_rag", "agentic_nomem", "reasoningbank", "flex"]
+DEFAULT_DATASET_FILE = "data/questions/subsets/pre_exp_fixed_30_resolved.json"
+DEFAULT_KNOWLEDGE_ROOT = "data/mini"
+DEFAULT_METHOD_CONFIGS = {
+    "direct_io": {},
+    "bm25_rag": {
+        "search_top_k": 3,
+        "search_content_chars": 1024,
+        "rag_max_per_source_type": 10,
+    },
+    "agentic_nomem": {"agent_max_steps": 7, "search_top_k": 3},
+    "reasoningbank": {"agent_max_steps": 7, "top_k": 1, "search_top_k": 3},
+    "flex": {
+        "agent_max_steps": 7,
+        "search_top_k": 3,
+        "strategy_top_k": 3,
+        "pattern_top_k": 3,
+        "case_top_k": 3,
+    },
+}
+
+
+def _build_experiment(
+    experiment_id: str,
+    *,
+    dataset_file: str = DEFAULT_DATASET_FILE,
+    knowledge_root: str = DEFAULT_KNOWLEDGE_ROOT,
+    method_ids: list[str] | None = None,
+    method_configs: dict[str, Any] | None = None,
+    max_parallel_methods: int = 3,
+) -> ExperimentSpec:
+    return ExperimentSpec(
+        experiment_id=experiment_id,
+        dataset_file=dataset_file,
+        knowledge_root=knowledge_root,
+        method_ids=list(method_ids or DEFAULT_METHOD_IDS),
+        method_configs=deepcopy(method_configs or DEFAULT_METHOD_CONFIGS),
+        output_dir=f"artifacts/{experiment_id}",
+        max_parallel_methods=max_parallel_methods,
+    )
+
+
+def build_pre_experiment() -> ExperimentSpec:
+    return _build_experiment("pre_experiment")
+
+
+def build_pre_experiment_smoke() -> ExperimentSpec:
+    return _build_experiment(
+        "pre_experiment_smoke",
+        dataset_file="data/questions/subsets/pre_exp_smoke_3_resolved.json",
+    )
+
+
+def build_pre_experiment_smoke_3() -> ExperimentSpec:
+    return _build_experiment(
+        "pre_experiment_smoke_3",
+        dataset_file="data/questions/subsets/pre_exp_smoke_3_resolved.json",
+    )
+
+
+def build_pre_experiment_smoke_v3() -> ExperimentSpec:
+    return _build_experiment("pre_experiment_smoke_v3")

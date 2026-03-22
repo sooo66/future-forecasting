@@ -44,6 +44,11 @@ def setup_logger(config: Config, *, verbose: bool = False):
     logging.getLogger("crawl4ai").setLevel(logging.ERROR)
     logging.getLogger("scrapling").setLevel(logging.ERROR)
     logging.getLogger("playwright").setLevel(logging.ERROR)
+    qwen_logger = logging.getLogger("qwen_agent_logger")
+    qwen_logger.setLevel(logging.WARNING)
+    qwen_logger.propagate = False
+    for handler in qwen_logger.handlers:
+        handler.setLevel(logging.WARNING)
     
     # 添加控制台输出（默认 INFO，verbose 时 DEBUG）
     logger.add(

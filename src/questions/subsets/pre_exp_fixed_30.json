@@ -1,0 +1,55 @@
+{
+  "subset_id": "pre_exp_fixed_30",
+  "description": "Fixed 30-question subset for pre-experiment iteration with balanced domain and difficulty coverage.",
+  "source_file": "src/questions/q_20260302T072119Z.json",
+  "horizon": "7d",
+  "selection_strategy": "Manual fixed subset with balanced domain (5 each) and difficulty (10 each).",
+  "market_ids": [
+    "811904",
+    "896773",
+    "898376",
+    "994605",
+    "1116335",
+    "1117229",
+    "1183484",
+    "1198710",
+    "1132574",
+    "1230806",
+    "1295211",
+    "1300295",
+    "1302443",
+    "1321123",
+    "1319967",
+    "1329182",
+    "1327920",
+    "1335112",
+    "1341339",
+    "1349366",
+    "1360991",
+    "1361169",
+    "1361170",
+    "1361168",
+    "1367016",
+    "1370932",
+    "1374639",
+    "1374704",
+    "1403945",
+    "1404048"
+  ],
+  "stats": {
+    "selected_count": 30,
+    "domains": {
+      "culture": 5,
+      "finance": 5,
+      "politics": 5,
+      "sports": 5,
+      "tech": 5,
+      "world": 5
+    },
+    "difficulties": {
+      "easy": 10,
+      "hard": 10,
+      "medium": 10
+    }
+  }
+}

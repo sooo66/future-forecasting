@@ -37,6 +37,9 @@ dependencies = [
     "openbb>=4.6.0",
     "qwen-agent[code-interpreter,gui,mcp,rag]>=0.0.5",
     "scrapling[all]>=0.2.99",
+    "fastapi>=0.116.0",
+    "uvicorn>=0.35.0",
+    "bm25s>=0.3.2",
 ]
 
 [[tool.uv.index]]
