@@ -69,7 +69,7 @@ class ResidentCodeInterpreterTool(CodeInterpreter):
                 "Malformed code_interpreter arguments. "
                 'Call code_interpreter again with a valid JSON object of the form {"code": "..."} only.'
             )
-        return super().call(normalized, files=files, timeout=timeout, **kwargs)
+        return super().call(json.dumps(normalized, ensure_ascii=False), files=files, timeout=timeout, **kwargs)
 
 
 class FlexMemoryTool(BaseTool):

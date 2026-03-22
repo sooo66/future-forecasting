@@ -52,6 +52,7 @@ def run_experiment(
     methods_override: Sequence[str] | None = None,
     output_dir_override: str | None = None,
     search_api_base: str | None = None,
+    search_retrieval_mode: str | None = None,
     force: bool = False,
     max_parallel_methods: int | None = None,
 ) -> dict[str, Any]:
@@ -66,7 +67,7 @@ def run_experiment(
 
     llm = OpenAIChatModel(project_root)
     expected_snapshot_root = str((project_root / spec.knowledge_root).resolve())
-    search_client = SearchClient(search_api_base)
+    search_client = SearchClient(search_api_base, default_mode=search_retrieval_mode)
     search_health = search_client.health()
     actual_snapshot_root = str(search_health.get("snapshot_root") or "")
     if actual_snapshot_root and actual_snapshot_root != expected_snapshot_root:
@@ -92,6 +93,9 @@ def run_experiment(
         "settings": {
             "knowledge_root": spec.knowledge_root,
             "search_api_base": search_client.base_url,
+            "search_retrieval_mode": getattr(search_client, "default_mode", None)
+            or search_health.get("default_mode")
+            or "bm25",
             "search_snapshot_root": actual_snapshot_root or expected_snapshot_root,
             "dataset": {
                 "dataset_file": spec.dataset_file,

@@ -8,9 +8,11 @@ from datetime import date, datetime
 from decimal import Decimal
 import inspect
 import os
+import time
 from typing import Any, Callable, Optional
 
 from openbb import obb
+from yfinance.exceptions import YFRateLimitError
 
 
 _PROXY_ENV_KEYS = [
@@ -123,12 +125,19 @@ def call_openbb_function(
 
     invoke = invoker or _invoke_openbb
     try:
-        result = invoke(raw_function, payload)
+        result = _invoke_with_retry(raw_function, payload, invoke=invoke)
     except Exception as exc:
-        return {
+        error_payload = {
             "function": raw_function,
             "params": _sanitize(payload),
             "error": str(exc),
+        }
+        if _is_openbb_rate_limit_error(exc):
+            error_payload["retryable"] = True
+            error_payload["provider"] = payload.get("provider")
+            error_payload["error_type"] = "rate_limit"
+        return {
+            **error_payload,
         }
 
     normalized = _coerce_result(result)
@@ -155,6 +164,35 @@ def _invoke_openbb(function: str, params: dict[str, Any]) -> Any:
     target = _resolve_openbb_callable(function)
     with _without_proxy_env():
         return target(**params)
+
+
+def _invoke_with_retry(
+    function: str,
+    params: dict[str, Any],
+    *,
+    invoke: Callable[[str, dict[str, Any]], Any],
+) -> Any:
+    delays = [0.0, 1.0, 2.0]
+    last_exc: Exception | None = None
+    for index, delay in enumerate(delays):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            return invoke(function, params)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_openbb_rate_limit_error(exc) or index == len(delays) - 1:
+                raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed to invoke OpenBB function: {function}")
+
+
+def _is_openbb_rate_limit_error(exc: Exception) -> bool:
+    if isinstance(exc, YFRateLimitError):
+        return True
+    message = str(exc).lower()
+    return "too many requests" in message or "rate limit" in message or "ratelimit" in message
 
 
 def _resolve_openbb_callable(function: str) -> Callable[..., Any]:

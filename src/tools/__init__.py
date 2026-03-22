@@ -7,10 +7,12 @@ from tools.search import (
     SearchClient,
     SearchEngine,
     build_bm25_index,
+    build_dense_index,
     create_app,
     default_search_root,
     find_latest_snapshot_root,
     resolve_search_api_base,
+    resolve_search_retrieval_mode,
 )
 
 __all__ = [
@@ -22,6 +24,7 @@ __all__ = [
     "SearchClient",
     "SearchEngine",
     "build_bm25_index",
+    "build_dense_index",
     "build_corpus",
     "call_openbb_function",
     "create_app",
@@ -29,5 +32,6 @@ __all__ = [
     "find_latest_snapshot_root",
     "list_supported_openbb_functions",
     "resolve_search_api_base",
+    "resolve_search_retrieval_mode",
     "tokenize",
 ]

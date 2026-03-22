@@ -494,13 +494,11 @@ def _normalize_final_payload(payload: dict[str, Any], raw_text: str) -> dict[str
     normalized_payload = payload if isinstance(payload, dict) else {}
     if not normalized_payload:
         normalized_payload = _try_parse_json_dict(raw_text)
-    prob = normalized_payload.get("predicted_prob")
-    if prob is None and isinstance(normalized_payload.get("probability"), (int, float, str)):
-        prob = normalized_payload.get("probability")
-    try:
-        prob_value = float(prob)
-    except (TypeError, ValueError):
-        prob_value = _extract_probability_from_text(raw_text)
+    prob_value = _extract_probability_from_payload(normalized_payload)
+    if prob_value is None:
+        prob_value = _extract_probability_from_structured_text(raw_text)
+    if prob_value is None:
+        prob_value = 0.5
     prob_value = min(1.0, max(0.0, prob_value))
     reasoning = str(
         normalized_payload.get("reasoning_summary") or normalized_payload.get("summary") or ""
@@ -512,9 +510,9 @@ def _normalize_final_payload(payload: dict[str, Any], raw_text: str) -> dict[str
 
 def _needs_forced_final_answer(final_text: str) -> bool:
     payload = _try_parse_json_dict(final_text)
-    if not payload:
-        return True
-    return not any(key in payload for key in ("predicted_prob", "probability"))
+    if _extract_probability_from_payload(payload) is not None:
+        return False
+    return _extract_probability_from_structured_text(final_text) is None
 
 
 def _force_final_answer(
@@ -548,20 +546,65 @@ def _force_final_answer(
         return {}, "", LLMUsage()
 
 
-def _extract_probability_from_text(text: str) -> float:
-    text = text or ""
-    candidates: list[float] = []
-    for token in text.replace("%", " % ").split():
-        try:
-            candidates.append(float(token))
-        except ValueError:
-            continue
-    for value in candidates:
-        if 0.0 <= value <= 1.0:
+def _extract_probability_from_payload(payload: dict[str, Any]) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("predicted_prob", "probability"):
+        value = _coerce_probability_value(payload.get(key))
+        if value is not None:
             return value
-        if 1.0 < value <= 100.0:
-            return value / 100.0
-    return 0.5
+    return None
+
+
+def _extract_probability_from_structured_text(text: str) -> float | None:
+    candidates = [text, _extract_fenced_json(text), _extract_first_json_object(text)]
+    pattern = re.compile(
+        r'["\']?(predicted_prob|probability)["\']?\s*[:=]\s*["\']?([0-9]+(?:\.[0-9]+)?%?)',
+        flags=re.IGNORECASE,
+    )
+    for candidate in candidates:
+        candidate = (candidate or "").strip()
+        if not candidate:
+            continue
+        match = pattern.search(candidate)
+        if not match:
+            continue
+        value = _coerce_probability_value(match.group(2))
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_probability_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        percent = stripped.endswith("%")
+        if percent:
+            stripped = stripped[:-1].strip()
+        try:
+            number = float(stripped)
+        except ValueError:
+            return None
+        if percent and 0.0 <= number <= 100.0:
+            return number / 100.0
+        if 0.0 <= number <= 1.0:
+            return number
+        if 1.0 < number <= 100.0:
+            return number / 100.0
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= number <= 1.0:
+        return number
+    if 1.0 < number <= 100.0:
+        return number / 100.0
+    return None
 
 
 def _extract_agent_outputs(

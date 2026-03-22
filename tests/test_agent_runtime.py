@@ -135,6 +135,20 @@ def test_normalize_final_payload_prefers_embedded_json_probability():
     assert parsed["reasoning_summary"] == "Tail-risk only."
 
 
+def test_normalize_final_payload_does_not_treat_threshold_number_as_probability():
+    raw_text = (
+        '{\n'
+        '  "predicted_prob": 0.98,\n'
+        '  "reasoning_summary": "The 8.4 billion threshold is high and likely exceeded."\n'
+        '}'
+    )
+
+    parsed = _normalize_final_payload({}, raw_text)
+
+    assert parsed["predicted_prob"] == 0.98
+    assert "8.4 billion" in parsed["reasoning_summary"]
+
+
 def test_agentic_forecast_disables_code_interpreter_for_non_numeric_question(monkeypatch, tmp_path):
     captured = {}
 

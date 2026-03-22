@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from core.io import MODULE_OUTPUT_PATHS
+from tools.dense_embeddings import DEFAULT_DENSE_EMBEDDING_MODEL, build_text_embedder
 from utils.time_utils import to_day
 
 
@@ -27,6 +28,9 @@ _DEFAULT_FETCH_MULTIPLIER = 10
 _DEFAULT_FETCH_MIN = 50
 _MAX_FETCH_LIMIT = 400
 _BM25S_METHOD = "lucene"
+_RETRIEVAL_MODES = {"bm25", "dense", "hybrid"}
+_DEFAULT_RETRIEVAL_MODE = "bm25"
+_DEFAULT_RRF_K = 60
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class SearchRequest(BaseModel):
     time: str | None = None
     source: str | None = None
     limit: int = 5
+    mode: str | None = None
 
 
 def resolve_search_api_base(base_url: str | None = None) -> str:
@@ -58,6 +63,15 @@ def resolve_search_api_base(base_url: str | None = None) -> str:
     if not value:
         return _DEFAULT_SEARCH_API_BASE
     return value.rstrip("/")
+
+
+def resolve_search_retrieval_mode(mode: str | None = None) -> str | None:
+    value = str(mode or os.getenv("SEARCH_RETRIEVAL_MODE") or "").strip().lower()
+    if not value:
+        return None
+    if value not in _RETRIEVAL_MODES:
+        raise ValueError(f"Unsupported search retrieval mode: {value}")
+    return value
 
 
 def default_search_log_dir(project_root: Path) -> Path:
@@ -110,9 +124,56 @@ def build_bm25_index(corpus_path: Path, index_dir: Path, *, overwrite: bool = Fa
     return index_dir
 
 
+def build_dense_index(
+    corpus_path: Path,
+    index_dir: Path,
+    *,
+    model_name: str = DEFAULT_DENSE_EMBEDDING_MODEL,
+    device: str | None = None,
+    overwrite: bool = False,
+) -> Path:
+    corpus_path = Path(corpus_path).expanduser().resolve()
+    index_dir = Path(index_dir).expanduser().resolve()
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"Corpus file does not exist: {corpus_path}")
+    np = _load_numpy_module()
+
+    if index_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"Index directory already exists: {index_dir}")
+        import shutil
+
+        shutil.rmtree(index_dir)
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = list(_iter_corpus_rows(corpus_path))
+    texts = [str(row.get("contents") or row.get("content") or row.get("title") or "") for row in rows]
+    embedder = build_text_embedder(model_name=model_name, device=device)
+    embeddings = embedder.embed_texts(texts)
+    matrix = np.asarray(embeddings, dtype="float32")
+    np.save(index_dir / "embeddings.npy", matrix, allow_pickle=False)
+    metadata = {
+        "model_name": model_name,
+        "corpus_size": len(rows),
+        "dimension": int(matrix.shape[1]) if matrix.ndim == 2 else 0,
+    }
+    (index_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return index_dir
+
+
 class SearchClient:
-    def __init__(self, base_url: str | None = None, *, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        client: Any | None = None,
+        default_mode: str | None = None,
+    ) -> None:
         self.base_url = resolve_search_api_base(base_url)
+        self.default_mode = resolve_search_retrieval_mode(default_mode)
         self._client = client or httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
 
     def search(
@@ -122,6 +183,7 @@ class SearchClient:
         time: str | None = None,
         source: str | Sequence[str] | None = None,
         limit: int = 5,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         source_value: str | None
         if source is None:
@@ -130,6 +192,7 @@ class SearchClient:
             source_value = source
         else:
             source_value = ",".join(str(item).strip() for item in source if str(item).strip()) or None
+        resolved_mode = resolve_search_retrieval_mode(mode) or self.default_mode
         response = self._client.post(
             "/search",
             json={
@@ -137,6 +200,7 @@ class SearchClient:
                 "time": time,
                 "source": source_value,
                 "limit": int(limit or 5),
+                "mode": resolved_mode,
             },
         )
         response.raise_for_status()
@@ -154,10 +218,12 @@ class SearchEngine:
         search_root: Path,
         *,
         searcher_factory: Callable[[Path], Any] | None = None,
+        retrieval_mode: str | None = None,
     ) -> None:
         self.search_root = Path(search_root).expanduser().resolve()
         self.corpus_path = self.search_root / "corpus.jsonl"
         self.index_dir = self.search_root / "bm25"
+        self.dense_index_dir = self.search_root / "dense"
         self.stats_path = self.search_root / "stats.json"
         if not self.corpus_path.exists():
             raise FileNotFoundError(f"Search corpus does not exist: {self.corpus_path}")
@@ -166,10 +232,26 @@ class SearchEngine:
         self.snapshot_root = Path(self.stats.get("snapshot_root") or self.search_root).resolve()
         self._rows = _iter_corpus_rows(self.corpus_path)
         self._rows_by_id = _load_rows_by_id(self.corpus_path)
+        self._searchers: dict[str, Any] = {}
         if searcher_factory is None:
-            self._searcher = _load_bm25s_searcher(self.index_dir, len(self._rows))
+            if self.index_dir.exists():
+                self._searchers["bm25"] = _load_bm25s_searcher(self.index_dir, len(self._rows))
         else:
-            self._searcher = searcher_factory(self.index_dir)
+            self._searchers["bm25"] = searcher_factory(self.index_dir)
+        if self.dense_index_dir.exists():
+            self._searchers["dense"] = _load_dense_searcher(self.dense_index_dir)
+        self.available_modes = self._resolve_available_modes()
+        if not self.available_modes:
+            raise FileNotFoundError(
+                f"No search index found under {self.search_root}. Build BM25 and/or dense indexes first."
+            )
+        requested_mode = resolve_search_retrieval_mode(retrieval_mode)
+        self.retrieval_mode = requested_mode or self.available_modes[0]
+        if self.retrieval_mode not in self.available_modes:
+            raise ValueError(
+                f"Retrieval mode {self.retrieval_mode!r} is unavailable. "
+                f"Available modes: {', '.join(self.available_modes)}"
+            )
 
     def search(
         self,
@@ -178,10 +260,17 @@ class SearchEngine:
         time: str | None = None,
         source: str | Sequence[str] | None = None,
         limit: int = 5,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         query = (question or "").strip()
         if not query:
             raise ValueError("search.question is required")
+        retrieval_mode = resolve_search_retrieval_mode(mode) or self.retrieval_mode
+        if retrieval_mode not in self.available_modes:
+            raise ValueError(
+                f"Retrieval mode {retrieval_mode!r} is unavailable. "
+                f"Available modes: {', '.join(self.available_modes)}"
+            )
 
         max_hits = max(1, min(int(limit or 5), 20))
         before_day = _normalize_day(time) if time else None
@@ -190,7 +279,7 @@ class SearchEngine:
         fetch_k = min(_MAX_FETCH_LIMIT, max(_DEFAULT_FETCH_MIN, max_hits * _DEFAULT_FETCH_MULTIPLIER))
 
         while True:
-            raw_hits = list(self._searcher.search(query, fetch_k))
+            raw_hits = list(self._search(query, fetch_k, mode=retrieval_mode))
             filtered_hits = []
             for hit in raw_hits:
                 row = _resolve_hit_row(hit, rows=self._rows, rows_by_id=self._rows_by_id)
@@ -210,6 +299,7 @@ class SearchEngine:
             "question": query,
             "time": before_day,
             "source": _source_filter_label(source),
+            "mode": retrieval_mode,
             "total_candidates": len(filtered_hits),
             "hits": filtered_hits[:max_hits],
         }
@@ -222,7 +312,39 @@ class SearchEngine:
             "search_root": str(self.search_root),
             "corpus_path": str(self.corpus_path),
             "index_dir": str(self.index_dir),
+            "dense_index_dir": str(self.dense_index_dir),
+            "default_mode": self.retrieval_mode,
+            "available_modes": list(self.available_modes),
         }
+
+    def _resolve_available_modes(self) -> list[str]:
+        modes: list[str] = []
+        if "bm25" in self._searchers:
+            modes.append("bm25")
+        if "dense" in self._searchers:
+            modes.append("dense")
+        if "bm25" in self._searchers and "dense" in self._searchers:
+            modes.append("hybrid")
+        return modes
+
+    def _search(self, query: str, k: int, *, mode: str) -> list[Any]:
+        if mode == "hybrid":
+            return self._hybrid_search(query, k)
+        searcher = self._searchers.get(mode)
+        if searcher is None:
+            raise ValueError(f"Searcher for mode {mode!r} is not available")
+        return list(searcher.search(query, k))
+
+    def _hybrid_search(self, query: str, k: int) -> list[_SearchHit]:
+        bm25_hits = list(self._searchers["bm25"].search(query, k))
+        dense_hits = list(self._searchers["dense"].search(query, k))
+        fused: dict[int, float] = {}
+        for hits in (bm25_hits, dense_hits):
+            for rank, hit in enumerate(hits, start=1):
+                row_index = int(getattr(hit, "row_index"))
+                fused[row_index] = fused.get(row_index, 0.0) + 1.0 / (_DEFAULT_RRF_K + rank)
+        ordered = sorted(fused.items(), key=lambda item: item[1], reverse=True)
+        return [_SearchHit(row_index=row_index, score=score) for row_index, score in ordered[:k]]
 
 
 def create_app(
@@ -230,8 +352,9 @@ def create_app(
     *,
     log_dir: Path | None = None,
     searcher_factory: Callable[[Path], Any] | None = None,
+    retrieval_mode: str | None = None,
 ) -> FastAPI:
-    engine = SearchEngine(search_root, searcher_factory=searcher_factory)
+    engine = SearchEngine(search_root, searcher_factory=searcher_factory, retrieval_mode=retrieval_mode)
     request_log_path = ((log_dir or Path.cwd() / _DEFAULT_LOG_DIR).resolve() / "requests.jsonl")
     app = FastAPI(title="future-forecasting-search", version="2.0.0")
 
@@ -248,6 +371,7 @@ def create_app(
             time=request.time,
             source=request.source,
             limit=request.limit,
+            mode=request.mode,
         )
         elapsed = time.perf_counter() - started
         _write_jsonl_row(
@@ -270,6 +394,13 @@ def _load_bm25s_module() -> Any:
         return importlib.import_module("bm25s")
     except Exception as exc:
         raise RuntimeError("bm25s is required to build and serve BM25 search. Install bm25s first.") from exc
+
+
+def _load_numpy_module() -> Any:
+    try:
+        return importlib.import_module("numpy")
+    except Exception as exc:
+        raise RuntimeError("numpy is required to build and serve dense search. Install numpy first.") from exc
 
 
 @dataclass(frozen=True)
@@ -308,6 +439,46 @@ def _load_bm25s_searcher(index_dir: Path, corpus_size: int) -> Any:
     bm25s = _load_bm25s_module()
     retriever = bm25s.BM25.load(index_dir, load_corpus=False, mmap=True)
     return _Bm25sSearcher(retriever, corpus_size)
+
+
+class _DenseSearcher:
+    def __init__(self, *, embeddings: Any, embedder: Any) -> None:
+        self._embeddings = embeddings
+        self._embedder = embedder
+        self._np = _load_numpy_module()
+
+    def search(self, query: str, k: int) -> list[_SearchHit]:
+        if len(self._embeddings) == 0:
+            return []
+        query_vector = self._np.asarray(
+            self._embedder.embed_texts([query])[0],
+            dtype="float32",
+        )
+        scores = self._embeddings @ query_vector
+        effective_k = min(max(1, int(k)), len(scores))
+        if effective_k <= 0:
+            return []
+        indices = self._np.argpartition(-scores, effective_k - 1)[:effective_k]
+        ordered = sorted(
+            ((int(index), float(scores[index])) for index in indices),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        return [_SearchHit(row_index=row_index, score=score) for row_index, score in ordered]
+
+
+def _load_dense_searcher(index_dir: Path) -> Any:
+    index_dir = Path(index_dir).expanduser().resolve()
+    metadata_path = index_dir / "metadata.json"
+    embeddings_path = index_dir / "embeddings.npy"
+    if not metadata_path.exists() or not embeddings_path.exists():
+        raise FileNotFoundError(f"Dense search index is incomplete: {index_dir}")
+    metadata = _read_json(metadata_path)
+    model_name = str(metadata.get("model_name") or DEFAULT_DENSE_EMBEDDING_MODEL)
+    embedder = build_text_embedder(model_name=model_name)
+    np = _load_numpy_module()
+    embeddings = np.load(embeddings_path, mmap_mode="r")
+    return _DenseSearcher(embeddings=embeddings, embedder=embedder)
 
 
 def _iter_corpus_rows(corpus_path: Path) -> list[dict[str, Any]]:

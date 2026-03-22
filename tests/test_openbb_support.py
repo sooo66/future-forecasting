@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+from yfinance.exceptions import YFRateLimitError
+
 from tools.openbb import call_openbb_function, list_supported_openbb_functions
 
 
@@ -49,3 +51,24 @@ def test_openbb_call_does_not_truncate_results_by_default():
 
     assert result["result_count"] == 25
     assert len(result["results"]) == 25
+
+
+def test_openbb_retries_and_returns_retryable_rate_limit_error(monkeypatch):
+    calls = {"count": 0}
+
+    monkeypatch.setattr("tools.openbb.time.sleep", lambda _seconds: None)
+
+    def fake_invoker(_function: str, _params: dict[str, object]):
+        calls["count"] += 1
+        raise YFRateLimitError()
+
+    result = call_openbb_function(
+        "equity.price.historical",
+        params={"symbol": "AAPL"},
+        invoker=fake_invoker,
+    )
+
+    assert calls["count"] == 3
+    assert result["retryable"] is True
+    assert result["error_type"] == "rate_limit"
+    assert result["provider"] == "yfinance"

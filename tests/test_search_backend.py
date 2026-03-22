@@ -6,7 +6,7 @@ import re
 from fastapi.testclient import TestClient
 
 from tools.corpus import build_corpus
-from tools.search import SearchClient, SearchEngine, build_bm25_index, create_app
+from tools.search import SearchClient, SearchEngine, build_bm25_index, build_dense_index, create_app
 
 
 def _write_jsonl(path, rows):
@@ -41,6 +41,20 @@ class _FakeSearcher:
             scored.append(_FakeHit(str(row["id"]), score))
         scored.sort(key=lambda item: item.score, reverse=True)
         return scored[:k]
+
+
+class _FakeDenseEmbedder:
+    def embed_texts(self, texts):
+        outputs = []
+        for text in texts:
+            lowered = str(text).lower()
+            if "iphone" in lowered or "smartphone" in lowered or "apple device" in lowered:
+                outputs.append([1.0, 0.0, 0.0])
+            elif "fruit" in lowered or "orchard" in lowered:
+                outputs.append([0.0, 1.0, 0.0])
+            else:
+                outputs.append([0.0, 0.0, 1.0])
+        return outputs
 
 
 def _build_search_root(tmp_path, snapshot_name):
@@ -353,3 +367,83 @@ def test_search_bm25_handles_duplicate_passage_ids_without_index_error(tmp_path)
 
     assert len(result["hits"]) == 2
     assert {hit["source"] for hit in result["hits"]} == {"info/news"}
+
+
+def test_search_builds_and_queries_dense_index(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-dense")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+            {
+                "id": "fruit-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple harvest season",
+                    "content": "Orchard fruit output improved this quarter.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    monkeypatch.setattr("tools.search.build_text_embedder", lambda **_: _FakeDenseEmbedder())
+    build_dense_index(search_root / "corpus.jsonl", search_root / "dense", overwrite=True)
+
+    engine = SearchEngine(search_root, retrieval_mode="dense")
+    result = engine.search("apple smartphone demand", source="news", time="2026-01-10", limit=1)
+
+    assert len(result["hits"]) == 1
+    assert result["mode"] == "dense"
+    assert result["hits"][0]["doc_id"] == "phone-doc"
+
+
+def test_search_hybrid_mode_is_available_when_both_indexes_exist(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-hybrid")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+            {
+                "id": "market-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple market wrap",
+                    "content": "Apple demand remained steady in quarterly data.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    build_bm25_index(search_root / "corpus.jsonl", search_root / "bm25")
+    monkeypatch.setattr("tools.search.build_text_embedder", lambda **_: _FakeDenseEmbedder())
+    build_dense_index(search_root / "corpus.jsonl", search_root / "dense", overwrite=True)
+
+    engine = SearchEngine(search_root, retrieval_mode="hybrid")
+    health = engine.health()
+    result = engine.search("apple smartphone demand", source="news", time="2026-01-10", limit=2)
+
+    assert "hybrid" in health["available_modes"]
+    assert result["mode"] == "hybrid"
+    assert result["hits"][0]["doc_id"] == "phone-doc"

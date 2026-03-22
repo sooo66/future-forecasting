@@ -27,11 +27,13 @@ from modules import DEFAULT_MODULES
 from tools.corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_TOKENS, DEFAULT_TOKENIZER_NAME, build_corpus
 from tools.search import (
     build_bm25_index,
+    build_dense_index,
     create_app,
     default_search_log_dir,
     default_search_root,
     find_latest_snapshot_root,
     resolve_search_api_base,
+    resolve_search_retrieval_mode,
 )
 from utils.config import Config
 from utils.env import get_first_env, load_dotenv
@@ -97,6 +99,11 @@ def _resolve_search_api_base(args: argparse.Namespace) -> str:
     return resolve_search_api_base((getattr(args, "search_api_base", "") or "").strip())
 
 
+def _resolve_search_retrieval_mode_arg(args: argparse.Namespace) -> str | None:
+    value = (getattr(args, "search_retrieval_mode", "") or "").strip()
+    return resolve_search_retrieval_mode(value or None)
+
+
 def _resolve_snapshot_root(args: argparse.Namespace) -> str:
     return (args.snapshot_root or "").strip() or get_first_env("AGENT_SNAPSHOT_ROOT", "SNAPSHOT_ROOT")
 
@@ -123,6 +130,7 @@ def _run_experiment_command(args: argparse.Namespace) -> int:
         methods_override=_parse_methods_override(args.methods),
         output_dir_override=(args.output_dir or "").strip() or None,
         search_api_base=_resolve_search_api_base(args),
+        search_retrieval_mode=_resolve_search_retrieval_mode_arg(args),
         force=bool(args.force),
         max_parallel_methods=(args.max_parallel_methods if int(args.max_parallel_methods) > 0 else None),
     )
@@ -157,6 +165,7 @@ def _run_agent(args: argparse.Namespace) -> int:
     tools = build_default_tools(
         project_root=project_root,
         search_api_base=_resolve_search_api_base(args),
+        search_retrieval_mode=_resolve_search_retrieval_mode_arg(args),
         cutoff_time=resolved_cuttime,
         search_limit=int(args.search_limit),
         enable_code_interpreter=not bool(args.no_code_interpreter),
@@ -225,7 +234,11 @@ def _run_search_serve_command(args: argparse.Namespace) -> int:
     )
     logger.info(f"starting search service for snapshot: {snapshot_root}")
     logger.info(f"search root: {search_root}")
-    app = create_app(search_root, log_dir=log_dir)
+    app = create_app(
+        search_root,
+        log_dir=log_dir,
+        retrieval_mode=_resolve_search_retrieval_mode_arg(args),
+    )
     uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
     return 0
 
@@ -290,9 +303,21 @@ def _run_search_build_index_command(args: argparse.Namespace) -> int:
         verbose=bool(args.verbose),
     )
     corpus_path = search_root / "corpus.jsonl"
-    index_dir = search_root / "bm25"
-    build_bm25_index(corpus_path, index_dir, overwrite=bool(args.force))
-    logger.info(f"search index written: {index_dir}")
+    retrieval_mode = _resolve_search_retrieval_mode_arg(args) or "bm25"
+    if retrieval_mode in {"bm25", "hybrid"}:
+        bm25_dir = search_root / "bm25"
+        build_bm25_index(corpus_path, bm25_dir, overwrite=bool(args.force))
+        logger.info(f"bm25 index written: {bm25_dir}")
+    if retrieval_mode in {"dense", "hybrid"}:
+        dense_dir = search_root / "dense"
+        build_dense_index(
+            corpus_path,
+            dense_dir,
+            model_name=(args.embedding_model_name or "").strip() or "sentence-transformers/all-MiniLM-L6-v2",
+            device=(args.embedding_device or "").strip() or None,
+            overwrite=bool(args.force),
+        )
+        logger.info(f"dense index written: {dense_dir}")
     return 0
 
 
@@ -359,6 +384,11 @@ def main() -> int:
         help="Optional search API base URL. Defaults to SEARCH_API_BASE or http://127.0.0.1:8000.",
     )
     agent_cmd.add_argument(
+        "--search-retrieval-mode",
+        default="",
+        help="Optional retrieval mode override for search requests: bm25, dense, or hybrid.",
+    )
+    agent_cmd.add_argument(
         "--cutoff-time",
         default="",
         help="Optional external cutoff time for search/openbb. Defaults to current UTC time.",
@@ -385,6 +415,11 @@ def main() -> int:
     experiment_run.add_argument("--output-dir", default="", help="Optional override for output dir")
     experiment_run.add_argument("--methods", default="", help="Optional comma-separated method override")
     experiment_run.add_argument("--search-api-base", default="", help="Optional search API base URL override")
+    experiment_run.add_argument(
+        "--search-retrieval-mode",
+        default="",
+        help="Optional retrieval mode override for search requests: bm25, dense, or hybrid.",
+    )
     experiment_run.add_argument("--force", action="store_true", help="Force rerun even if results already exist")
     experiment_run.add_argument(
         "--max-parallel-methods",
@@ -408,15 +443,35 @@ def main() -> int:
     search_build_corpus.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_NAME, help="Tokenizer name used for chunking.")
     search_build_corpus.add_argument("--verbose", action="store_true", help="Enable DEBUG logs on console")
 
-    search_build_index = search_sub.add_parser("build-index", help="Build a BM25 index from an offline search corpus")
+    search_build_index = search_sub.add_parser("build-index", help="Build retrieval indexes from an offline search corpus")
     search_build_index.add_argument("--snapshot-root", default="", help="Snapshot root used to derive the default search root.")
     search_build_index.add_argument("--search-root", default="", help="Root containing corpus.jsonl.")
+    search_build_index.add_argument(
+        "--search-retrieval-mode",
+        default="bm25",
+        help="Index mode to build: bm25, dense, or hybrid (builds both).",
+    )
+    search_build_index.add_argument(
+        "--embedding-model-name",
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Hugging Face embedding model for dense retrieval.",
+    )
+    search_build_index.add_argument(
+        "--embedding-device",
+        default="",
+        help="Optional torch device override for dense embedding generation, e.g. cpu or cuda.",
+    )
     search_build_index.add_argument("--force", action="store_true", help="Overwrite an existing BM25 index directory.")
     search_build_index.add_argument("--verbose", action="store_true", help="Enable DEBUG logs on console")
 
     search_serve = search_sub.add_parser("serve", help="Serve the local search API for one snapshot")
     search_serve.add_argument("--snapshot-root", default="", help="Snapshot root to bind. Defaults to the latest local snapshot.")
-    search_serve.add_argument("--search-root", default="", help="Root containing corpus.jsonl and bm25 index artifacts.")
+    search_serve.add_argument("--search-root", default="", help="Root containing corpus.jsonl and retrieval index artifacts.")
+    search_serve.add_argument(
+        "--search-retrieval-mode",
+        default="",
+        help="Default retrieval mode for requests: bm25, dense, or hybrid.",
+    )
     search_serve.add_argument("--host", default="127.0.0.1", help="Host to bind the search API server")
     search_serve.add_argument("--port", type=int, default=8000, help="Port to bind the search API server")
     search_serve.add_argument("--log-dir", default="", help="Optional log directory for search request logs")
