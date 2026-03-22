@@ -164,9 +164,10 @@ class SearchEngine:
 
         self.stats = _read_json(self.stats_path) if self.stats_path.exists() else {}
         self.snapshot_root = Path(self.stats.get("snapshot_root") or self.search_root).resolve()
+        self._rows = _iter_corpus_rows(self.corpus_path)
         self._rows_by_id = _load_rows_by_id(self.corpus_path)
         if searcher_factory is None:
-            self._searcher = _load_bm25s_searcher(self.index_dir, list(self._rows_by_id))
+            self._searcher = _load_bm25s_searcher(self.index_dir, len(self._rows))
         else:
             self._searcher = searcher_factory(self.index_dir)
 
@@ -192,7 +193,7 @@ class SearchEngine:
             raw_hits = list(self._searcher.search(query, fetch_k))
             filtered_hits = []
             for hit in raw_hits:
-                row = self._rows_by_id.get(str(getattr(hit, "docid", "")))
+                row = _resolve_hit_row(hit, rows=self._rows, rows_by_id=self._rows_by_id)
                 if row is None:
                     continue
                 if not _row_matches(row, source_filters=source_filters, before_day=before_day):
@@ -216,8 +217,8 @@ class SearchEngine:
     def health(self) -> dict[str, Any]:
         return {
             "snapshot_root": str(self.snapshot_root),
-            "record_count": len(self._rows_by_id),
-            "indexed_documents": len(self._rows_by_id),
+            "record_count": len(self._rows),
+            "indexed_documents": len(self._rows),
             "search_root": str(self.search_root),
             "corpus_path": str(self.corpus_path),
             "index_dir": str(self.index_dir),
@@ -273,40 +274,40 @@ def _load_bm25s_module() -> Any:
 
 @dataclass(frozen=True)
 class _SearchHit:
-    docid: str
+    row_index: int
     score: float
 
 
 class _Bm25sSearcher:
-    def __init__(self, retriever: Any, row_ids: list[str]) -> None:
+    def __init__(self, retriever: Any, corpus_size: int) -> None:
         self._retriever = retriever
-        self._row_ids = row_ids
+        self._row_indices = list(range(corpus_size))
         self._bm25s = _load_bm25s_module()
 
     def search(self, query: str, k: int) -> list[_SearchHit]:
-        effective_k = min(max(1, int(k)), len(self._row_ids))
+        effective_k = min(max(1, int(k)), len(self._row_indices))
         if effective_k <= 0:
             return []
         query_tokens = self._bm25s.tokenize([query], show_progress=False)
         results = self._retriever.retrieve(
             query_tokens,
-            corpus=self._row_ids,
+            corpus=self._row_indices,
             k=effective_k,
             show_progress=False,
             return_as="tuple",
         )
-        row_ids = results.documents[0].tolist() if hasattr(results.documents[0], "tolist") else list(results.documents[0])
+        row_indices = results.documents[0].tolist() if hasattr(results.documents[0], "tolist") else list(results.documents[0])
         scores = results.scores[0].tolist() if hasattr(results.scores[0], "tolist") else list(results.scores[0])
-        return [_SearchHit(docid=str(row_id), score=float(score)) for row_id, score in zip(row_ids, scores)]
+        return [_SearchHit(row_index=int(row_index), score=float(score)) for row_index, score in zip(row_indices, scores)]
 
 
-def _load_bm25s_searcher(index_dir: Path, row_ids: list[str]) -> Any:
+def _load_bm25s_searcher(index_dir: Path, corpus_size: int) -> Any:
     index_dir = Path(index_dir).expanduser().resolve()
     if not index_dir.exists():
         raise FileNotFoundError(f"Search index does not exist: {index_dir}")
     bm25s = _load_bm25s_module()
     retriever = bm25s.BM25.load(index_dir, load_corpus=False, mmap=True)
-    return _Bm25sSearcher(retriever, row_ids)
+    return _Bm25sSearcher(retriever, corpus_size)
 
 
 def _iter_corpus_rows(corpus_path: Path) -> list[dict[str, Any]]:
@@ -327,6 +328,21 @@ def _load_rows_by_id(corpus_path: Path) -> dict[str, dict[str, Any]]:
         if row_id:
             rows[row_id] = row
     return rows
+
+
+def _resolve_hit_row(
+    hit: Any,
+    *,
+    rows: list[dict[str, Any]],
+    rows_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    row_index = getattr(hit, "row_index", None)
+    if isinstance(row_index, int) and 0 <= row_index < len(rows):
+        return rows[row_index]
+    docid = str(getattr(hit, "docid", "")).strip()
+    if not docid:
+        return None
+    return rows_by_id.get(docid)
 
 
 def _row_matches(

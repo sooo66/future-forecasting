@@ -311,3 +311,45 @@ def test_search_builds_and_queries_bm25s_index(tmp_path):
 
     assert len(result["hits"]) == 1
     assert result["hits"][0]["doc_id"] == "news-1"
+
+
+def test_search_bm25_handles_duplicate_passage_ids_without_index_error(tmp_path):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-dup-id")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "dup-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "AAPL demand cools",
+                    "content": "AAPL demand weakened after guidance cut.",
+                },
+            }
+        ],
+    )
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "reuters" / "records.jsonl",
+        [
+            {
+                "id": "dup-doc",
+                "kind": "info",
+                "source": "news/reuters",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "AAPL suppliers cautious",
+                    "content": "Suppliers signaled weaker AAPL demand in Asia.",
+                },
+            }
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    build_bm25_index(search_root / "corpus.jsonl", search_root / "bm25")
+
+    engine = SearchEngine(search_root)
+    result = engine.search("AAPL demand", source="news", time="2026-01-10", limit=2)
+
+    assert len(result["hits"]) == 2
+    assert {hit["source"] for hit in result["hits"]} == {"info/news"}
