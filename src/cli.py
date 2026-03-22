@@ -35,6 +35,7 @@ from tools.search import (
     resolve_search_api_base,
     resolve_search_retrieval_mode,
 )
+from tools.search_clients import resolve_search_backend
 from utils.config import Config
 from utils.env import get_first_env, load_dotenv
 from utils.logger import setup_logger
@@ -104,6 +105,11 @@ def _resolve_search_retrieval_mode_arg(args: argparse.Namespace) -> str | None:
     return resolve_search_retrieval_mode(value or None)
 
 
+def _resolve_search_backend_arg(args: argparse.Namespace) -> str:
+    value = (getattr(args, "search_backend", "") or "").strip()
+    return resolve_search_backend(value or None)
+
+
 def _resolve_snapshot_root(args: argparse.Namespace) -> str:
     return (args.snapshot_root or "").strip() or get_first_env("AGENT_SNAPSHOT_ROOT", "SNAPSHOT_ROOT")
 
@@ -131,6 +137,7 @@ def _run_experiment_command(args: argparse.Namespace) -> int:
         output_dir_override=(args.output_dir or "").strip() or None,
         search_api_base=_resolve_search_api_base(args),
         search_retrieval_mode=_resolve_search_retrieval_mode_arg(args),
+        search_backend=_resolve_search_backend_arg(args),
         force=bool(args.force),
         max_parallel_methods=(args.max_parallel_methods if int(args.max_parallel_methods) > 0 else None),
     )
@@ -166,6 +173,7 @@ def _run_agent(args: argparse.Namespace) -> int:
         project_root=project_root,
         search_api_base=_resolve_search_api_base(args),
         search_retrieval_mode=_resolve_search_retrieval_mode_arg(args),
+        search_backend=_resolve_search_backend_arg(args),
         cutoff_time=resolved_cuttime,
         search_limit=int(args.search_limit),
         enable_code_interpreter=not bool(args.no_code_interpreter),
@@ -384,6 +392,11 @@ def main() -> int:
         help="Optional search API base URL. Defaults to SEARCH_API_BASE or http://127.0.0.1:8000.",
     )
     agent_cmd.add_argument(
+        "--search-backend",
+        default="",
+        help="Search backend override: local or exa. Defaults to SEARCH_BACKEND or local.",
+    )
+    agent_cmd.add_argument(
         "--search-retrieval-mode",
         default="",
         help="Optional retrieval mode override for search requests: bm25, dense, or hybrid.",
@@ -415,6 +428,11 @@ def main() -> int:
     experiment_run.add_argument("--output-dir", default="", help="Optional override for output dir")
     experiment_run.add_argument("--methods", default="", help="Optional comma-separated method override")
     experiment_run.add_argument("--search-api-base", default="", help="Optional search API base URL override")
+    experiment_run.add_argument(
+        "--search-backend",
+        default="",
+        help="Search backend override: local or exa. Defaults to SEARCH_BACKEND or local.",
+    )
     experiment_run.add_argument(
         "--search-retrieval-mode",
         default="",

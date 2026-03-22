@@ -116,6 +116,7 @@ def test_run_experiment_command_uses_spec_and_overrides(monkeypatch, tmp_path):
             output_dir="custom/output",
             methods="direct_io,flex",
             search_api_base="http://127.0.0.1:9001",
+            search_backend="exa",
             force=True,
             max_parallel_methods=3,
             verbose=False,
@@ -127,6 +128,7 @@ def test_run_experiment_command_uses_spec_and_overrides(monkeypatch, tmp_path):
     assert captured["kwargs"]["methods_override"] == ["direct_io", "flex"]
     assert captured["kwargs"]["output_dir_override"] == "custom/output"
     assert captured["kwargs"]["search_api_base"] == "http://127.0.0.1:9001"
+    assert captured["kwargs"]["search_backend"] == "exa"
     assert captured["kwargs"]["force"] is True
     assert captured["kwargs"]["max_parallel_methods"] == 3
 

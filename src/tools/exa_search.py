@@ -1,0 +1,151 @@
+"""Exa-backed search client compatible with the local search interface."""
+
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+from utils.env import get_first_env
+
+
+_DEFAULT_EXA_BASE_URL = "https://api.exa.ai"
+_DEFAULT_EXA_SEARCH_TYPE = "auto"
+_DEFAULT_TEXT_MAX_CHARACTERS = 1024
+_EXA_CATEGORY_BY_SOURCE = {
+    "news": "news",
+    "paper": "research paper",
+    "report": "financial report",
+    "sociomedia": "tweet",
+}
+
+
+class ExaSearchClient:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        base_url: str | None = None,
+        search_type: str = _DEFAULT_EXA_SEARCH_TYPE,
+        text_max_characters: int = _DEFAULT_TEXT_MAX_CHARACTERS,
+    ) -> None:
+        resolved_api_key = str(api_key or get_first_env("EXA_API_KEY", "EXA_SEARCH_API_KEY")).strip()
+        if not resolved_api_key:
+            raise ValueError("EXA_API_KEY (or EXA_SEARCH_API_KEY) is required for Exa search")
+        self.api_key = resolved_api_key
+        self.base_url = str(base_url or get_first_env("EXA_BASE_URL") or _DEFAULT_EXA_BASE_URL).rstrip("/")
+        self.search_type = str(search_type or _DEFAULT_EXA_SEARCH_TYPE).strip() or _DEFAULT_EXA_SEARCH_TYPE
+        self.text_max_characters = max(128, int(text_max_characters or _DEFAULT_TEXT_MAX_CHARACTERS))
+        self._client = _load_exa_class()(self.api_key, base_url=self.base_url)
+
+    def search(
+        self,
+        question: str,
+        *,
+        time: str | None = None,
+        source: str | Sequence[str] | None = None,
+        limit: int = 5,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        query = str(question or "").strip()
+        if not query:
+            raise ValueError("search.question is required")
+        source_type = _normalize_source_type(source)
+        category = _EXA_CATEGORY_BY_SOURCE.get(source_type or "")
+        response = self._client.search(
+            query,
+            end_published_date=time,
+            num_results=max(1, int(limit or 5)),
+            type=self.search_type,
+            category=category,
+            contents={
+                "text": {
+                    "max_characters": self.text_max_characters,
+                    "verbosity": "compact",
+                }
+            },
+        )
+        hits = []
+        for result in list(getattr(response, "results", []) or []):
+            hits.append(_exa_result_to_hit(result, requested_source=source_type))
+        return {
+            "snapshot_root": "exa",
+            "backend": "exa",
+            "question": query,
+            "time": time,
+            "source": source_type or "",
+            "mode": "exa",
+            "total_candidates": len(hits),
+            "hits": hits,
+        }
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "backend": "exa",
+            "snapshot_root": "exa",
+            "search_root": None,
+            "default_mode": "exa",
+            "available_modes": ["exa"],
+            "base_url": self.base_url,
+        }
+
+
+def _load_exa_class() -> Any:
+    try:
+        from exa_py import Exa
+    except ImportError as exc:
+        raise RuntimeError("exa-py is required for Exa search. Install project dependencies first.") from exc
+    return Exa
+
+
+def _normalize_source_type(source: str | Sequence[str] | None) -> str:
+    if source is None:
+        return ""
+    if isinstance(source, str):
+        candidates = [item.strip().lower() for item in source.split(",") if item.strip()]
+    else:
+        candidates = [str(item).strip().lower() for item in source if str(item).strip()]
+    for item in candidates:
+        if "/" in item:
+            return item.split("/", 1)[-1]
+        return item
+    return ""
+
+
+def _exa_result_to_hit(result: Any, *, requested_source: str) -> dict[str, Any]:
+    title = str(getattr(result, "title", "") or "").strip()
+    content = _extract_result_text(result)
+    url = str(getattr(result, "url", "") or "").strip() or None
+    published_date = str(getattr(result, "published_date", "") or "").strip()
+    score = getattr(result, "score", None)
+    source_type = requested_source or _infer_source_type(result)
+    return {
+        "doc_id": str(getattr(result, "id", "") or url or title),
+        "score": round(float(score or 0.0), 4),
+        "source": f"info/{source_type}" if source_type else "info/news",
+        "source_type": source_type or "news",
+        "timestamp": published_date[:10] if published_date else "",
+        "title": title,
+        "content": content,
+        "url": url,
+    }
+
+
+def _extract_result_text(result: Any) -> str:
+    text = str(getattr(result, "text", "") or "").strip()
+    if text:
+        return text
+    summary = str(getattr(result, "summary", "") or "").strip()
+    if summary:
+        return summary
+    highlights = getattr(result, "highlights", None)
+    if isinstance(highlights, list):
+        joined = " ".join(str(item).strip() for item in highlights if str(item).strip())
+        if joined:
+            return joined
+    return ""
+
+
+def _infer_source_type(result: Any) -> str:
+    url = str(getattr(result, "url", "") or "").lower()
+    if url.endswith(".pdf"):
+        return "paper"
+    return "news"

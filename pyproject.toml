@@ -40,6 +40,7 @@ dependencies = [
     "fastapi>=0.116.0",
     "uvicorn>=0.35.0",
     "bm25s>=0.3.2",
+    "exa-py>=2.9.0",
 ]
 
 [[tool.uv.index]]

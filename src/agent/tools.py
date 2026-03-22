@@ -12,6 +12,7 @@ from qwen_agent.utils.tokenization_qwen import tokenizer as qwen_tokenizer
 
 from tools.openbb import call_openbb_function, list_supported_openbb_functions
 from tools.search import SearchClient, resolve_search_api_base, resolve_search_retrieval_mode
+from tools.search_clients import build_search_client
 
 
 DEFAULT_SEARCH_LIMIT = 3
@@ -214,6 +215,7 @@ def build_default_tools(
     project_root: Path | str,
     search_api_base: str | None = None,
     search_retrieval_mode: str | None = None,
+    search_backend: str | None = None,
     cutoff_time: str | None = None,
     search_limit: int = DEFAULT_SEARCH_LIMIT,
     enable_code_interpreter: bool = True,
@@ -228,9 +230,10 @@ def build_default_tools(
                 "work_dir": str((repo_root / ".qwen_agent_workspace" / "code_interpreter").resolve()),
             }
         )
-    search_client = SearchClient(
-        resolve_search_api_base(search_api_base),
+    search_client = build_search_client(
+        base_url=resolve_search_api_base(search_api_base),
         default_mode=resolve_search_retrieval_mode(search_retrieval_mode),
+        backend=search_backend,
     )
     tools.append(
         SearchTool(
