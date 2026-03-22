@@ -9,7 +9,7 @@ from experiments.base import ExperimentSpec
 
 DEFAULT_METHOD_IDS = ["direct_io", "bm25_rag", "agentic_nomem", "reasoningbank", "flex"]
 DEFAULT_DATASET_FILE = "data/questions/subsets/pre_exp_fixed_30_resolved.json"
-DEFAULT_KNOWLEDGE_ROOT = "data/mini"
+DEFAULT_KNOWLEDGE_ROOT = "data/benchmark/s-0306"
 DEFAULT_METHOD_CONFIGS = {
     "direct_io": {},
     "bm25_rag": {
@@ -53,19 +53,15 @@ def build_pre_experiment() -> ExperimentSpec:
     return _build_experiment("pre_experiment")
 
 
-def build_pre_experiment_smoke() -> ExperimentSpec:
+def build_smoke_test_3() -> ExperimentSpec:
     return _build_experiment(
-        "pre_experiment_smoke",
-        dataset_file="data/questions/subsets/pre_exp_smoke_3_resolved.json",
+        "smoke_test_3",
+        dataset_file="data/questions/subsets/smoke_test_3.json",
     )
 
 
-def build_pre_experiment_smoke_3() -> ExperimentSpec:
+def build_smoke_test_30() -> ExperimentSpec:
     return _build_experiment(
-        "pre_experiment_smoke_3",
-        dataset_file="data/questions/subsets/pre_exp_smoke_3_resolved.json",
+        "smoke_test_30",
+        dataset_file="data/questions/subsets/smoke_test_30.json",
     )
-
-
-def build_pre_experiment_smoke_v3() -> ExperimentSpec:
-    return _build_experiment("pre_experiment_smoke_v3")
