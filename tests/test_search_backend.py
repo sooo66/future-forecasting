@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -55,6 +56,29 @@ class _FakeDenseEmbedder:
             else:
                 outputs.append([0.0, 0.0, 1.0])
         return outputs
+
+
+class _FakeReranker:
+    model_name = "fake-reranker"
+    resolved_device = "cuda"
+
+    def score(self, query, documents):
+        outputs = []
+        for document in documents:
+            text = str(document).lower()
+            if "iphone" in text or "smartphone" in text:
+                outputs.append(10.0)
+            else:
+                outputs.append(1.0)
+        return outputs
+
+
+class _OrderedSearcher:
+    def __init__(self, hits):
+        self._hits = list(hits)
+
+    def search(self, query, k):
+        return list(self._hits[:k])
 
 
 def _build_search_root(tmp_path, snapshot_name):
@@ -408,6 +432,68 @@ def test_search_builds_and_queries_dense_index(tmp_path, monkeypatch):
     assert result["hits"][0]["doc_id"] == "phone-doc"
 
 
+def test_search_build_dense_index_reports_progress_and_metadata(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-dense-progress")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+            {
+                "id": "fruit-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple harvest season",
+                    "content": "Orchard fruit output improved this quarter.",
+                },
+            },
+            {
+                "id": "market-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple market wrap",
+                    "content": "Apple demand remained steady in quarterly data.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    monkeypatch.setattr("tools.search.build_text_embedder", lambda **_: _FakeDenseEmbedder())
+    progress_events = []
+
+    build_dense_index(
+        search_root / "corpus.jsonl",
+        search_root / "dense",
+        overwrite=True,
+        batch_size=2,
+        workers=1,
+        show_progress=False,
+        progress_callback=progress_events.append,
+    )
+
+    metadata = json.loads((search_root / "dense" / "metadata.json").read_text(encoding="utf-8"))
+
+    assert progress_events
+    assert progress_events[-1]["completed"] == 3
+    assert progress_events[-1]["total"] == 3
+    assert metadata["corpus_size"] == 3
+    assert metadata["dimension"] == 3
+    assert metadata["batch_size"] == 2
+    assert metadata["workers"] == 1
+
+
 def test_search_hybrid_mode_is_available_when_both_indexes_exist(tmp_path, monkeypatch):
     snapshot_root, search_root = _build_search_root(tmp_path, "s-hybrid")
     _write_jsonl(
@@ -447,3 +533,107 @@ def test_search_hybrid_mode_is_available_when_both_indexes_exist(tmp_path, monke
     assert "hybrid" in health["available_modes"]
     assert result["mode"] == "hybrid"
     assert result["hits"][0]["doc_id"] == "phone-doc"
+
+
+def test_search_defaults_to_hybrid_when_both_indexes_exist(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-hybrid-default")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+            {
+                "id": "market-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple market wrap",
+                    "content": "Apple demand remained steady in quarterly data.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    build_bm25_index(search_root / "corpus.jsonl", search_root / "bm25")
+    monkeypatch.setattr("tools.search.build_text_embedder", lambda **_: _FakeDenseEmbedder())
+    build_dense_index(search_root / "corpus.jsonl", search_root / "dense", overwrite=True, show_progress=False)
+
+    engine = SearchEngine(search_root)
+    health = engine.health()
+    result = engine.search("apple smartphone demand", source="news", time="2026-01-10", limit=1)
+
+    assert health["default_mode"] == "hybrid"
+    assert result["mode"] == "hybrid"
+    assert result["hits"][0]["doc_id"] == "phone-doc"
+
+
+def test_search_hybrid_reranker_reorders_final_hits(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-hybrid-rerank")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "market-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple market wrap",
+                    "content": "Apple demand remained steady in quarterly data.",
+                },
+            },
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    (search_root / "dense").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "tools.search._load_dense_searcher",
+        lambda _index_dir: _OrderedSearcher(
+            [
+                SimpleNamespace(row_index=0, score=8.0),
+                SimpleNamespace(row_index=1, score=7.0),
+            ]
+        ),
+    )
+    engine = SearchEngine(
+        search_root,
+        searcher_factory=lambda _index_dir: _OrderedSearcher(
+            [
+                SimpleNamespace(row_index=0, score=10.0),
+                SimpleNamespace(row_index=1, score=9.0),
+            ]
+        ),
+        retrieval_mode="hybrid",
+        reranker=_FakeReranker(),
+        rerank_candidate_limit=2,
+    )
+
+    health = engine.health()
+    result = engine.search("apple smartphone demand", source="news", time="2026-01-10", limit=1)
+
+    assert health["reranker_enabled"] is True
+    assert health["reranker_device"] == "cuda"
+    assert result["mode"] == "hybrid"
+    assert result["hits"][0]["doc_id"] == "phone-doc"
+    assert result["hits"][0]["retrieval_score"] < result["hits"][0]["score"]
+    assert result["hits"][0]["rerank_score"] == 10.0

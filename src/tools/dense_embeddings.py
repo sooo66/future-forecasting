@@ -8,7 +8,7 @@ from typing import Any
 
 
 DEFAULT_DENSE_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-_EMBEDDER_CACHE: dict[tuple[str, str | None], "HuggingFaceTextEmbedder"] = {}
+_EMBEDDER_CACHE: dict[tuple[str, str | None, int], "HuggingFaceTextEmbedder"] = {}
 
 
 @dataclass
@@ -75,12 +75,18 @@ def build_text_embedder(
     *,
     model_name: str = DEFAULT_DENSE_EMBEDDING_MODEL,
     device: str | None = None,
+    batch_size: int = 16,
 ) -> HuggingFaceTextEmbedder:
-    key = (model_name, device)
+    resolved_batch_size = max(1, int(batch_size or 16))
+    key = (model_name, device, resolved_batch_size)
     cached = _EMBEDDER_CACHE.get(key)
     if cached is not None:
         return cached
-    embedder = HuggingFaceTextEmbedder(model_name=model_name, device=device)
+    embedder = HuggingFaceTextEmbedder(
+        model_name=model_name,
+        device=device,
+        batch_size=resolved_batch_size,
+    )
     _EMBEDDER_CACHE[key] = embedder
     return embedder
 

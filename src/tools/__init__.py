@@ -4,6 +4,7 @@ from tools.bm25 import BM25Document, BM25Index, tokenize
 from tools.corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_TOKENS, DEFAULT_TOKENIZER_NAME, build_corpus
 from tools.openbb import call_openbb_function, list_supported_openbb_functions
 from tools.exa_search import ExaSearchClient
+from tools.rerankers import DEFAULT_RERANKER_MODEL, HuggingFaceTextReranker, build_text_reranker
 from tools.search import (
     SearchClient,
     SearchEngine,
@@ -23,12 +24,15 @@ __all__ = [
     "DEFAULT_CHUNK_OVERLAP",
     "DEFAULT_CHUNK_TOKENS",
     "DEFAULT_TOKENIZER_NAME",
+    "DEFAULT_RERANKER_MODEL",
     "ExaSearchClient",
+    "HuggingFaceTextReranker",
     "SearchClient",
     "SearchEngine",
     "build_bm25_index",
     "build_dense_index",
     "build_search_client",
+    "build_text_reranker",
     "build_corpus",
     "call_openbb_function",
     "create_app",

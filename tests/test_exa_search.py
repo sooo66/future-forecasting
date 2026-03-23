@@ -86,6 +86,20 @@ def test_build_search_client_does_not_reuse_local_search_base_for_exa(monkeypatc
     assert client.base_url == "https://api.exa.ai"
 
 
+def test_build_search_client_rejects_local_retrieval_mode_for_exa(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "secret")
+    monkeypatch.setattr("tools.exa_search._load_exa_class", lambda: _FakeExa)
+
+    try:
+        build_search_client(backend="exa", default_mode="hybrid")
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected build_search_client() to reject local retrieval modes for exa")
+
+    assert "search_retrieval_mode applies only to the local search backend" in message
+
+
 def test_exa_search_client_surfaces_proxy_context(monkeypatch):
     monkeypatch.setenv("EXA_API_KEY", "secret")
     monkeypatch.setenv("https_proxy", "http://127.0.0.1:7897")

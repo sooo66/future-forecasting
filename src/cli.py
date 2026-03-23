@@ -25,6 +25,7 @@ from experiments import get_experiment_spec, list_experiments
 from forecasting.runner import run_experiment
 from modules import DEFAULT_MODULES
 from tools.corpus import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_TOKENS, DEFAULT_TOKENIZER_NAME, build_corpus
+from tools.rerankers import DEFAULT_RERANKER_MODEL
 from tools.search import (
     build_bm25_index,
     build_dense_index,
@@ -246,6 +247,10 @@ def _run_search_serve_command(args: argparse.Namespace) -> int:
         search_root,
         log_dir=log_dir,
         retrieval_mode=_resolve_search_retrieval_mode_arg(args),
+        reranker_model_name=(args.reranker_model_name or "").strip() or None,
+        reranker_device=(args.reranker_device or "").strip() or None,
+        reranker_batch_size=int(args.reranker_batch_size),
+        rerank_candidate_limit=int(args.rerank_candidates),
     )
     uvicorn.run(app, host=args.host, port=int(args.port), log_level="info")
     return 0
@@ -323,7 +328,10 @@ def _run_search_build_index_command(args: argparse.Namespace) -> int:
             dense_dir,
             model_name=(args.embedding_model_name or "").strip() or "sentence-transformers/all-MiniLM-L6-v2",
             device=(args.embedding_device or "").strip() or None,
+            batch_size=int(args.embedding_batch_size),
+            workers=int(args.embedding_workers),
             overwrite=bool(args.force),
+            show_progress=not bool(args.no_progress),
         )
         logger.info(f"dense index written: {dense_dir}")
     return 0
@@ -479,6 +487,23 @@ def main() -> int:
         default="",
         help="Optional torch device override for dense embedding generation, e.g. cpu or cuda.",
     )
+    search_build_index.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=64,
+        help="Dense embedding batch size. Larger is faster but uses more memory.",
+    )
+    search_build_index.add_argument(
+        "--embedding-workers",
+        type=int,
+        default=0,
+        help="Dense embedding worker processes. 0 means auto; non-CPU devices are forced to 1.",
+    )
+    search_build_index.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable dense indexing progress output.",
+    )
     search_build_index.add_argument("--force", action="store_true", help="Overwrite an existing BM25 index directory.")
     search_build_index.add_argument("--verbose", action="store_true", help="Enable DEBUG logs on console")
 
@@ -489,6 +514,31 @@ def main() -> int:
         "--search-retrieval-mode",
         default="",
         help="Default retrieval mode for requests: bm25, dense, or hybrid.",
+    )
+    search_serve.add_argument(
+        "--reranker-model-name",
+        default="",
+        help=(
+            "Optional local reranker model for hybrid mode, e.g. "
+            f"{DEFAULT_RERANKER_MODEL}. Disabled when omitted."
+        ),
+    )
+    search_serve.add_argument(
+        "--reranker-device",
+        default="",
+        help="Optional torch device override for reranking, e.g. cuda or cpu.",
+    )
+    search_serve.add_argument(
+        "--reranker-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for reranker inference.",
+    )
+    search_serve.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=40,
+        help="How many hybrid first-stage candidates to rerank before truncating to the requested limit.",
     )
     search_serve.add_argument("--host", default="127.0.0.1", help="Host to bind the search API server")
     search_serve.add_argument("--port", type=int, default=8000, help="Port to bind the search API server")

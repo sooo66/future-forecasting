@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import importlib
+from itertools import repeat
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Callable, Optional, Sequence
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI
+from loguru import logger
 from pydantic import BaseModel
 
 from core.io import MODULE_OUTPUT_PATHS
 from tools.dense_embeddings import DEFAULT_DENSE_EMBEDDING_MODEL, build_text_embedder
+from tools.rerankers import build_text_reranker
 from utils.time_utils import to_day
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is optional at import time
+    tqdm = None  # type: ignore[assignment]
 
 
 _DEFAULT_BASE_DIR = "data/benchmark"
@@ -31,6 +41,12 @@ _BM25S_METHOD = "lucene"
 _RETRIEVAL_MODES = {"bm25", "dense", "hybrid"}
 _DEFAULT_RETRIEVAL_MODE = "bm25"
 _DEFAULT_RRF_K = 60
+_DEFAULT_DENSE_BATCH_SIZE = 64
+_DEFAULT_DENSE_AUTO_WORKERS = 0
+_DEFAULT_DENSE_MAX_AUTO_WORKERS = 4
+_DEFAULT_DENSE_MIN_PARALLEL_ROWS = 256
+_DEFAULT_RERANK_CANDIDATE_LIMIT = 40
+_DEFAULT_RERANKER_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -130,13 +146,19 @@ def build_dense_index(
     *,
     model_name: str = DEFAULT_DENSE_EMBEDDING_MODEL,
     device: str | None = None,
+    batch_size: int = _DEFAULT_DENSE_BATCH_SIZE,
+    workers: int = _DEFAULT_DENSE_AUTO_WORKERS,
     overwrite: bool = False,
+    show_progress: bool | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
     corpus_path = Path(corpus_path).expanduser().resolve()
     index_dir = Path(index_dir).expanduser().resolve()
     if not corpus_path.exists():
         raise FileNotFoundError(f"Corpus file does not exist: {corpus_path}")
     np = _load_numpy_module()
+    resolved_batch_size = max(1, int(batch_size or _DEFAULT_DENSE_BATCH_SIZE))
+    resolved_device = _resolve_dense_device(device)
 
     if index_dir.exists():
         if not overwrite:
@@ -148,18 +170,94 @@ def build_dense_index(
 
     rows = list(_iter_corpus_rows(corpus_path))
     texts = [str(row.get("contents") or row.get("content") or row.get("title") or "") for row in rows]
-    embedder = build_text_embedder(model_name=model_name, device=device)
-    embeddings = embedder.embed_texts(texts)
-    matrix = np.asarray(embeddings, dtype="float32")
-    np.save(index_dir / "embeddings.npy", matrix, allow_pickle=False)
+    resolved_workers = _resolve_dense_worker_count(
+        requested_workers=workers,
+        device=resolved_device,
+        row_count=len(texts),
+    )
+    logger.info(
+        "building dense index: passages={} model={} device={} batch_size={} workers={}",
+        len(texts),
+        model_name,
+        resolved_device,
+        resolved_batch_size,
+        resolved_workers,
+    )
+
+    embeddings_path = index_dir / "embeddings.npy"
+    matrix = None
+    dimension = 0
+    completed = 0
+    started = time.perf_counter()
+    progress_bar = _create_dense_progress_bar(
+        total=len(texts),
+        show_progress=show_progress,
+        description="dense index",
+    )
+
+    batch_arrays = _iter_dense_embedding_batches(
+        texts,
+        model_name=model_name,
+        device=resolved_device,
+        batch_size=resolved_batch_size,
+        workers=resolved_workers,
+    )
+    try:
+        for batch_array in batch_arrays:
+            batch_matrix = np.asarray(batch_array, dtype="float32")
+            if batch_matrix.ndim != 2:
+                raise ValueError("Dense embedding model must return a 2D array-like result")
+            if matrix is None:
+                dimension = int(batch_matrix.shape[1]) if batch_matrix.shape[0] else 0
+                matrix = np.lib.format.open_memmap(
+                    embeddings_path,
+                    mode="w+",
+                    dtype="float32",
+                    shape=(len(rows), dimension),
+                )
+            next_completed = completed + int(batch_matrix.shape[0])
+            matrix[completed:next_completed] = batch_matrix
+            completed = next_completed
+            _update_dense_progress(
+                progress_bar,
+                batch_size=int(batch_matrix.shape[0]),
+                completed=completed,
+                total=len(texts),
+                started=started,
+                callback=progress_callback,
+            )
+    finally:
+        close = getattr(batch_arrays, "close", None)
+        if callable(close):
+            close()
+        if progress_bar is not None:
+            progress_bar.close()
+
+    if matrix is None:
+        empty = np.empty((0, 0), dtype="float32")
+        np.save(embeddings_path, empty, allow_pickle=False)
+    else:
+        matrix.flush()
+
     metadata = {
         "model_name": model_name,
         "corpus_size": len(rows),
-        "dimension": int(matrix.shape[1]) if matrix.ndim == 2 else 0,
+        "dimension": dimension,
+        "device": resolved_device,
+        "batch_size": resolved_batch_size,
+        "workers": resolved_workers,
     }
     (index_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "dense index complete: passages={} dimension={} elapsed={:.2f}s output={}",
+        len(rows),
+        dimension,
+        elapsed,
+        index_dir,
     )
     return index_dir
 
@@ -219,12 +317,16 @@ class SearchEngine:
         *,
         searcher_factory: Callable[[Path], Any] | None = None,
         retrieval_mode: str | None = None,
+        reranker: Any | None = None,
+        rerank_candidate_limit: int = _DEFAULT_RERANK_CANDIDATE_LIMIT,
     ) -> None:
         self.search_root = Path(search_root).expanduser().resolve()
         self.corpus_path = self.search_root / "corpus.jsonl"
         self.index_dir = self.search_root / "bm25"
         self.dense_index_dir = self.search_root / "dense"
         self.stats_path = self.search_root / "stats.json"
+        self._reranker = reranker
+        self._rerank_candidate_limit = max(1, int(rerank_candidate_limit or _DEFAULT_RERANK_CANDIDATE_LIMIT))
         if not self.corpus_path.exists():
             raise FileNotFoundError(f"Search corpus does not exist: {self.corpus_path}")
 
@@ -246,7 +348,7 @@ class SearchEngine:
                 f"No search index found under {self.search_root}. Build BM25 and/or dense indexes first."
             )
         requested_mode = resolve_search_retrieval_mode(retrieval_mode)
-        self.retrieval_mode = requested_mode or self.available_modes[0]
+        self.retrieval_mode = requested_mode or _select_default_retrieval_mode(self.available_modes)
         if self.retrieval_mode not in self.available_modes:
             raise ValueError(
                 f"Retrieval mode {self.retrieval_mode!r} is unavailable. "
@@ -273,10 +375,12 @@ class SearchEngine:
             )
 
         max_hits = max(1, min(int(limit or 5), 20))
+        rerank_enabled = self._should_rerank(retrieval_mode)
+        target_hits = max_hits if not rerank_enabled else max(max_hits, self._rerank_candidate_limit)
         before_day = _normalize_day(time) if time else None
         source_filters = _parse_source_filters(source)
         filtered_hits: list[dict[str, Any]] = []
-        fetch_k = min(_MAX_FETCH_LIMIT, max(_DEFAULT_FETCH_MIN, max_hits * _DEFAULT_FETCH_MULTIPLIER))
+        fetch_k = min(_MAX_FETCH_LIMIT, max(_DEFAULT_FETCH_MIN, target_hits * _DEFAULT_FETCH_MULTIPLIER))
 
         while True:
             raw_hits = list(self._search(query, fetch_k, mode=retrieval_mode))
@@ -288,11 +392,14 @@ class SearchEngine:
                 if not _row_matches(row, source_filters=source_filters, before_day=before_day):
                     continue
                 filtered_hits.append(_row_to_hit(row, score=float(getattr(hit, "score", 0.0))))
-                if len(filtered_hits) >= max_hits:
+                if len(filtered_hits) >= target_hits:
                     break
-            if len(filtered_hits) >= max_hits or len(raw_hits) < fetch_k or fetch_k >= _MAX_FETCH_LIMIT:
+            if len(filtered_hits) >= target_hits or len(raw_hits) < fetch_k or fetch_k >= _MAX_FETCH_LIMIT:
                 break
             fetch_k = min(_MAX_FETCH_LIMIT, fetch_k * 2)
+
+        if rerank_enabled and filtered_hits:
+            filtered_hits = self._rerank_hits(query, filtered_hits[:target_hits])
 
         return {
             "snapshot_root": str(self.snapshot_root),
@@ -315,6 +422,10 @@ class SearchEngine:
             "dense_index_dir": str(self.dense_index_dir),
             "default_mode": self.retrieval_mode,
             "available_modes": list(self.available_modes),
+            "reranker_enabled": self._reranker is not None,
+            "rerank_candidate_limit": self._rerank_candidate_limit if self._reranker is not None else 0,
+            "reranker_model": getattr(self._reranker, "model_name", None),
+            "reranker_device": _reranker_device_label(self._reranker),
         }
 
     def _resolve_available_modes(self) -> list[str]:
@@ -346,6 +457,28 @@ class SearchEngine:
         ordered = sorted(fused.items(), key=lambda item: item[1], reverse=True)
         return [_SearchHit(row_index=row_index, score=score) for row_index, score in ordered[:k]]
 
+    def _should_rerank(self, mode: str) -> bool:
+        return self._reranker is not None and mode == "hybrid"
+
+    def _rerank_hits(self, query: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        texts = [_hit_text_for_reranking(hit) for hit in hits]
+        scores = list(self._reranker.score(query, texts))
+        if len(scores) != len(hits):
+            raise ValueError(
+                f"Reranker returned {len(scores)} scores for {len(hits)} hits"
+            )
+        ranked: list[tuple[float, float, int, dict[str, Any]]] = []
+        for order, (hit, score) in enumerate(zip(hits, scores)):
+            retrieval_score = float(hit.get("score", 0.0))
+            rerank_score = float(score)
+            enriched = dict(hit)
+            enriched["retrieval_score"] = round(retrieval_score, 4)
+            enriched["rerank_score"] = round(rerank_score, 4)
+            enriched["score"] = round(rerank_score, 4)
+            ranked.append((rerank_score, retrieval_score, -order, enriched))
+        ranked.sort(reverse=True)
+        return [item[3] for item in ranked]
+
 
 def create_app(
     search_root: Path,
@@ -353,8 +486,34 @@ def create_app(
     log_dir: Path | None = None,
     searcher_factory: Callable[[Path], Any] | None = None,
     retrieval_mode: str | None = None,
+    reranker: Any | None = None,
+    reranker_model_name: str | None = None,
+    reranker_device: str | None = None,
+    reranker_batch_size: int = _DEFAULT_RERANKER_BATCH_SIZE,
+    rerank_candidate_limit: int = _DEFAULT_RERANK_CANDIDATE_LIMIT,
 ) -> FastAPI:
-    engine = SearchEngine(search_root, searcher_factory=searcher_factory, retrieval_mode=retrieval_mode)
+    resolved_reranker = reranker
+    resolved_reranker_model = str(reranker_model_name or "").strip()
+    if resolved_reranker is None and resolved_reranker_model:
+        logger.info(
+            "enabling hybrid reranker: model={} device={} batch_size={} candidates={}",
+            resolved_reranker_model,
+            (reranker_device or "").strip() or "auto",
+            max(1, int(reranker_batch_size or _DEFAULT_RERANKER_BATCH_SIZE)),
+            max(1, int(rerank_candidate_limit or _DEFAULT_RERANK_CANDIDATE_LIMIT)),
+        )
+        resolved_reranker = build_text_reranker(
+            model_name=resolved_reranker_model,
+            device=(reranker_device or "").strip() or None,
+            batch_size=int(reranker_batch_size or _DEFAULT_RERANKER_BATCH_SIZE),
+        )
+    engine = SearchEngine(
+        search_root,
+        searcher_factory=searcher_factory,
+        retrieval_mode=retrieval_mode,
+        reranker=resolved_reranker,
+        rerank_candidate_limit=rerank_candidate_limit,
+    )
     request_log_path = ((log_dir or Path.cwd() / _DEFAULT_LOG_DIR).resolve() / "requests.jsonl")
     app = FastAPI(title="future-forecasting-search", version="2.0.0")
 
@@ -479,6 +638,171 @@ def _load_dense_searcher(index_dir: Path) -> Any:
     np = _load_numpy_module()
     embeddings = np.load(embeddings_path, mmap_mode="r")
     return _DenseSearcher(embeddings=embeddings, embedder=embedder)
+
+
+def _reranker_device_label(reranker: Any | None) -> str | None:
+    if reranker is None:
+        return None
+    value = getattr(reranker, "resolved_device", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raw = getattr(reranker, "device", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _select_default_retrieval_mode(available_modes: Sequence[str]) -> str:
+    for candidate in ("hybrid", "dense", "bm25"):
+        if candidate in available_modes:
+            return candidate
+    return available_modes[0]
+
+
+def _resolve_dense_device(device: str | None) -> str:
+    value = str(device or "").strip().lower()
+    if value:
+        return value
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _resolve_dense_worker_count(*, requested_workers: int, device: str, row_count: int) -> int:
+    requested = int(requested_workers or 0)
+    if requested < 0:
+        raise ValueError("workers must be >= 0")
+    normalized_device = str(device or "cpu").strip().lower()
+    if normalized_device and normalized_device != "cpu":
+        return 1
+    cpu_count = os.cpu_count() or 1
+    if requested > 0:
+        return max(1, min(requested, cpu_count))
+    if cpu_count <= 1 or row_count < _DEFAULT_DENSE_MIN_PARALLEL_ROWS:
+        return 1
+    return max(1, min(cpu_count, _DEFAULT_DENSE_MAX_AUTO_WORKERS))
+
+
+def _iter_dense_embedding_batches(
+    texts: Sequence[str],
+    *,
+    model_name: str,
+    device: str,
+    batch_size: int,
+    workers: int,
+):
+    if not texts:
+        return
+    if workers <= 1:
+        embedder = build_text_embedder(
+            model_name=model_name,
+            device=device,
+            batch_size=batch_size,
+        )
+        for batch in _iter_text_batches(texts, batch_size):
+            yield embedder.embed_texts(batch)
+        return
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for batch_embeddings in executor.map(
+            _embed_dense_batch_worker,
+            _iter_text_batches(texts, batch_size),
+            repeat(model_name),
+            repeat(device),
+            repeat(batch_size),
+        ):
+            yield batch_embeddings
+
+
+def _embed_dense_batch_worker(
+    texts: Sequence[str],
+    model_name: str,
+    device: str,
+    batch_size: int,
+) -> list[list[float]]:
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if str(device or "").strip().lower() == "cpu":
+        try:
+            import torch
+
+            torch.set_num_threads(1)
+            if hasattr(torch, "set_num_interop_threads"):
+                torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+    embedder = build_text_embedder(
+        model_name=model_name,
+        device=device,
+        batch_size=batch_size,
+    )
+    return embedder.embed_texts(list(texts))
+
+
+def _create_dense_progress_bar(*, total: int, show_progress: bool | None, description: str):
+    if total <= 0 or tqdm is None:
+        return None
+    enabled = bool(show_progress) if show_progress is not None else sys.stderr.isatty()
+    if not enabled:
+        return None
+    return tqdm(
+        total=total,
+        desc=description,
+        unit="passage",
+        dynamic_ncols=True,
+    )
+
+
+def _iter_text_batches(texts: Sequence[str], batch_size: int):
+    for start in range(0, len(texts), batch_size):
+        yield list(texts[start : start + batch_size])
+
+
+def _update_dense_progress(
+    progress_bar: Any,
+    *,
+    batch_size: int,
+    completed: int,
+    total: int,
+    started: float,
+    callback: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    elapsed = max(0.0, time.perf_counter() - started)
+    eta_seconds = None
+    if completed > 0 and total > completed:
+        rate = completed / max(elapsed, 1e-9)
+        if rate > 0:
+            eta_seconds = (total - completed) / rate
+    if progress_bar is not None:
+        progress_bar.update(batch_size)
+        if eta_seconds is not None:
+            progress_bar.set_postfix_str(f"eta={int(eta_seconds)}s")
+    if callback is not None:
+        callback(
+            {
+                "completed": completed,
+                "total": total,
+                "batch_size": batch_size,
+                "elapsed_seconds": elapsed,
+                "eta_seconds": eta_seconds,
+            }
+        )
+
+
+def _hit_text_for_reranking(hit: dict[str, Any]) -> str:
+    title = str(hit.get("title") or "").strip()
+    content = str(hit.get("content") or "").strip()
+    if not title:
+        return content
+    if not content:
+        return title
+    if content.lower().startswith(title.lower()):
+        return content
+    return f"{title}\n{content}"
 
 
 def _iter_corpus_rows(corpus_path: Path) -> list[dict[str, Any]]:

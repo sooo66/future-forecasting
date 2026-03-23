@@ -16,7 +16,6 @@ from forecasting.evaluation import render_experiment_summary, summarize_results
 from forecasting.llm import OpenAIChatModel
 from forecasting.methods._agentic_shared import build_failed_result, serialize_config
 from forecasting.registry import get_method
-from tools.search import SearchClient
 from tools.search_clients import build_search_client, resolve_search_backend
 
 try:
@@ -70,15 +69,12 @@ def run_experiment(
     llm = OpenAIChatModel(project_root)
     expected_snapshot_root = str((project_root / spec.knowledge_root).resolve())
     resolved_search_backend = resolve_search_backend(search_backend)
-    if resolved_search_backend == "exa":
-        search_client = build_search_client(
-            base_url=None,
-            default_mode=search_retrieval_mode,
-            backend=resolved_search_backend,
-            exa_base_url=None,
-        )
-    else:
-        search_client = SearchClient(search_api_base, default_mode=search_retrieval_mode)
+    search_client = build_search_client(
+        base_url=search_api_base,
+        default_mode=search_retrieval_mode,
+        backend=resolved_search_backend,
+        exa_base_url=None,
+    )
     search_health = search_client.health()
     actual_snapshot_root = str(search_health.get("snapshot_root") or "")
     if resolved_search_backend == "local" and actual_snapshot_root and actual_snapshot_root != expected_snapshot_root:
