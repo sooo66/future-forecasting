@@ -664,6 +664,41 @@ def _load_dense_searcher(index_dir: Path) -> Any:
     return _DenseSearcher(embeddings=embeddings, embedder=embedder)
 
 
+def is_bm25_index_complete(corpus_path: Path, index_dir: Path) -> bool:
+    corpus_path = Path(corpus_path).expanduser().resolve()
+    index_dir = Path(index_dir).expanduser().resolve()
+    if not corpus_path.exists() or not index_dir.exists():
+        return False
+    try:
+        _load_bm25s_searcher(index_dir, _count_corpus_rows(corpus_path))
+    except Exception:
+        return False
+    return True
+
+
+def is_dense_index_complete(index_dir: Path) -> bool:
+    index_dir = Path(index_dir).expanduser().resolve()
+    metadata_path = index_dir / "metadata.json"
+    embeddings_path = index_dir / "embeddings.npy"
+    if not metadata_path.exists() or not embeddings_path.exists():
+        return False
+    try:
+        metadata = _read_json(metadata_path)
+        np = _load_numpy_module()
+        embeddings = np.load(embeddings_path, mmap_mode="r")
+    except Exception:
+        return False
+    if getattr(embeddings, "ndim", 0) != 2:
+        return False
+    corpus_size = int(metadata.get("corpus_size") or 0)
+    dimension = int(metadata.get("dimension") or 0)
+    if int(embeddings.shape[0]) != corpus_size:
+        return False
+    if corpus_size > 0 and int(embeddings.shape[1]) != dimension:
+        return False
+    return True
+
+
 def _reranker_device_label(reranker: Any | None) -> str | None:
     if reranker is None:
         return None
@@ -883,6 +918,15 @@ def _iter_corpus_rows(corpus_path: Path) -> list[dict[str, Any]]:
                 continue
             rows.append(json.loads(line))
     return rows
+
+
+def _count_corpus_rows(corpus_path: Path) -> int:
+    count = 0
+    with corpus_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                count += 1
+    return count
 
 
 def _load_rows_by_id(corpus_path: Path) -> dict[str, dict[str, Any]]:

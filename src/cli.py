@@ -33,6 +33,8 @@ from tools.search import (
     default_search_log_dir,
     default_search_root,
     find_latest_snapshot_root,
+    is_bm25_index_complete,
+    is_dense_index_complete,
     resolve_search_api_base,
     resolve_search_retrieval_mode,
 )
@@ -317,28 +319,63 @@ def _run_search_build_index_command(args: argparse.Namespace) -> int:
     )
     corpus_path = search_root / "corpus.jsonl"
     retrieval_mode = _resolve_search_retrieval_mode_arg(args) or "bm25"
+    build_targets: dict[str, dict[str, object]] = {}
     if retrieval_mode in {"bm25", "hybrid"}:
         bm25_dir = search_root / "bm25"
-        build_bm25_index(
-            corpus_path,
-            bm25_dir,
-            overwrite=bool(args.force),
-            show_progress=not bool(args.no_progress),
-        )
-        logger.info(f"bm25 index written: {bm25_dir}")
+        build_targets["bm25"] = {
+            "dir": bm25_dir,
+            "complete": is_bm25_index_complete(corpus_path, bm25_dir),
+        }
     if retrieval_mode in {"dense", "hybrid"}:
         dense_dir = search_root / "dense"
-        build_dense_index(
-            corpus_path,
-            dense_dir,
-            model_name=(args.embedding_model_name or "").strip() or "sentence-transformers/all-MiniLM-L6-v2",
-            device=(args.embedding_device or "").strip() or None,
-            batch_size=int(args.embedding_batch_size),
-            workers=int(args.embedding_workers),
-            overwrite=bool(args.force),
-            show_progress=not bool(args.no_progress),
+        build_targets["dense"] = {
+            "dir": dense_dir,
+            "complete": is_dense_index_complete(dense_dir),
+        }
+
+    rebuild_complete_indexes = bool(args.force) and all(
+        bool(target["complete"]) for target in build_targets.values()
+    )
+    if build_targets:
+        logger.info(
+            "index status: {}",
+            ", ".join(
+                f"{name}={'complete' if target['complete'] else 'missing_or_incomplete'}"
+                for name, target in build_targets.items()
+            ),
         )
-        logger.info(f"dense index written: {dense_dir}")
+
+    if "bm25" in build_targets:
+        bm25_dir = Path(build_targets["bm25"]["dir"])
+        bm25_complete = bool(build_targets["bm25"]["complete"])
+        if bm25_complete and not rebuild_complete_indexes:
+            logger.info(f"reusing existing bm25 index: {bm25_dir}")
+        else:
+            build_bm25_index(
+                corpus_path,
+                bm25_dir,
+                overwrite=bm25_dir.exists(),
+                show_progress=not bool(args.no_progress),
+            )
+            logger.info(f"bm25 index written: {bm25_dir}")
+
+    if "dense" in build_targets:
+        dense_dir = Path(build_targets["dense"]["dir"])
+        dense_complete = bool(build_targets["dense"]["complete"])
+        if dense_complete and not rebuild_complete_indexes:
+            logger.info(f"reusing existing dense index: {dense_dir}")
+        else:
+            build_dense_index(
+                corpus_path,
+                dense_dir,
+                model_name=(args.embedding_model_name or "").strip() or "sentence-transformers/all-MiniLM-L6-v2",
+                device=(args.embedding_device or "").strip() or None,
+                batch_size=int(args.embedding_batch_size),
+                workers=int(args.embedding_workers),
+                overwrite=dense_dir.exists(),
+                show_progress=not bool(args.no_progress),
+            )
+            logger.info(f"dense index written: {dense_dir}")
     return 0
 
 
@@ -509,7 +546,11 @@ def main() -> int:
         action="store_true",
         help="Disable dense indexing progress output.",
     )
-    search_build_index.add_argument("--force", action="store_true", help="Overwrite an existing BM25 index directory.")
+    search_build_index.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild complete target indexes too. Without this flag, complete indexes are reused and incomplete ones are rebuilt automatically.",
+    )
     search_build_index.add_argument("--verbose", action="store_true", help="Enable DEBUG logs on console")
 
     search_serve = search_sub.add_parser("serve", help="Serve the local search API for one snapshot")

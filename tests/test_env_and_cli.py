@@ -5,7 +5,7 @@ import json
 from argparse import Namespace
 from types import SimpleNamespace
 
-from cli import _build_llm_config, _list_experiment_specs, _parse_methods_override, _resolve_agent_prompt, _resolve_search_api_base, _resolve_snapshot_root, _run_experiment_command, _run_experiment_pretty_command
+from cli import _build_llm_config, _list_experiment_specs, _parse_methods_override, _resolve_agent_prompt, _resolve_search_api_base, _resolve_snapshot_root, _run_experiment_command, _run_experiment_pretty_command, _run_search_build_index_command
 from utils.env import load_dotenv
 
 
@@ -160,3 +160,43 @@ def test_run_experiment_pretty_command_writes_output_file(tmp_path):
     assert exit_code == 0
     assert output_path.exists()
     assert json.loads(output_path.read_text(encoding="utf-8")) == [{"market_id": "m-1"}]
+
+
+def test_search_build_index_reuses_complete_bm25_when_dense_needs_rebuild(monkeypatch, tmp_path):
+    search_root = tmp_path / "search"
+    search_root.mkdir(parents=True)
+    (search_root / "corpus.jsonl").write_text('{"id":"x"}\n', encoding="utf-8")
+    (search_root / "bm25").mkdir()
+    (search_root / "dense").mkdir()
+
+    calls: list[tuple[str, bool]] = []
+
+    monkeypatch.setattr("cli.setup_logger", lambda *args, **kwargs: None)
+    monkeypatch.setattr("cli.is_bm25_index_complete", lambda corpus_path, index_dir: True)
+    monkeypatch.setattr("cli.is_dense_index_complete", lambda index_dir: False)
+    monkeypatch.setattr(
+        "cli.build_bm25_index",
+        lambda corpus_path, index_dir, **kwargs: calls.append(("bm25", bool(kwargs.get("overwrite")))),
+    )
+    monkeypatch.setattr(
+        "cli.build_dense_index",
+        lambda corpus_path, index_dir, **kwargs: calls.append(("dense", bool(kwargs.get("overwrite")))),
+    )
+
+    exit_code = _run_search_build_index_command(
+        Namespace(
+            snapshot_root="",
+            search_root=str(search_root),
+            search_retrieval_mode="hybrid",
+            embedding_model_name="BAAI/bge-small-en-v1.5",
+            embedding_device="cuda",
+            embedding_batch_size=256,
+            embedding_workers=1,
+            no_progress=False,
+            force=True,
+            verbose=False,
+        )
+    )
+
+    assert exit_code == 0
+    assert calls == [("dense", True)]

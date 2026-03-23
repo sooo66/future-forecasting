@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 from typing import Any
 
+from loguru import logger
+
 
 DEFAULT_DENSE_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _EMBEDDER_CACHE: dict[tuple[str, str | None, int], "HuggingFaceTextEmbedder"] = {}
@@ -20,30 +22,30 @@ class HuggingFaceTextEmbedder:
     _model: Any = None
     _tokenizer: Any = None
     _torch: Any = None
+    _device: str | None = None
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         self._ensure_loaded()
-        outputs: list[list[float]] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start : start + self.batch_size]
-            encoded = self._tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
+        try:
+            return self._embed_texts_impl(texts)
+        except Exception as exc:
+            if not _is_cuda_runtime_error(exc) or str(self._device or "").lower() == "cpu":
+                raise
+            failed_device = str(self._device or self.device or "cuda")
+            logger.warning(
+                "dense embedding failed on device {} with CUDA error; falling back to CPU. error={}",
+                failed_device,
+                exc,
             )
-            encoded = {key: value.to(self._device) for key, value in encoded.items()}
-            with self._torch.no_grad():
-                model_output = self._model(**encoded)
-            attention_mask = encoded["attention_mask"]
-            token_embeddings = model_output.last_hidden_state
-            pooled = _mean_pool(self._torch, token_embeddings, attention_mask)
-            normalized = self._torch.nn.functional.normalize(pooled, p=2, dim=1)
-            outputs.extend(normalized.cpu().tolist())
-        return outputs
+            self._move_to_device("cpu")
+            return self._embed_texts_impl(texts)
+
+    @property
+    def resolved_device(self) -> str:
+        self._ensure_loaded()
+        return str(self._device or "cpu")
 
     def _ensure_loaded(self) -> None:
         if self._model is not None and self._tokenizer is not None:
@@ -68,7 +70,49 @@ class HuggingFaceTextEmbedder:
                 message += f" Active proxy env: {proxy_hint}"
             raise RuntimeError(message) from exc
         self._model.eval()
-        self._model.to(self._device)
+        try:
+            self._move_to_device(self._device)
+        except Exception as exc:
+            if not _is_cuda_runtime_error(exc) or str(self._device or "").lower() == "cpu":
+                raise
+            failed_device = str(self._device)
+            logger.warning(
+                "dense embedding model could not initialize on device {} due to CUDA error; falling back to CPU. error={}",
+                failed_device,
+                exc,
+            )
+            self._move_to_device("cpu")
+
+    def _embed_texts_impl(self, texts: list[str]) -> list[list[float]]:
+        outputs: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            encoded = self._tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self._device) for key, value in encoded.items()}
+            with self._torch.no_grad():
+                model_output = self._model(**encoded)
+            attention_mask = encoded["attention_mask"]
+            token_embeddings = model_output.last_hidden_state
+            pooled = _mean_pool(self._torch, token_embeddings, attention_mask)
+            normalized = self._torch.nn.functional.normalize(pooled, p=2, dim=1)
+            outputs.extend(normalized.cpu().tolist())
+        return outputs
+
+    def _move_to_device(self, device: str | None) -> None:
+        target = str(device or "cpu").strip() or "cpu"
+        self._model.to(target)
+        self._device = target
+        if target == "cpu" and self._torch is not None and hasattr(self._torch, "cuda"):
+            try:
+                self._torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 def build_text_embedder(
@@ -112,3 +156,8 @@ def _active_proxy_summary() -> str:
         if value:
             entries.append(f"{key}={value}")
     return ", ".join(entries)
+
+
+def _is_cuda_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda" in message
