@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 import inspect
+import json
 import os
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -23,6 +25,12 @@ _PROXY_ENV_KEYS = [
     "all_proxy",
     "ALL_PROXY",
 ]
+_YFINANCE_MIN_INTERVAL_SECONDS = float(os.getenv("YFINANCE_MIN_INTERVAL_SECONDS", "1.5") or 1.5)
+_YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS", "60") or 60.0)
+_YFINANCE_CALL_LOCK = threading.Lock()
+_YFINANCE_LAST_CALL_AT = 0.0
+_YFINANCE_COOLDOWN_UNTIL = 0.0
+_OPENBB_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -122,11 +130,16 @@ def call_openbb_function(
     spec = SAFE_OPENBB_FUNCTIONS[raw_function]
     if spec.default_provider and "provider" not in payload:
         payload["provider"] = spec.default_provider
+    cache_key = _make_openbb_cache_key(raw_function, payload)
+    cached_payload = _OPENBB_RESULT_CACHE.get(cache_key)
+    if cached_payload is not None:
+        return {**cached_payload, "cache_hit": True}
 
     invoke = invoker or _invoke_openbb
     try:
         result = _invoke_with_retry(raw_function, payload, invoke=invoke)
     except Exception as exc:
+        cooldown_remaining = _yfinance_cooldown_remaining(payload)
         error_payload = {
             "function": raw_function,
             "params": _sanitize(payload),
@@ -136,6 +149,15 @@ def call_openbb_function(
             error_payload["retryable"] = True
             error_payload["provider"] = payload.get("provider")
             error_payload["error_type"] = "rate_limit"
+            if cooldown_remaining > 0:
+                error_payload["cooldown_seconds"] = cooldown_remaining
+            if cached_payload is not None:
+                return {
+                    **cached_payload,
+                    "cache_hit": True,
+                    "warning": "Returned cached OpenBB result after yfinance rate limit.",
+                    "stale_cache": True,
+                }
         return {
             **error_payload,
         }
@@ -152,12 +174,14 @@ def call_openbb_function(
         returned = normalized
         result_count = None
 
-    return {
+    response_payload = {
         "function": raw_function,
         "params": _sanitize(payload),
         "result_count": result_count,
         "results": returned,
     }
+    _OPENBB_RESULT_CACHE[cache_key] = response_payload
+    return response_payload
 
 
 def _invoke_openbb(function: str, params: dict[str, Any]) -> Any:
@@ -178,9 +202,11 @@ def _invoke_with_retry(
         if delay > 0:
             time.sleep(delay)
         try:
+            _guard_yfinance_request(params)
             return invoke(function, params)
         except Exception as exc:
             last_exc = exc
+            _record_yfinance_result(params, exc)
             if not _is_openbb_rate_limit_error(exc) or index == len(delays) - 1:
                 raise
     if last_exc is not None:
@@ -192,7 +218,12 @@ def _is_openbb_rate_limit_error(exc: Exception) -> bool:
     if isinstance(exc, YFRateLimitError):
         return True
     message = str(exc).lower()
-    return "too many requests" in message or "rate limit" in message or "ratelimit" in message
+    return (
+        "too many requests" in message
+        or "rate limit" in message
+        or "ratelimit" in message
+        or "yfinance cooldown active" in message
+    )
 
 
 def _resolve_openbb_callable(function: str) -> Callable[..., Any]:
@@ -225,6 +256,54 @@ def _sanitize(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
     return value
+
+
+def _make_openbb_cache_key(function: str, params: dict[str, Any]) -> str:
+    payload = {
+        "function": function,
+        "params": _sanitize(params),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _uses_yfinance(params: dict[str, Any]) -> bool:
+    return str(params.get("provider") or "").strip().lower() == "yfinance"
+
+
+def _guard_yfinance_request(params: dict[str, Any]) -> None:
+    if not _uses_yfinance(params):
+        return
+    global _YFINANCE_LAST_CALL_AT
+    with _YFINANCE_CALL_LOCK:
+        now = time.monotonic()
+        if _YFINANCE_COOLDOWN_UNTIL > now:
+            remaining = _YFINANCE_COOLDOWN_UNTIL - now
+            raise RuntimeError(f"yfinance cooldown active for {remaining:.1f}s after rate limiting")
+        wait_for = (_YFINANCE_LAST_CALL_AT + _YFINANCE_MIN_INTERVAL_SECONDS) - now
+        if wait_for > 0:
+            time.sleep(wait_for)
+        _YFINANCE_LAST_CALL_AT = time.monotonic()
+
+
+def _record_yfinance_result(params: dict[str, Any], exc: Exception | None) -> None:
+    if not _uses_yfinance(params):
+        return
+    global _YFINANCE_COOLDOWN_UNTIL
+    if exc is None:
+        return
+    if _is_openbb_rate_limit_error(exc):
+        with _YFINANCE_CALL_LOCK:
+            _YFINANCE_COOLDOWN_UNTIL = max(
+                _YFINANCE_COOLDOWN_UNTIL,
+                time.monotonic() + _YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS,
+            )
+
+
+def _yfinance_cooldown_remaining(params: dict[str, Any]) -> int | None:
+    if not _uses_yfinance(params):
+        return None
+    remaining = int(max(0.0, _YFINANCE_COOLDOWN_UNTIL - time.monotonic()))
+    return remaining or None
 
 
 @contextmanager

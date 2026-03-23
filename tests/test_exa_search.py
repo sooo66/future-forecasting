@@ -30,6 +30,15 @@ class _FakeExa:
         )
 
 
+class _FailingExa:
+    def __init__(self, api_key, base_url="https://api.exa.ai", user_agent=None):
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def search(self, query, **kwargs):
+        raise RuntimeError("proxy connection failed")
+
+
 def test_exa_search_client_maps_response(monkeypatch):
     fake = _FakeExa("secret")
     monkeypatch.setenv("EXA_API_KEY", "secret")
@@ -49,7 +58,7 @@ def test_exa_search_client_maps_response(monkeypatch):
     assert result["backend"] == "exa"
     assert result["hits"][0]["doc_id"] == "exa-doc-1"
     assert result["hits"][0]["source"] == "info/news"
-    assert result["hits"][0]["content"] == "Nvidia demand remained strong through the quarter."
+    assert result["hits"][0]["content"] == "Nvidia supply chain update\nNvidia demand remained strong through the quarter."
 
 
 def test_build_search_client_selects_exa_backend(monkeypatch):
@@ -74,3 +83,21 @@ def test_build_search_client_does_not_reuse_local_search_base_for_exa(monkeypatc
 
     assert isinstance(client, ExaSearchClient)
     assert client.base_url == "https://api.exa.ai"
+
+
+def test_exa_search_client_surfaces_proxy_context(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "secret")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7897")
+    monkeypatch.setattr("tools.exa_search._load_exa_class", lambda: _FailingExa)
+
+    client = ExaSearchClient()
+
+    try:
+        client.search("Latest news on Nvidia")
+    except RuntimeError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected ExaSearchClient.search() to raise")
+
+    assert "Exa search request failed" in message
+    assert "https_proxy=http://127.0.0.1:7897" in message
