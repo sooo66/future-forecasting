@@ -11,41 +11,8 @@ from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeC
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import FlexExperience, FlexLibrary
 from forecasting.methods._agentic_shared import build_memory_query, coerce_config, run_agentic_forecast
+from forecasting.prompts import build_flex_distill_messages
 from forecasting.question_tools import FlexMemoryTool, ResidentCodeInterpreterTool
-
-_SUCCESS_DISTILL_PROMPT = """You are building a FLEX experience library from a successful forecasting run.
-Extract reusable experience blocks at three levels:
-1. strategy: a high-level rule that transfers across similar forecasting questions.
-2. pattern: a reusable evidence-gathering or reasoning workflow.
-3. case: a short task-shaped cue that helps retrieve this experience for similar situations.
-
-Requirements:
-- Return JSON only with keys strategy, pattern, case.
-- Each value must be an object with keys title, summary, content.
-- Focus on reusable guidance from the trajectory, not the final market answer itself.
-- Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
-- Do not use generic titles like "golden strategy" or "case note".
-- strategy should be broadly reusable and action-oriented.
-- pattern should describe what evidence to gather and in what order.
-- case should capture the shape of the task or the distinctive cue, but still avoid ids and exact dates.
-- Keep summary to one sentence and content to 2-4 short sentences."""
-
-_FAILURE_DISTILL_PROMPT = """You are building a FLEX experience library from a failed forecasting run.
-Extract reusable warning blocks at three levels:
-1. strategy: a high-level warning or corrective rule for similar questions.
-2. pattern: a reusable failure mode or corrective workflow.
-3. case: a short task-shaped cue that helps retrieve this warning for similar situations.
-
-Requirements:
-- Return JSON only with keys strategy, pattern, case.
-- Each value must be an object with keys title, summary, content.
-- Focus on reusable lessons from the trajectory, not the final market answer itself.
-- Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
-- Do not use generic titles like "warning strategy" or "case note".
-- strategy should state the corrective principle.
-- pattern should explain which evidence path failed or should have been prioritized instead.
-- case should capture the shape of the failure so it can be recognized later.
-- Keep summary to one sentence and content to 2-4 short sentences."""
 
 
 @dataclass(frozen=True)
@@ -165,28 +132,14 @@ def _distill_flex(
 ) -> dict[str, Any]:
     if llm is None:
         return {}
-    messages = [
-        {
-            "role": "system",
-            "content": _SUCCESS_DISTILL_PROMPT if correctness else _FAILURE_DISTILL_PROMPT,
-        },
-        {"role": "user", "content": _flex_context(question, result, correctness=correctness)},
-    ]
+    messages = build_flex_distill_messages(
+        question,
+        correctness=correctness,
+        reasoning_summary=_clean_flex_text(str(result.get("reasoning_summary") or "")),
+        trajectory_highlights=_format_flex_trajectory(result.get("trajectory") or []),
+    )
     payload, _raw, _usage = llm.chat_json(messages, max_tokens=500, temperature=0.0)
     return payload
-
-
-def _flex_context(question: QuestionRecord, result: dict[str, Any], *, correctness: bool) -> str:
-    return (
-        f"Question: {question['question']}\n"
-        f"Domain: {question['domain']}\n"
-        f"Description: {' '.join(question['description'].split())[:800]}\n"
-        f"Resolution Criteria: {' '.join(question['resolution_criteria'].split())[:800]}\n"
-        f"Outcome Label: {question['label']}\n"
-        f"Prediction Correctness: {'correct' if correctness else 'incorrect'}\n"
-        f"Reasoning Summary: {_clean_flex_text(str(result.get('reasoning_summary') or ''))}\n"
-        f"Trajectory Highlights:\n{_format_flex_trajectory(result.get('trajectory') or [])}\n"
-    )
 
 
 def _default_flex_distillation(

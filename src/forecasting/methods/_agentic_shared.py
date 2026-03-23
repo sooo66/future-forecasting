@@ -16,6 +16,15 @@ from agent.tools import OpenBBTool, SearchTool
 from forecasting.contracts import ForecastResult, QuestionRecord
 from forecasting.llm import LLMUsage, OpenAIChatModel
 from forecasting.memory import FlexExperience
+from forecasting.prompts import (
+    build_agent_system_prompt,
+    build_agent_user_prompt,
+    build_direct_user_prompt,
+    build_forced_finalizer_messages,
+    build_rag_user_prompt,
+    forecast_system_prompt,
+    format_docs_for_prompt,
+)
 
 EPS = 1e-6
 DEFAULT_SEARCH_TOP_K = 3
@@ -61,8 +70,8 @@ def run_direct_io_forecast(
 ) -> ForecastResult:
     started = time.perf_counter()
     messages = [
-        {"role": "system", "content": _forecast_system_prompt()},
-        {"role": "user", "content": _direct_prompt(question)},
+        {"role": "system", "content": forecast_system_prompt()},
+        {"role": "user", "content": build_direct_user_prompt(question)},
     ]
     payload, raw_text, usage = llm.chat_json(
         messages, max_tokens=max_tokens, temperature=temperature
@@ -102,10 +111,10 @@ def run_naive_rag_forecast(
         top_k=search_top_k,
         max_per_source_type=rag_max_per_source_type,
     )
-    context = _format_docs_for_prompt(hits, content_chars=search_content_chars)
+    context = format_docs_for_prompt(hits, content_chars=search_content_chars)
     messages = [
-        {"role": "system", "content": _forecast_system_prompt()},
-        {"role": "user", "content": _rag_prompt(question, query, context)},
+        {"role": "system", "content": forecast_system_prompt()},
+        {"role": "user", "content": build_rag_user_prompt(question, query, context)},
     ]
     payload, raw_text, usage = llm.chat_json(
         messages, max_tokens=max_tokens, temperature=temperature
@@ -178,7 +187,7 @@ def run_agentic_forecast(
     agent = Agent(
         llm=llm.to_agent_config(),
         tools=tools,
-        system_prompt=_agent_system_prompt(
+        system_prompt=build_agent_system_prompt(
             question,
             method_name=method_name,
             injected_memories=injected_memories or [],
@@ -189,7 +198,7 @@ def run_agentic_forecast(
         raise_on_tool_error=False,
     )
     responses = agent.run_messages(
-        _agent_user_prompt(question, injected_memories=injected_memories or []),
+        build_agent_user_prompt(question, injected_memories=injected_memories or []),
         cuttime=question["open_time"],
     )
     extracted = _extract_agent_outputs(responses, tool_events=agent.get_last_tool_events())
@@ -343,156 +352,6 @@ def build_result(
     return result
 
 
-def _forecast_system_prompt() -> str:
-    return (
-        "You are a forecasting assistant. "
-        "Return JSON only with keys predicted_prob and reasoning_summary. "
-        "predicted_prob must be a number in [0,1]. "
-        "reasoning_summary must be concise and factual."
-    )
-
-
-def _agent_system_prompt(
-    question: QuestionRecord,
-    *,
-    method_name: str,
-    injected_memories: list[Any],
-    flex_preloaded: list[FlexExperience],
-    code_interpreter_enabled: bool,
-) -> str:
-    parts = [
-        "You are a forecasting research agent.",
-        "Your task is to estimate the probability that the market resolves YES.",
-        f"Never use information later than the cutoff {question['open_time']}.",
-        "The available search and market-data tools are already constrained to the question cutoff.",
-        "Use tools when they materially improve the forecast instead of relying on unsupported intuition.",
-        "For structured historical price, index, FX, or crypto data, openbb is usually the most reliable and structured option.",
-        "For textual background, policy, people, events, or narrative evidence, search is usually the best starting point.",
-        "When using search, prefer named entities and concrete event descriptions over vague terms, and use source filters when a result set is clearly off-topic.",
-        "Search is capped to 2 calls total, each returning at most 3 truncated content snippets. Repeated or low-yield searches will be blocked.",
-        "Do not keep calling the same tool with near-duplicate queries if the returned evidence is off-topic; switch tools, narrow the source, or finalize with lower confidence.",
-        "If the question mentions a ticker, price level, percentage move, index, FX pair, or crypto symbol, seriously consider openbb before additional broad search.",
-        "Aim to stay within at most 5 LLM reasoning steps and keep the tool path short.",
-        "Keep tool interactions concise. Do not use tools to restate qualitative reasoning you could express directly.",
-        "Before each tool call, keep your discussion to one short sentence rather than a long plan.",
-        "Return the final answer as JSON only with keys predicted_prob and reasoning_summary.",
-        "If evidence remains weak, lower confidence instead of inventing facts.",
-    ]
-    if code_interpreter_enabled:
-        parts.append(
-            "code_interpreter is available only because this question has an explicit numeric or interval-comparison component. "
-            "Use it only for a concrete calculation you cannot do reliably in plain text, and call it at most once."
-        )
-    else:
-        parts.append(
-            "Do not use code_interpreter for this question. This is not an explicit numeric-calculation task; reason directly from search/openbb evidence."
-        )
-    if injected_memories:
-        if method_name == "reasoningbank":
-            parts.append(
-                "Below are some memory items that I accumulated from past interaction from the environment "
-                "that may be helpful to solve the task. You can use it when you feel it's relevant. "
-                "In each step, please first explicitly discuss if you want to use each memory item or not, and then take action."
-            )
-        else:
-            parts.append(
-                "You also have reusable historical memories from earlier resolved questions. Treat them as guidance, not as direct evidence."
-            )
-        parts.append(_format_memories_for_prompt(injected_memories, mode=method_name))
-    if flex_preloaded:
-        parts.append(
-            "The FLEX library has already surfaced a few relevant experiences. Warning items are for avoiding prior mistakes, not for direct support."
-        )
-        parts.append(_format_flex_experiences(flex_preloaded))
-    if method_name == "flex":
-        parts.append(
-            "A memory tool is available. After checking the preloaded experiences, call it whenever you still need a more specific strategy, pattern, warning, or prior case."
-        )
-    return "\n\n".join(parts)
-
-
-def _direct_prompt(question: QuestionRecord) -> str:
-    return (
-        f"{_question_block(question)}\n\n"
-        "Use only the market text above. "
-        "Estimate the probability that the market resolves YES."
-    )
-
-
-def _rag_prompt(question: QuestionRecord, query: str, context: str) -> str:
-    return (
-        f"{_question_block(question)}\n\n"
-        f"Retrieval query: {query}\n"
-        "Retrieved context is already filtered to the allowed cutoff.\n"
-        f"{context}\n\n"
-        "Estimate the probability that the market resolves YES."
-    )
-
-
-def _agent_user_prompt(
-    question: QuestionRecord, *, injected_memories: list[Any]
-) -> str:
-    prompt = (
-        f"{_question_block(question)}\n\n"
-        "Use tools as needed. "
-        "When you finish, output JSON only with keys predicted_prob and reasoning_summary."
-    )
-    if injected_memories:
-        prompt += "\n\nThe injected memories above are not evidence by themselves; use them to guide what to check."
-    return prompt
-
-
-def _question_block(question: QuestionRecord) -> str:
-    description = _compact_text(question["description"], 900)
-    resolution_criteria = _compact_text(question["resolution_criteria"], 900)
-    if description == resolution_criteria:
-        resolution_criteria = ""
-    return (
-        f"Question: {question['question']}\n"
-        f"Description: {description}\n"
-        f"Resolution criteria: {resolution_criteria or '(same as description)'}"
-    )
-
-
-def _format_docs_for_prompt(hits: list[dict[str, Any]], *, content_chars: int) -> str:
-    if not hits:
-        return "Retrieved context: none."
-    lines = ["Retrieved context:"]
-    for index, hit in enumerate(hits, start=1):
-        lines.append(
-            f"[{index}] doc_id={hit['doc_id']} source={hit.get('source') or 'unknown'} "
-            f"timestamp={hit['timestamp']} title={hit['title']}"
-        )
-        lines.append(
-            f"    content={_compact_text(str(hit.get('content') or ''), content_chars)}"
-        )
-    return "\n".join(lines)
-
-
-def _format_memories_for_prompt(memories: list[Any], *, mode: str) -> str:
-    if not memories:
-        return ""
-    lines: list[str] = []
-    for index, item in enumerate(memories, start=1):
-        lines.append(f"# Memory Item {index}")
-        lines.append(f"## Title {getattr(item, 'title', '')}")
-        lines.append(f"## Description {getattr(item, 'description', '')}")
-        lines.append(f"## Content {_compact_text(str(getattr(item, 'content', '')), 360)}")
-    return "\n".join(lines)
-
-
-def _format_flex_experiences(items: list[FlexExperience]) -> str:
-    if not items:
-        return ""
-    lines: list[str] = []
-    for index, item in enumerate(items, start=1):
-        lines.append(f"[{index}] zone={item.zone} level={item.level}")
-        lines.append(f"    title={item.title}")
-        lines.append(f"    summary={item.summary}")
-        lines.append(f"    content={_compact_text(item.content, 280)}")
-    return "\n".join(lines)
-
-
 def _normalize_final_payload(payload: dict[str, Any], raw_text: str) -> dict[str, Any]:
     normalized_payload = payload if isinstance(payload, dict) else {}
     if not normalized_payload:
@@ -524,25 +383,7 @@ def _force_final_answer(
     *,
     trajectory: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str, LLMUsage]:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a forecasting assistant. A previous tool-using run collected evidence but did not return "
-                "the required final JSON. Using only the question and collected evidence below, return JSON only "
-                "with keys predicted_prob and reasoning_summary."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"{_question_block(question)}\n\n"
-                "Collected evidence:\n"
-                f"{_format_trajectory_for_finalizer(trajectory)}\n\n"
-                "Return JSON only with keys predicted_prob and reasoning_summary."
-            ),
-        },
-    ]
+    messages = build_forced_finalizer_messages(question, trajectory=trajectory)
     try:
         return llm.chat_json(messages, max_tokens=220, temperature=0.0)
     except Exception:
@@ -819,17 +660,6 @@ def _compact_openbb_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "result_count": payload.get("result_count"),
         "results_preview": preview,
     }
-
-
-def _format_trajectory_for_finalizer(trajectory: list[dict[str, Any]]) -> str:
-    if not trajectory:
-        return "No tool evidence was collected."
-    lines: list[str] = []
-    for step in trajectory[-12:]:
-        name = str(step.get("step") or "step")
-        payload = {key: value for key, value in step.items() if key != "step"}
-        lines.append(f"[{name}] {json.dumps(payload, ensure_ascii=False)}")
-    return "\n".join(lines)
 
 
 def _try_parse_json_dict(text: str) -> dict[str, Any]:

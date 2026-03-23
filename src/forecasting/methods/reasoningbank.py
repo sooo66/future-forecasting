@@ -10,52 +10,11 @@ from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeC
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import MemoryItem, ReasoningBankRecord, ReasoningBankStore
 from forecasting.methods._agentic_shared import build_memory_query, coerce_config, run_agentic_forecast
+from forecasting.prompts import (
+    build_reasoningbank_extraction_messages,
+    format_reasoningbank_trajectory,
+)
 from forecasting.question_tools import ResidentCodeInterpreterTool
-
-_SUCCESS_EXTRACTION_PROMPT = """You are an expert in web navigation. You will be given a user query, the corresponding trajectory
-that represents how an agent successfully accomplished the task.
-## Guidelines
-You need to extract and summarize useful insights in the format of memory items based on the
-agent's successful trajectory.
-The goal of summarized memory items is to be helpful and generalizable for future similar tasks.
-## Important notes
-- You must first think why the trajectory is successful, and then summarize the insights.
-- You can extract at most 3 memory items from the trajectory.
-- You must not repeat similar or overlapping items.
-- Do not mention specific websites, queries, or string contents, but rather focus on the
-  generalizable insights.
-## Output Format
-Your output must strictly follow the Markdown format shown below:
-```
-# Memory Item i
-## Title <the title of the memory item>
-## Description <one sentence summary of the memory item>
-## Content <1-3 sentences describing the insights learned to successfully accomplishing the
-task>
-```"""
-
-_FAILURE_EXTRACTION_PROMPT = """You are an expert in web navigation. You will be given a user query, the corresponding trajectory
-that represents how an agent attempted to resolve the task but failed.
-## Guidelines
-You need to extract and summarize useful insights in the format of memory items based on the
-agent's failed trajectory.
-The goal of summarized memory items is to be helpful and generalizable for future similar tasks.
-## Important notes
-- You must first reflect and think why the trajectory failed, and then summarize what lessons
-  you have learned or strategies to prevent the failure in the future.
-- You can extract at most 3 memory items from the trajectory.
-- You must not repeat similar or overlapping items.
-- Do not mention specific websites, queries, or string contents, but rather focus on the
-  generalizable insights.
-## Output Format
-Your output must strictly follow the Markdown format shown below:
-```
-# Memory Item i
-## Title <the title of the memory item>
-## Description <one sentence summary of the memory item>
-## Content <1-3 sentences describing the insights learned to successfully accomplishing the
-task>
-```"""
 
 
 @dataclass(frozen=True)
@@ -156,33 +115,17 @@ def _extract_reasoningbank_items(
 ) -> list[MemoryItem]:
     if llm is None:
         return []
-    system_prompt = (
-        _SUCCESS_EXTRACTION_PROMPT if success_or_failure == "success" else _FAILURE_EXTRACTION_PROMPT
-    )
-    user_prompt = (
-        f"Query: {question['question']}\n\n"
-        f"Trajectory: {_format_reasoningbank_trajectory(result)}"
-    )
     raw_text, _usage = llm.chat(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        build_reasoningbank_extraction_messages(
+            query=question["question"],
+            trajectory_text=format_reasoningbank_trajectory(result),
+            success_or_failure=success_or_failure,
+        ),
         max_tokens=700,
         temperature=0.0,
     )
     items = _parse_memory_items(raw_text)
     return items[:3]
-
-
-def _format_reasoningbank_trajectory(result: dict[str, Any]) -> str:
-    trajectory = list(result.get("trajectory") or [])
-    if not trajectory:
-        return str(result.get("reasoning_summary") or "")
-    lines: list[str] = []
-    for index, step in enumerate(trajectory, start=1):
-        lines.append(f"[{index}] {step}")
-    return "\n".join(lines)
 
 
 def _parse_memory_items(text: str) -> list[MemoryItem]:
