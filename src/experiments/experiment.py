@@ -22,9 +22,9 @@ DEFAULT_METHOD_CONFIGS = {
     "flex": {
         "agent_max_steps": 5,
         "search_top_k": 3,
-        "strategy_top_k": 3,
-        "pattern_top_k": 3,
-        "case_top_k": 3,
+        "strategy_top_k": 1,
+        "pattern_top_k": 1,
+        "case_top_k": 1,
     },
 }
 
@@ -36,7 +36,7 @@ def _build_experiment(
     knowledge_root: str = DEFAULT_KNOWLEDGE_ROOT,
     method_ids: list[str] | None = None,
     method_configs: dict[str, Any] | None = None,
-    max_parallel_methods: int = 3,
+    max_parallel_methods: int = 1,
 ) -> ExperimentSpec:
     return ExperimentSpec(
         experiment_id=experiment_id,
