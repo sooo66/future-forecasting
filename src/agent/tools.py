@@ -234,6 +234,7 @@ def build_default_tools(
         base_url=resolve_search_api_base(search_api_base),
         default_mode=resolve_search_retrieval_mode(search_retrieval_mode),
         backend=search_backend,
+        exa_base_url=None,
     )
     tools.append(
         SearchTool(

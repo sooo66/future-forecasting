@@ -653,6 +653,10 @@ def _extract_agent_outputs(
                 "step": f"{tool_name}_result_{tool_usage[tool_name]}",
                 "tool_name": tool_name,
             }
+            if isinstance(payload, dict):
+                error = str(payload.get("error") or "").strip()
+                if error:
+                    result_entry["error"] = _compact_text(error, 240)
             if tool_name == "search":
                 hits = payload.get("hits") if isinstance(payload, dict) else None
                 if isinstance(hits, list):

@@ -72,9 +72,10 @@ def run_experiment(
     resolved_search_backend = resolve_search_backend(search_backend)
     if resolved_search_backend == "exa":
         search_client = build_search_client(
-            base_url=search_api_base,
+            base_url=None,
             default_mode=search_retrieval_mode,
             backend=resolved_search_backend,
+            exa_base_url=None,
         )
     else:
         search_client = SearchClient(search_api_base, default_mode=search_retrieval_mode)

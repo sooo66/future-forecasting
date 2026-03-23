@@ -60,3 +60,17 @@ def test_build_search_client_selects_exa_backend(monkeypatch):
 
     assert isinstance(client, ExaSearchClient)
     assert client.health()["backend"] == "exa"
+
+
+def test_build_search_client_does_not_reuse_local_search_base_for_exa(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "secret")
+    monkeypatch.delenv("EXA_BASE_URL", raising=False)
+    monkeypatch.setattr("tools.exa_search._load_exa_class", lambda: _FakeExa)
+
+    client = build_search_client(
+        backend="exa",
+        base_url="http://127.0.0.1:8000",
+    )
+
+    assert isinstance(client, ExaSearchClient)
+    assert client.base_url == "https://api.exa.ai"

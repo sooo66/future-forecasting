@@ -21,8 +21,9 @@ def build_search_client(
     base_url: str | None = None,
     default_mode: str | None = None,
     backend: str | None = None,
+    exa_base_url: str | None = None,
 ) -> Any:
     resolved_backend = resolve_search_backend(backend)
     if resolved_backend == "exa":
-        return ExaSearchClient(base_url=base_url)
+        return ExaSearchClient(base_url=exa_base_url)
     return SearchClient(base_url, default_mode=default_mode)

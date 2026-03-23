@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agent import Agent
-from forecasting.methods._agentic_shared import _normalize_final_payload, run_agentic_forecast
+from forecasting.methods._agentic_shared import _extract_agent_outputs, _normalize_final_payload, run_agentic_forecast
 from forecasting.llm import LLMUsage
 
 
@@ -206,3 +206,13 @@ def test_agentic_forecast_disables_code_interpreter_for_non_numeric_question(mon
     assert "code_interpreter" not in tool_names
     assert "Do not use code_interpreter for this question." in captured["system_prompt"]
     assert result["predicted_prob"] == 0.4
+
+
+def test_extract_agent_outputs_preserves_tool_error_messages():
+    messages = [{"role": "function", "name": "search", "content": ""}]
+    tool_events = [{"tool_name": "search", "raw_result": {"error": "connection refused"}}]
+
+    extracted = _extract_agent_outputs(messages, tool_events=tool_events)
+
+    assert extracted["trajectory"][0]["step"] == "search_result_1"
+    assert extracted["trajectory"][0]["error"] == "connection refused"
