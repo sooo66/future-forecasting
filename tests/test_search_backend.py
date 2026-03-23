@@ -73,6 +73,14 @@ class _FakeReranker:
         return outputs
 
 
+class _FailingReranker:
+    model_name = "failing-reranker"
+    resolved_device = "cuda"
+
+    def score(self, query, documents):
+        raise RuntimeError("Tensor on device cuda:0 is not on the expected device meta!")
+
+
 class _OrderedSearcher:
     def __init__(self, hits):
         self._hits = list(hits)
@@ -637,3 +645,75 @@ def test_search_hybrid_reranker_reorders_final_hits(tmp_path, monkeypatch):
     assert result["hits"][0]["doc_id"] == "phone-doc"
     assert result["hits"][0]["retrieval_score"] < result["hits"][0]["score"]
     assert result["hits"][0]["rerank_score"] == 10.0
+
+
+def test_search_api_falls_back_when_hybrid_reranker_fails(tmp_path, monkeypatch):
+    snapshot_root, search_root = _build_search_root(tmp_path, "s-hybrid-rerank-fallback")
+    _write_jsonl(
+        snapshot_root / "info" / "news" / "cnn" / "records.jsonl",
+        [
+            {
+                "id": "market-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple market wrap",
+                    "content": "Apple demand remained steady in quarterly data.",
+                },
+            },
+            {
+                "id": "phone-doc",
+                "kind": "info",
+                "source": "news/cnn",
+                "timestamp": "2026-01-10",
+                "payload": {
+                    "title": "Apple smartphone update",
+                    "content": "The latest iPhone launch lifted Apple device demand.",
+                },
+            },
+        ],
+    )
+    build_corpus(snapshot_root, search_root / "corpus.jsonl")
+    (search_root / "dense").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "tools.search._load_dense_searcher",
+        lambda _index_dir: _OrderedSearcher(
+            [
+                SimpleNamespace(row_index=0, score=8.0),
+                SimpleNamespace(row_index=1, score=7.0),
+            ]
+        ),
+    )
+    client = TestClient(
+        create_app(
+            search_root,
+            log_dir=tmp_path / "logs" / "search",
+            searcher_factory=lambda _index_dir: _OrderedSearcher(
+                [
+                    SimpleNamespace(row_index=0, score=10.0),
+                    SimpleNamespace(row_index=1, score=9.0),
+                ]
+            ),
+            retrieval_mode="hybrid",
+            reranker=_FailingReranker(),
+            rerank_candidate_limit=2,
+        )
+    )
+
+    response = client.post(
+        "/search",
+        json={
+            "question": "apple smartphone demand",
+            "source": "news",
+            "time": "2026-01-10",
+            "limit": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "hybrid"
+    assert payload["hits"][0]["doc_id"] == "market-doc"
+    assert "rerank_score" not in payload["hits"][0]

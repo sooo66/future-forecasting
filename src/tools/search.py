@@ -423,7 +423,15 @@ class SearchEngine:
             fetch_k = min(_MAX_FETCH_LIMIT, fetch_k * 2)
 
         if rerank_enabled and filtered_hits:
-            filtered_hits = self._rerank_hits(query, filtered_hits[:target_hits])
+            rerank_input = filtered_hits[:target_hits]
+            try:
+                filtered_hits = self._rerank_hits(query, rerank_input)
+            except Exception as exc:
+                logger.warning(
+                    "hybrid reranker failed and search will fall back to first-stage results. error={}",
+                    exc,
+                )
+                filtered_hits = rerank_input
 
         return {
             "snapshot_root": str(self.snapshot_root),

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 from typing import Any, Sequence
 
+from loguru import logger
+
 
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 _RERANKER_CACHE: dict[tuple[str, str | None, int, int], "HuggingFaceTextReranker"] = {}
@@ -27,6 +29,21 @@ class HuggingFaceTextReranker:
         if not documents:
             return []
         self._ensure_loaded()
+        try:
+            return self._score_impl(query, documents)
+        except Exception as exc:
+            if not _is_retryable_runtime_error(exc) or str(self._device or "").lower() == "cpu":
+                raise
+            failed_device = str(self._device or self.device or "cuda")
+            logger.warning(
+                "reranker inference failed on device {} and will fall back to CPU. error={}",
+                failed_device,
+                exc,
+            )
+            self._move_to_device("cpu")
+            return self._score_impl(query, documents)
+
+    def _score_impl(self, query: str, documents: Sequence[str]) -> list[float]:
         outputs: list[float] = []
         normalized_query = str(query or "").strip()
         for start in range(0, len(documents), self.batch_size):
@@ -62,7 +79,7 @@ class HuggingFaceTextReranker:
         self._device = _resolve_torch_device(self.device)
         try:
             self._tokenizer = _load_from_pretrained(AutoTokenizer, self.model_name)
-            self._model = _load_from_pretrained(AutoModelForSequenceClassification, self.model_name)
+            self._model = _load_reranker_model(AutoModelForSequenceClassification, self.model_name)
         except Exception as exc:
             proxy_hint = _active_proxy_summary()
             message = (
@@ -72,8 +89,19 @@ class HuggingFaceTextReranker:
             if proxy_hint:
                 message += f" Active proxy env: {proxy_hint}"
             raise RuntimeError(message) from exc
+        _configure_reranker_model(self._model)
         self._model.eval()
-        self._model.to(self._device)
+        self._move_to_device(self._device)
+
+    def _move_to_device(self, device: str | None) -> None:
+        target = str(device or "cpu").strip() or "cpu"
+        self._model.to(target)
+        self._device = target
+        if target == "cpu" and self._torch is not None and hasattr(self._torch, "cuda"):
+            try:
+                self._torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 def build_text_reranker(
@@ -131,6 +159,41 @@ def _load_from_pretrained(factory: Any, model_name: str) -> Any:
         return factory.from_pretrained(model_name)
 
 
+def _load_reranker_model(factory: Any, model_name: str) -> Any:
+    for kwargs in ({"attn_implementation": "eager"}, {}):
+        try:
+            try:
+                return factory.from_pretrained(model_name, local_files_only=True, **kwargs)
+            except Exception:
+                return factory.from_pretrained(model_name, **kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            if kwargs:
+                continue
+            raise
+    return _load_from_pretrained(factory, model_name)
+
+
+def _configure_reranker_model(model: Any) -> None:
+    setter = getattr(model, "set_attn_implementation", None)
+    if callable(setter):
+        try:
+            setter("eager")
+            return
+        except Exception:
+            pass
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    for attr in ("attn_implementation", "_attn_implementation"):
+        if hasattr(config, attr):
+            try:
+                setattr(config, attr, "eager")
+            except Exception:
+                continue
+
+
 def _active_proxy_summary() -> str:
     entries = []
     for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
@@ -138,3 +201,13 @@ def _active_proxy_summary() -> str:
         if value:
             entries.append(f"{key}={value}")
     return ", ".join(entries)
+
+
+def _is_retryable_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "cuda" in message
+        or "device meta" in message
+        or "expected device meta" in message
+        or "scaled_dot_product_attention" in message
+    )
