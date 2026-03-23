@@ -319,7 +319,12 @@ def _run_search_build_index_command(args: argparse.Namespace) -> int:
     retrieval_mode = _resolve_search_retrieval_mode_arg(args) or "bm25"
     if retrieval_mode in {"bm25", "hybrid"}:
         bm25_dir = search_root / "bm25"
-        build_bm25_index(corpus_path, bm25_dir, overwrite=bool(args.force))
+        build_bm25_index(
+            corpus_path,
+            bm25_dir,
+            overwrite=bool(args.force),
+            show_progress=not bool(args.no_progress),
+        )
         logger.info(f"bm25 index written: {bm25_dir}")
     if retrieval_mode in {"dense", "hybrid"}:
         dense_dir = search_root / "dense"

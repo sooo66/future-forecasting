@@ -45,6 +45,7 @@ _DEFAULT_DENSE_BATCH_SIZE = 64
 _DEFAULT_DENSE_AUTO_WORKERS = 0
 _DEFAULT_DENSE_MAX_AUTO_WORKERS = 4
 _DEFAULT_DENSE_MIN_PARALLEL_ROWS = 256
+_DEFAULT_DENSE_PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 _DEFAULT_RERANK_CANDIDATE_LIMIT = 40
 _DEFAULT_RERANKER_BATCH_SIZE = 32
 
@@ -116,12 +117,19 @@ def find_latest_snapshot_root(project_root: Path, *, base_dir: str = _DEFAULT_BA
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
-def build_bm25_index(corpus_path: Path, index_dir: Path, *, overwrite: bool = False) -> Path:
+def build_bm25_index(
+    corpus_path: Path,
+    index_dir: Path,
+    *,
+    overwrite: bool = False,
+    show_progress: bool | None = None,
+) -> Path:
     corpus_path = Path(corpus_path).expanduser().resolve()
     index_dir = Path(index_dir).expanduser().resolve()
     if not corpus_path.exists():
         raise FileNotFoundError(f"Corpus file does not exist: {corpus_path}")
     bm25s = _load_bm25s_module()
+    resolved_show_progress = _resolve_progress_enabled(show_progress)
 
     if index_dir.exists():
         if not overwrite:
@@ -133,10 +141,19 @@ def build_bm25_index(corpus_path: Path, index_dir: Path, *, overwrite: bool = Fa
 
     rows = list(_iter_corpus_rows(corpus_path))
     texts = [str(row.get("contents") or "") for row in rows]
-    tokenized_corpus = bm25s.tokenize(texts, show_progress=False)
+    logger.info(
+        "building bm25 index: passages={} progress={}",
+        len(texts),
+        resolved_show_progress,
+    )
+    logger.info("bm25 step 1/2: tokenizing corpus")
+    tokenized_corpus = bm25s.tokenize(texts, show_progress=resolved_show_progress)
+    logger.info("bm25 step 1/2 complete")
     retriever = bm25s.BM25(method=_BM25S_METHOD)
-    retriever.index(tokenized_corpus, show_progress=False)
+    logger.info("bm25 step 2/2: building inverted index")
+    retriever.index(tokenized_corpus, show_progress=resolved_show_progress)
     retriever.save(index_dir)
+    logger.info("bm25 index complete: output={}", index_dir)
     return index_dir
 
 
@@ -189,6 +206,7 @@ def build_dense_index(
     dimension = 0
     completed = 0
     started = time.perf_counter()
+    log_state = {"last_logged_at": started, "last_logged_completed": 0}
     progress_bar = _create_dense_progress_bar(
         total=len(texts),
         show_progress=show_progress,
@@ -225,6 +243,12 @@ def build_dense_index(
                 total=len(texts),
                 started=started,
                 callback=progress_callback,
+            )
+            _maybe_log_dense_progress(
+                completed=completed,
+                total=len(texts),
+                started=started,
+                state=log_state,
             )
     finally:
         close = getattr(batch_arrays, "close", None)
@@ -746,7 +770,7 @@ def _embed_dense_batch_worker(
 def _create_dense_progress_bar(*, total: int, show_progress: bool | None, description: str):
     if total <= 0 or tqdm is None:
         return None
-    enabled = bool(show_progress) if show_progress is not None else sys.stderr.isatty()
+    enabled = _resolve_progress_enabled(show_progress)
     if not enabled:
         return None
     return tqdm(
@@ -791,6 +815,51 @@ def _update_dense_progress(
                 "eta_seconds": eta_seconds,
             }
         )
+
+
+def _maybe_log_dense_progress(
+    *,
+    completed: int,
+    total: int,
+    started: float,
+    state: dict[str, float | int],
+) -> None:
+    if total <= 0:
+        return
+    now = time.perf_counter()
+    elapsed = max(0.0, now - started)
+    last_logged_at = float(state.get("last_logged_at", started))
+    last_logged_completed = int(state.get("last_logged_completed", 0))
+    is_complete = completed >= total
+    should_log = (
+        is_complete
+        or (completed > last_logged_completed and now - last_logged_at >= _DEFAULT_DENSE_PROGRESS_LOG_INTERVAL_SECONDS)
+    )
+    if not should_log:
+        return
+    eta_seconds = None
+    if completed > 0 and total > completed:
+        rate = completed / max(elapsed, 1e-9)
+        if rate > 0:
+            eta_seconds = (total - completed) / rate
+    percent = (completed / total) * 100.0
+    eta_label = f"{int(eta_seconds)}s" if eta_seconds is not None else "0s"
+    logger.info(
+        "dense index progress: {}/{} ({:.1f}%) elapsed={:.1f}s eta={}",
+        completed,
+        total,
+        percent,
+        elapsed,
+        eta_label,
+    )
+    state["last_logged_at"] = now
+    state["last_logged_completed"] = completed
+
+
+def _resolve_progress_enabled(show_progress: bool | None) -> bool:
+    if show_progress is not None:
+        return bool(show_progress)
+    return sys.stderr.isatty()
 
 
 def _hit_text_for_reranking(hit: dict[str, Any]) -> str:
