@@ -9,7 +9,7 @@ from utils.env import get_first_env
 
 _DEFAULT_EXA_BASE_URL = "https://api.exa.ai"
 _DEFAULT_EXA_SEARCH_TYPE = "auto"
-_DEFAULT_TEXT_MAX_CHARACTERS = 1024
+_DEFAULT_TEXT_MAX_CHARACTERS = 4000
 _EXA_CATEGORY_BY_SOURCE = {
     "news": "news",
     "paper": "research paper",

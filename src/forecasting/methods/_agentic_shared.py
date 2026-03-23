@@ -80,7 +80,7 @@ def run_direct_io_forecast(
     )
 
 
-def run_bm25_rag_forecast(
+def run_naive_rag_forecast(
     question: QuestionRecord,
     llm: OpenAIChatModel,
     search_engine: Any,
@@ -118,13 +118,16 @@ def run_bm25_rag_forecast(
         predicted_prob=parsed["predicted_prob"],
         reasoning_summary=parsed["reasoning_summary"],
         trajectory=[
-            {"step": "retrieve", "query": query, "hits": _compact_hits(hits, include_content=True)},
+            {"step": "retrieve", "query": query, "hits": _trajectory_hits(hits)},
             {"step": "final", "raw_response": raw_text},
         ],
         usage=usage,
         latency_sec=elapsed,
         retrieved_source_types=[_hit_source_type(hit) for hit in hits],
     )
+
+
+run_bm25_rag_forecast = run_naive_rag_forecast
 
 
 def run_agentic_forecast(
@@ -660,7 +663,7 @@ def _extract_agent_outputs(
             if tool_name == "search":
                 hits = payload.get("hits") if isinstance(payload, dict) else None
                 if isinstance(hits, list):
-                    result_entry["hits"] = _compact_hits(hits, include_content=True)
+                    result_entry["hits"] = _trajectory_hits(hits)
                     for hit in hits:
                         source_type = _hit_source_type(hit)
                         if source_type:
@@ -764,6 +767,16 @@ def _compact_hits(
             item["content"] = _compact_text(str(hit.get("content") or ""), 240)
         compacted.append(item)
     return compacted
+
+
+def _trajectory_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    preserved = []
+    for hit in hits:
+        if isinstance(hit, dict):
+            preserved.append(dict(hit))
+        else:
+            preserved.append({"content": str(hit)})
+    return preserved
 
 
 def _hit_source_type(hit: dict[str, Any]) -> str:

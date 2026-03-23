@@ -216,3 +216,32 @@ def test_extract_agent_outputs_preserves_tool_error_messages():
 
     assert extracted["trajectory"][0]["step"] == "search_result_1"
     assert extracted["trajectory"][0]["error"] == "connection refused"
+
+
+def test_extract_agent_outputs_keeps_full_search_hits_in_trajectory():
+    long_content = "A" * 500
+    messages = [{"role": "function", "name": "search", "content": ""}]
+    tool_events = [
+        {
+            "tool_name": "search",
+            "raw_result": {
+                "hits": [
+                    {
+                        "doc_id": "doc-1",
+                        "source": "info/news",
+                        "source_type": "news",
+                        "timestamp": "2026-01-10",
+                        "title": "Long article",
+                        "content": long_content,
+                        "url": "https://example.com/long",
+                    }
+                ]
+            },
+        }
+    ]
+
+    extracted = _extract_agent_outputs(messages, tool_events=tool_events)
+
+    hit = extracted["trajectory"][0]["hits"][0]
+    assert hit["content"] == long_content
+    assert hit["url"] == "https://example.com/long"

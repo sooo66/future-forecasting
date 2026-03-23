@@ -7,12 +7,12 @@ from typing import Any
 
 from experiments.base import ExperimentSpec
 
-DEFAULT_METHOD_IDS = ["direct_io", "bm25_rag", "agentic_nomem", "reasoningbank", "flex"]
+DEFAULT_METHOD_IDS = ["direct_io", "naive_rag", "agentic_nomem", "reasoningbank", "flex"]
 DEFAULT_DATASET_FILE = "data/questions/subsets/pre_exp_fixed_30_resolved.json"
 DEFAULT_KNOWLEDGE_ROOT = "data/benchmark/s-0306"
 DEFAULT_METHOD_CONFIGS = {
     "direct_io": {},
-    "bm25_rag": {
+    "naive_rag": {
         "search_top_k": 3,
         "search_content_chars": 1024,
         "rag_max_per_source_type": 10,

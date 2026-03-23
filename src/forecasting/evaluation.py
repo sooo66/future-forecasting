@@ -51,6 +51,7 @@ def compute_ece(
 def summarize_results(results: list[ForecastResult]) -> dict[str, Any]:
     total_tokens = [item["total_tokens"] for item in results if item.get("total_tokens") is not None]
     step_counts = [int(item["steps_count"]) for item in results if item.get("steps_count") is not None]
+    method_names = [str(item.get("method_name") or "").strip() for item in results if str(item.get("method_name") or "").strip()]
     source_counter = Counter()
     tool_counter = Counter()
     predictions = [float(item["predicted_prob"]) for item in results]
@@ -60,6 +61,7 @@ def summarize_results(results: list[ForecastResult]) -> dict[str, Any]:
         source_counter.update(item.get("retrieved_source_types") or [])
         tool_counter.update(item.get("tool_usage_counts") or {})
     return {
+        "display_name": method_names[0] if method_names and len(set(method_names)) == 1 else None,
         "count": len(results),
         "accuracy": mean(item["accuracy"] for item in results) if results else 0.0,
         "brier_score": mean(item["brier_score"] for item in results) if results else 0.0,
@@ -86,10 +88,11 @@ def render_experiment_summary(summary: dict[str, Any]) -> str:
         metrics = methods.get(method_id)
         if not isinstance(metrics, dict):
             continue
+        display_name = str(metrics.get("display_name") or method_id)
         avg_total_tokens = metrics.get("avg_total_tokens")
         avg_steps_count = metrics.get("avg_steps_count")
         rows.append(
-            f"| {method_id} | {metrics.get('count', 0)} | {float(metrics.get('accuracy') or 0.0):.3f} | "
+            f"| {display_name} | {metrics.get('count', 0)} | {float(metrics.get('accuracy') or 0.0):.3f} | "
             f"{float(metrics.get('brier_score') or 0.0):.4f} | {float(metrics.get('ece_10') or 0.0):.4f} | "
             f"{float(metrics.get('avg_latency_sec') or 0.0):.2f} | "
             f"{avg_total_tokens if avg_total_tokens is not None else 'n/a'} | "

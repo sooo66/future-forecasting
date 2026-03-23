@@ -55,6 +55,7 @@ def test_exa_search_client_maps_response(monkeypatch):
     assert fake.calls[0]["query"] == "Latest news on Nvidia"
     assert fake.calls[0]["kwargs"]["end_published_date"] == "2026-03-06T15:59:59.999Z"
     assert fake.calls[0]["kwargs"]["category"] == "news"
+    assert fake.calls[0]["kwargs"]["contents"]["text"]["max_characters"] == 4000
     assert result["backend"] == "exa"
     assert result["hits"][0]["doc_id"] == "exa-doc-1"
     assert result["hits"][0]["source"] == "info/news"
