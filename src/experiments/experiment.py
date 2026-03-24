@@ -7,7 +7,13 @@ from typing import Any
 
 from experiments.base import ExperimentSpec
 
-DEFAULT_METHOD_IDS = ["direct_io", "naive_rag", "agentic_nomem", "reasoningbank", "flex"]
+DEFAULT_METHOD_IDS = [
+    "direct_io",
+    "naive_rag",
+    "agentic_nomem",
+    "reasoningbank",
+    "flex",
+]
 DEFAULT_DATASET_FILE = "data/questions/subsets/pre_exp_fixed_30_resolved.json"
 DEFAULT_KNOWLEDGE_ROOT = "data/benchmark/s-0306"
 DEFAULT_METHOD_CONFIGS = {
@@ -64,4 +70,19 @@ def build_smoke_test_30() -> ExperimentSpec:
     return _build_experiment(
         "smoke_test_30",
         dataset_file="data/questions/subsets/smoke_test_30.json",
+    )
+
+
+def build_smoke_test_100() -> ExperimentSpec:
+    return _build_experiment(
+        "smoke_test_100",
+        dataset_file="data/questions/subsets/smoke_test_100.json",
+    )
+
+
+def build_smoke_test_100_gemini() -> ExperimentSpec:
+    return _build_experiment(
+        "smoke_test_100_gemini",
+        method_ids=["reasoningbank"],
+        dataset_file="data/questions/subsets/smoke_test_100.json",
     )
