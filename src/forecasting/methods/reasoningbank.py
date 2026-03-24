@@ -9,7 +9,12 @@ from typing import Any
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import MemoryItem, ReasoningBankRecord, ReasoningBankStore
-from forecasting.methods._agentic_shared import build_memory_query, coerce_config, run_agentic_forecast
+from forecasting.methods._agentic_shared import (
+    build_memory_query,
+    coerce_config,
+    question_cutoff_time,
+    run_agentic_forecast,
+)
 from forecasting.prompts import (
     build_reasoningbank_extraction_messages,
     format_reasoningbank_trajectory,
@@ -22,6 +27,7 @@ class ReasoningBankConfig:
     agent_max_steps: int = 5
     top_k: int = 1
     search_top_k: int = 3
+    success_only: bool = True
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL
     embedding_device: str | None = None
     artifact_filename: str = "reasoningbank_mem.jsonl"
@@ -51,10 +57,12 @@ class _ReasoningBankSession(MethodSession):
         )
 
     def run_question(self, question: QuestionRecord):
+        cutoff_time = question_cutoff_time(question)
         memories = self._store.retrieve(
             build_memory_query(question),
-            open_time=question["open_time"],
+            open_time=cutoff_time,
             top_k=self._config.top_k,
+            success_only=self._config.success_only,
         )
         result = run_agentic_forecast(
             question,

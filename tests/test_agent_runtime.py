@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent import Agent
+from forecasting.memory import FlexExperience, RetrievedMemoryItem
 from forecasting.methods._agentic_shared import _extract_agent_outputs, _normalize_final_payload, run_agentic_forecast
 from forecasting.llm import LLMUsage
 
@@ -208,6 +209,93 @@ def test_agentic_forecast_disables_code_interpreter_for_non_numeric_question(mon
     assert result["predicted_prob"] == 0.4
 
 
+def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkeypatch, tmp_path):
+    captured = {}
+
+    class _CaptureAgent:
+        def __init__(self, *, llm, tools, system_prompt, max_steps, raise_on_tool_error):
+            captured["system_prompt"] = system_prompt
+            self._usage = {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+
+        def run_messages(self, user_input, messages=None, *, cuttime=None):
+            captured["cuttime"] = cuttime
+            return [{"role": "assistant", "content": '{"predicted_prob": 0.61, "reasoning_summary": "done"}'}]
+
+        def get_last_usage(self):
+            return dict(self._usage)
+
+        def get_last_tool_events(self):
+            return []
+
+        def get_last_llm_call_count(self):
+            return 1
+
+        @staticmethod
+        def extract_final_content(messages):
+            return messages[-1]["content"]
+
+    monkeypatch.setattr("forecasting.methods._agentic_shared.Agent", _CaptureAgent)
+    question = {
+        "market_id": "m-sample",
+        "question": "Will AAPL close above 200?",
+        "description": "Synthetic question",
+        "resolution_criteria": "Synthetic resolution",
+        "domain": "finance",
+        "open_time": "2026-01-20T00:00:00Z",
+        "sample_time": "2026-01-27T00:00:00Z",
+        "resolve_time": "2026-02-01T00:00:00Z",
+        "label": 1,
+        "difficulty": "easy",
+    }
+    injected = [
+        RetrievedMemoryItem(
+            memory_id="rb-1#1",
+            record_id="rb-1",
+            source_question_id="q-1",
+            source_resolved_time="2026-01-10T00:00:00Z",
+            success_or_failure="success",
+            title="Memory title",
+            description="Reusable cue",
+            content="Use structured evidence first.",
+        )
+    ]
+    preloaded = [
+        FlexExperience(
+            experience_id="flex-1",
+            source_question_id="q-2",
+            domain="finance",
+            zone="golden",
+            level="strategy",
+            title="Strategy title",
+            summary="Summary text",
+            content="Content text",
+            created_at="2026-01-12T00:00:00Z",
+            source_open_time="2026-01-01T00:00:00Z",
+            source_resolved_time="2026-01-12T00:00:00Z",
+            outcome=1,
+            correctness=True,
+        )
+    ]
+
+    result = run_agentic_forecast(
+        question,
+        _FakeForecastLLM(),
+        object(),
+        project_root=tmp_path,
+        method_name="flex",
+        agent_max_steps=5,
+        injected_memories=injected,
+        flex_preloaded=preloaded,
+    )
+
+    assert captured["cuttime"] == "2026-01-27T00:00:00Z"
+    assert "2026-01-27T00:00:00Z" in captured["system_prompt"]
+    assert result["cutoff_time"] == "2026-01-27T00:00:00Z"
+    assert result["injected_memories"][0]["memory_id"] == "rb-1#1"
+    assert result["flex_preloaded"][0]["experience_id"] == "flex-1"
+    assert result["flex_preloaded"][0]["domain"] == "finance"
+
+
 def test_extract_agent_outputs_preserves_tool_error_messages():
     messages = [{"role": "function", "name": "search", "content": ""}]
     tool_events = [{"tool_name": "search", "raw_result": {"error": "connection refused"}}]
@@ -245,3 +333,34 @@ def test_extract_agent_outputs_keeps_full_search_hits_in_trajectory():
     hit = extracted["trajectory"][0]["hits"][0]
     assert hit["content"] == long_content
     assert hit["url"] == "https://example.com/long"
+
+
+def test_extract_agent_outputs_keeps_memory_hit_metadata_in_trajectory():
+    messages = [{"role": "function", "name": "memory", "content": ""}]
+    tool_events = [
+        {
+            "tool_name": "memory",
+            "raw_result": {
+                "hits": [
+                    {
+                        "experience_id": "flex-1",
+                        "source_question_id": "q-1",
+                        "domain": "finance",
+                        "zone": "golden",
+                        "level": "strategy",
+                        "title": "Strategy title",
+                        "summary": "Summary text",
+                        "content": "Content text",
+                        "correctness": True,
+                    }
+                ]
+            },
+        }
+    ]
+
+    extracted = _extract_agent_outputs(messages, tool_events=tool_events)
+
+    hit = extracted["trajectory"][0]["hits"][0]
+    assert hit["experience_id"] == "flex-1"
+    assert hit["source_question_id"] == "q-1"
+    assert hit["domain"] == "finance"

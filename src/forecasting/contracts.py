@@ -31,6 +31,7 @@ class ForecastResult(TypedDict, total=False):
     open_time: str
     resolve_time: str
     sample_time: str | None
+    cutoff_time: str | None
     predicted_prob: float
     label: int
     accuracy: int
@@ -45,6 +46,8 @@ class ForecastResult(TypedDict, total=False):
     total_tokens: int | None
     steps_count: int | None
     tool_usage_counts: dict[str, int]
+    injected_memories: list[dict[str, Any]]
+    flex_preloaded: list[dict[str, Any]]
     error: str
 
 

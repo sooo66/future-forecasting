@@ -103,8 +103,9 @@ def run_naive_rag_forecast(
 ) -> ForecastResult:
     started = time.perf_counter()
     query = build_rag_query(question)
+    cutoff_time = question_cutoff_time(question)
     search_result = search_engine.search(
-        query, time=question["open_time"], limit=search_top_k
+        query, time=cutoff_time, limit=search_top_k
     )
     hits = diversify_hits(
         search_result.get("hits", []),
@@ -154,6 +155,7 @@ def run_agentic_forecast(
     code_interpreter_tool: Any | None = None,
 ) -> ForecastResult:
     started = time.perf_counter()
+    cutoff_time = question_cutoff_time(question)
     code_interpreter_enabled = _question_requires_code_interpreter(question)
     if code_interpreter_enabled and code_interpreter_tool is not None and hasattr(
         code_interpreter_tool, "begin_question"
@@ -199,7 +201,7 @@ def run_agentic_forecast(
     )
     responses = agent.run_messages(
         build_agent_user_prompt(question, injected_memories=injected_memories or []),
-        cuttime=question["open_time"],
+        cuttime=cutoff_time,
     )
     extracted = _extract_agent_outputs(responses, tool_events=agent.get_last_tool_events())
     final_text = Agent.extract_final_content(responses)
@@ -228,6 +230,8 @@ def run_agentic_forecast(
         retrieved_source_types=extracted["retrieved_source_types"],
         steps_count=agent.get_last_llm_call_count(),
         tool_usage_counts=extracted["tool_usage_counts"],
+        injected_memories=injected_memories,
+        flex_preloaded=flex_preloaded,
     )
 
 
@@ -273,6 +277,7 @@ def build_failed_result(
         "open_time": question["open_time"],
         "resolve_time": question["resolve_time"],
         "sample_time": question.get("sample_time"),
+        "cutoff_time": question_cutoff_time(question),
         "method_name": method_name,
         "predicted_prob": 0.5,
         "label": label,
@@ -308,6 +313,10 @@ def build_memory_query(question: QuestionRecord) -> str:
     return f"{question['question']} {description} {question['domain']}".strip()
 
 
+def question_cutoff_time(question: QuestionRecord) -> str:
+    return str(question.get("sample_time") or question["open_time"]).strip()
+
+
 def build_result(
     *,
     question: QuestionRecord,
@@ -320,6 +329,8 @@ def build_result(
     retrieved_source_types: list[str] | None = None,
     steps_count: int | None = None,
     tool_usage_counts: dict[str, int] | None = None,
+    injected_memories: list[Any] | None = None,
+    flex_preloaded: list[Any] | None = None,
 ) -> ForecastResult:
     label = int(question["label"])
     predicted_prob = min(1.0, max(0.0, float(predicted_prob)))
@@ -330,6 +341,7 @@ def build_result(
         "open_time": question["open_time"],
         "resolve_time": question["resolve_time"],
         "sample_time": question.get("sample_time"),
+        "cutoff_time": question_cutoff_time(question),
         "method_name": method_name,
         "predicted_prob": predicted_prob,
         "label": label,
@@ -349,6 +361,12 @@ def build_result(
     tool_counts = dict(sorted((tool_usage_counts or {}).items()))
     if tool_counts:
         result["tool_usage_counts"] = tool_counts
+    serialized_injected = _serialize_memory_context_items(injected_memories)
+    if serialized_injected:
+        result["injected_memories"] = serialized_injected
+    serialized_preloaded = _serialize_memory_context_items(flex_preloaded)
+    if serialized_preloaded:
+        result["flex_preloaded"] = serialized_preloaded
     return result
 
 
@@ -633,16 +651,44 @@ def _hit_source_type(hit: dict[str, Any]) -> str:
 def _compact_memory_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compacted = []
     for hit in hits:
-        compacted.append(
-            {
-                "zone": hit.get("zone"),
-                "level": hit.get("level"),
-                "title": hit.get("title"),
-                "summary": _compact_text(str(hit.get("summary") or ""), 180),
-                "content": _compact_text(str(hit.get("content") or ""), 220),
-            }
-        )
+        item = {
+            "title": hit.get("title"),
+            "summary": _compact_text(str(hit.get("summary") or ""), 180),
+            "content": _compact_text(str(hit.get("content") or ""), 220),
+        }
+        for key in (
+            "memory_id",
+            "record_id",
+            "experience_id",
+            "source_question_id",
+            "source_resolved_time",
+            "success_or_failure",
+            "domain",
+            "zone",
+            "level",
+            "correctness",
+            "support_count",
+        ):
+            if key in hit:
+                item[key] = hit.get(key)
+        compacted.append(item)
     return compacted
+
+
+def _serialize_memory_context_items(items: list[Any] | None) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for item in items or []:
+        if hasattr(item, "to_dict"):
+            payload = item.to_dict()
+        elif isinstance(item, dict):
+            payload = dict(item)
+        else:
+            payload = {"value": str(item)}
+        for key, limit in (("description", 220), ("summary", 220), ("content", 320)):
+            if key in payload:
+                payload[key] = _compact_text(str(payload.get(key) or ""), limit)
+        serialized.append(payload)
+    return serialized
 
 
 def _compact_openbb_payload(payload: dict[str, Any]) -> dict[str, Any]:

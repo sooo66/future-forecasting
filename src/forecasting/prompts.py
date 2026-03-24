@@ -22,7 +22,7 @@ FORECAST_SYSTEM_PROMPT = (
 AGENT_SYSTEM_BASE_SECTIONS = [
     "You are a forecasting research agent.",
     "Your task is to estimate the probability that the market resolves YES.",
-    "Never use information later than the cutoff {open_time}.",
+    "Never use information later than the cutoff {cutoff_time}.",
     "The available search and market-data tools are already constrained to the question cutoff.",
     "Use tools when they materially improve the forecast instead of relying on unsupported intuition.",
     "For structured historical price, index, FX, or crypto data, openbb is usually the most reliable and structured option.",
@@ -185,7 +185,8 @@ def build_agent_system_prompt(
     flex_preloaded: list[FlexExperience],
     code_interpreter_enabled: bool,
 ) -> str:
-    parts = [section.format(open_time=question["open_time"]) for section in AGENT_SYSTEM_BASE_SECTIONS]
+    cutoff_time = question.get("sample_time") or question["open_time"]
+    parts = [section.format(cutoff_time=cutoff_time) for section in AGENT_SYSTEM_BASE_SECTIONS]
     parts.append(
         AGENT_CODE_INTERPRETER_ENABLED_SECTION
         if code_interpreter_enabled

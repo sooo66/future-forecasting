@@ -84,17 +84,25 @@ def _runtime_ctx(tmp_path, llm=None):
     )
 
 
-def _question(market_id: str, *, open_time: str, resolve_time: str, label: int) -> dict[str, object]:
+def _question(
+    market_id: str,
+    *,
+    open_time: str,
+    resolve_time: str,
+    label: int,
+    sample_time: str | None = None,
+    domain: str = "finance",
+) -> dict[str, object]:
     return {
         "market_id": market_id,
         "question": f"Question {market_id}",
         "description": "Synthetic question",
         "resolution_criteria": "Synthetic resolution",
-        "domain": "finance",
+        "domain": domain,
         "open_time": open_time,
         "resolve_time": resolve_time,
         "resolved_time": resolve_time,
-        "sample_time": open_time,
+        "sample_time": sample_time or open_time,
         "difficulty": "easy",
         "sampled_prob_yes": 0.5,
         "label": label,
@@ -103,13 +111,20 @@ def _question(market_id: str, *, open_time: str, resolve_time: str, label: int) 
 
 
 def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path):
-    captured_counts = []
+    captured_memory_ids = []
     fake_llm = _FakeLLM()
+    predicted_probs = {
+        "m-1": 0.1,
+        "m-2": 0.9,
+        "m-3": 0.9,
+    }
 
     def fake_agentic(question, llm, search_engine, **kwargs):
-        captured_counts.append(len(kwargs.get("injected_memories") or []))
+        captured_memory_ids.append(
+            [item.source_question_id for item in (kwargs.get("injected_memories") or [])]
+        )
         return {
-            "predicted_prob": 0.9 if int(question["label"]) == 1 else 0.1,
+            "predicted_prob": predicted_probs[str(question["market_id"])],
             "reasoning_summary": f"summary {question['market_id']}",
             "retrieved_source_types": ["search"],
             "retrieved_docs": [],
@@ -124,12 +139,20 @@ def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path
     )
 
     session = ReasoningBankMethod().build_session(_runtime_ctx(tmp_path, llm=fake_llm), {"agent_max_steps": 3, "top_k": 1})
-    session.run_question(_question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1))
-    session.run_question(_question("m-2", open_time="2026-01-03T00:00:00Z", resolve_time="2026-01-04T00:00:00Z", label=0))
-    session.run_question(_question("m-3", open_time="2026-01-06T00:00:00Z", resolve_time="2026-01-08T00:00:00Z", label=1))
+    session.run_question(_question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-02T00:00:00Z", label=1))
+    session.run_question(_question("m-2", open_time="2026-01-02T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1))
+    session.run_question(
+        _question(
+            "m-3",
+            open_time="2026-01-03T00:00:00Z",
+            sample_time="2026-01-06T00:00:00Z",
+            resolve_time="2026-01-08T00:00:00Z",
+            label=1,
+        )
+    )
     artifacts = session.finalize()
 
-    assert captured_counts == [0, 0, 1]
+    assert captured_memory_ids == [[], [], ["m-2"]]
     assert fake_llm.chat_calls == 3
     assert len(artifacts) == 1
     assert artifacts[0].filename == "reasoningbank_mem.jsonl"
@@ -141,11 +164,21 @@ def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path
 def test_flex_session_preloads_only_resolved_experiences(monkeypatch, tmp_path):
     captured_preloaded = []
     fake_llm = _FakeLLM()
+    predicted_probs = {
+        "m-1": 0.9,
+        "m-2": 0.9,
+        "m-3": 0.9,
+    }
 
     def fake_agentic(question, llm, search_engine, **kwargs):
-        captured_preloaded.append(len(kwargs.get("flex_preloaded") or []))
+        captured_preloaded.append(
+            [
+                (item.source_question_id, item.domain, item.zone)
+                for item in (kwargs.get("flex_preloaded") or [])
+            ]
+        )
         return {
-            "predicted_prob": 0.9 if int(question["label"]) == 1 else 0.1,
+            "predicted_prob": predicted_probs[str(question["market_id"])],
             "reasoning_summary": f"summary {question['market_id']}",
             "retrieved_source_types": ["search"],
             "retrieved_docs": [],
@@ -163,12 +196,25 @@ def test_flex_session_preloads_only_resolved_experiences(monkeypatch, tmp_path):
         _runtime_ctx(tmp_path, llm=fake_llm),
         {"agent_max_steps": 3, "strategy_top_k": 1, "pattern_top_k": 1, "case_top_k": 1},
     )
-    session.run_question(_question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1))
-    session.run_question(_question("m-2", open_time="2026-01-03T00:00:00Z", resolve_time="2026-01-04T00:00:00Z", label=1))
-    session.run_question(_question("m-3", open_time="2026-01-06T00:00:00Z", resolve_time="2026-01-08T00:00:00Z", label=1))
+    session.run_question(
+        _question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1, domain="finance")
+    )
+    session.run_question(
+        _question("m-2", open_time="2026-01-03T00:00:00Z", resolve_time="2026-01-04T00:00:00Z", label=1, domain="world")
+    )
+    session.run_question(
+        _question(
+            "m-3",
+            open_time="2026-01-04T00:00:00Z",
+            sample_time="2026-01-06T00:00:00Z",
+            resolve_time="2026-01-08T00:00:00Z",
+            label=1,
+            domain="finance",
+        )
+    )
     artifacts = session.finalize()
 
-    assert captured_preloaded == [0, 0, 3]
+    assert captured_preloaded == [[], [], [("m-1", "finance", "golden")] * 3]
     assert fake_llm.chat_json_calls == 3
     assert len(artifacts) == 1
     assert artifacts[0].filename == "flex_mem.jsonl"
