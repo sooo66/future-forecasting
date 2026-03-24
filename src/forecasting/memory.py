@@ -61,6 +61,7 @@ class ReasoningBankRecord:
 class FlexExperience:
     experience_id: str
     source_question_id: str
+    domain: str
     zone: str
     level: str
     title: str
@@ -79,6 +80,9 @@ class FlexExperience:
 
     def to_tool_dict(self) -> dict[str, Any]:
         return {
+            "experience_id": self.experience_id,
+            "source_question_id": self.source_question_id,
+            "domain": self.domain,
             "zone": self.zone,
             "level": self.level,
             "title": self.title,
@@ -120,13 +124,19 @@ class ReasoningBankStore:
         *,
         open_time: str,
         top_k: int = 1,
+        success_only: bool = False,
     ) -> list[RetrievedMemoryItem]:
         self.activate_until(open_time)
-        if not self._active_records:
+        candidates = [
+            record
+            for record in self._active_records
+            if not success_only or record.success_or_failure == "success"
+        ]
+        if not candidates:
             return []
         query_embedding = self._embedder.embed_texts([query])[0]
         scored: list[tuple[float, ReasoningBankRecord]] = []
-        for record in self._active_records:
+        for record in candidates:
             score = _cosine_similarity(query_embedding, self._embedding_cache[record.record_id])
             scored.append((score, record))
         scored.sort(key=lambda pair: (pair[0], pair[1].source_resolved_time, pair[1].record_id), reverse=True)
@@ -205,6 +215,7 @@ class FlexLibrary:
         top_k: int = 5,
         zone: str | None = None,
         level: str | None = None,
+        domain: str | None = None,
         candidate_question_ids: set[str] | None = None,
     ) -> list[FlexExperience]:
         self.activate_until(open_time)
@@ -213,6 +224,7 @@ class FlexLibrary:
             for item in self._active_items
             if (not zone or item.zone == zone)
             and (not level or item.level == level)
+            and (not domain or item.domain == domain)
             and (candidate_question_ids is None or item.source_question_id in candidate_question_ids)
         ]
         if not candidates:
@@ -234,17 +246,28 @@ class FlexLibrary:
         *,
         open_time: str,
         per_level: dict[str, int] | None = None,
+        zone: str | None = None,
+        domain: str | None = None,
     ) -> list[FlexExperience]:
         level_targets = per_level or {"strategy": 5, "pattern": 5, "case": 5}
         collected: list[FlexExperience] = []
         seen_ids: set[str] = set()
-        selected_strategies = self.retrieve(query, open_time=open_time, top_k=level_targets.get("strategy", 5), level="strategy")
+        selected_strategies = self.retrieve(
+            query,
+            open_time=open_time,
+            top_k=level_targets.get("strategy", 5),
+            zone=zone,
+            level="strategy",
+            domain=domain,
+        )
         strategy_question_ids = {item.source_question_id for item in selected_strategies}
         selected_patterns = self.retrieve(
             query,
             open_time=open_time,
             top_k=level_targets.get("pattern", 5),
+            zone=zone,
             level="pattern",
+            domain=domain,
             candidate_question_ids=strategy_question_ids or None,
         )
         pattern_question_ids = {item.source_question_id for item in selected_patterns}
@@ -252,7 +275,9 @@ class FlexLibrary:
             query,
             open_time=open_time,
             top_k=level_targets.get("case", 5),
+            zone=zone,
             level="case",
+            domain=domain,
             candidate_question_ids=pattern_question_ids or None,
         )
         for group in (selected_strategies, selected_patterns, selected_cases):
@@ -290,7 +315,11 @@ class FlexLibrary:
     def _insert_or_merge(self, new_item: FlexExperience) -> None:
         new_embedding = self._embed_text(_flex_embedding_text(new_item))
         for index, existing in enumerate(self._active_items):
-            if existing.zone != new_item.zone or existing.level != new_item.level:
+            if (
+                existing.domain != new_item.domain
+                or existing.zone != new_item.zone
+                or existing.level != new_item.level
+            ):
                 continue
             if _is_exact_duplicate(existing, new_item):
                 return
@@ -328,6 +357,7 @@ def _merge_experiences(existing: FlexExperience, new_item: FlexExperience) -> Fl
     return FlexExperience(
         experience_id=existing.experience_id,
         source_question_id=existing.source_question_id,
+        domain=existing.domain,
         zone=existing.zone,
         level=existing.level,
         title=_prefer_richer(existing.title, new_item.title),

@@ -10,7 +10,12 @@ from typing import Any
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import FlexExperience, FlexLibrary
-from forecasting.methods._agentic_shared import build_memory_query, coerce_config, run_agentic_forecast
+from forecasting.methods._agentic_shared import (
+    build_memory_query,
+    coerce_config,
+    question_cutoff_time,
+    run_agentic_forecast,
+)
 from forecasting.prompts import build_flex_distill_messages
 from forecasting.question_tools import FlexMemoryTool, ResidentCodeInterpreterTool
 
@@ -22,6 +27,8 @@ class FlexConfig:
     strategy_top_k: int = 5
     pattern_top_k: int = 5
     case_top_k: int = 5
+    preload_zone: str = "golden"
+    preload_domain_match: bool = True
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL
     embedding_device: str | None = None
     merge_similarity_threshold: float = 0.92
@@ -53,14 +60,17 @@ class _FlexSession(MethodSession):
         )
 
     def run_question(self, question: QuestionRecord):
+        cutoff_time = question_cutoff_time(question)
         preloaded = self._library.retrieve_default_bundle(
             build_memory_query(question),
-            open_time=question["open_time"],
+            open_time=cutoff_time,
             per_level={
                 "strategy": self._config.strategy_top_k,
                 "pattern": self._config.pattern_top_k,
                 "case": self._config.case_top_k,
             },
+            zone=(self._config.preload_zone or "").strip().lower() or None,
+            domain=question["domain"] if self._config.preload_domain_match else None,
         )
         result = run_agentic_forecast(
             question,
@@ -70,7 +80,7 @@ class _FlexSession(MethodSession):
             method_name="flex",
             agent_max_steps=self._config.agent_max_steps,
             search_top_k=self._config.search_top_k,
-            flex_memory_tool=FlexMemoryTool(self._library, cutoff_time=question["open_time"]),
+            flex_memory_tool=FlexMemoryTool(self._library, cutoff_time=cutoff_time),
             flex_preloaded=preloaded,
             code_interpreter_tool=self._code_interpreter,
         )
@@ -107,6 +117,7 @@ def _build_flex_experiences(
             FlexExperience(
                 experience_id=f"flex-{zone}-{level}-{question['market_id']}",
                 source_question_id=question["market_id"],
+                domain=question["domain"],
                 zone=zone,
                 level=level,
                 title=str(block.get("title") or f"{question['domain']} {level}").strip(),

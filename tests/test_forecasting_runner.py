@@ -140,7 +140,7 @@ def test_runner_executes_spec_and_writes_outputs(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr("forecasting.runner.OpenAIChatModel", _FakeLLM)
-    monkeypatch.setattr("forecasting.runner.SearchClient", _FakeSearchClient)
+    monkeypatch.setattr("forecasting.runner.build_search_client", lambda **kwargs: _FakeSearchClient())
     monkeypatch.setattr("forecasting.runner.get_method", lambda method_id: _FakeMethod())
     monkeypatch.setattr(
         "forecasting.runner.load_fixed_question_subset",
