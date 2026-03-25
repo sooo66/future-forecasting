@@ -25,29 +25,16 @@ class QuestionRecord(TypedDict, total=False):
 
 class ForecastResult(TypedDict, total=False):
     market_id: str
-    method_name: str
     domain: str
     difficulty: str
-    open_time: str
-    resolve_time: str
-    sample_time: str | None
-    cutoff_time: str | None
     predicted_prob: float
     label: int
-    accuracy: int
     brier_score: float
-    log_loss: float
     trajectory: list[dict[str, Any]]
     reasoning_summary: str
     latency_sec: float
-    retrieved_source_types: list[str]
-    prompt_tokens: int | None
-    completion_tokens: int | None
     total_tokens: int | None
     steps_count: int | None
-    tool_usage_counts: dict[str, int]
-    injected_memories: list[dict[str, Any]]
-    flex_preloaded: list[dict[str, Any]]
     error: str
 
 

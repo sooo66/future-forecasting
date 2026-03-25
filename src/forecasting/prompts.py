@@ -6,7 +6,6 @@ If you want to manually edit forecasting prompts, start here.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from forecasting.memory import FlexExperience
@@ -20,45 +19,54 @@ FORECAST_SYSTEM_PROMPT = (
 )
 
 AGENT_SYSTEM_BASE_SECTIONS = [
-    "You are a forecasting research agent.",
-    "Your task is to estimate the probability that the market resolves YES.",
-    "Never use information later than the cutoff {cutoff_time}.",
-    "The available search and market-data tools are already constrained to the question cutoff.",
-    "Use tools when they materially improve the forecast instead of relying on unsupported intuition.",
-    "For structured historical price, index, FX, or crypto data, openbb is usually the most reliable and structured option.",
-    "For textual background, policy, people, events, or narrative evidence, search is usually the best starting point.",
-    "When using search, prefer named entities and concrete event descriptions over vague terms, and use source filters when a result set is clearly off-topic.",
-    "Search snippets may be noisy, incomplete, stale, or off-topic even when they rank highly. Treat each hit as provisional until the entity, timeframe, source, and quote actually match the market.",
-    "Search is capped to 2 calls total, each returning at most 3 truncated content snippets. Repeated or low-yield searches will be blocked.",
-    "Do not keep calling the same tool with near-duplicate queries if the returned evidence is off-topic; switch tools, narrow the source, or finalize with lower confidence.",
-    "Do not infer precise historical statistics, event mechanics, or hidden facts from weak search hits. If retrieval is poor, say confidence is limited and avoid overclaiming.",
-    "If the question mentions a ticker, price level, percentage move, index, FX pair, or crypto symbol, seriously consider openbb before additional broad search.",
-    "Aim to stay within the available reasoning-step budget and keep the tool path short.",
-    "Keep tool interactions concise. Do not use tools to restate qualitative reasoning you could express directly.",
-    "Before each tool call, keep your discussion to one short sentence rather than a long plan.",
-    "Return the final answer as JSON only with keys predicted_prob and reasoning_summary.",
-    "If evidence remains weak, lower confidence instead of inventing facts.",
+    """## Role & Goal
+You are a forecasting research agent.
+Your task is to estimate the probability that the market resolves YES.""",
+    """## Input Information
+You will receive a forecasting question containing:
+- question: the core prediction question
+- description: background context
+- resolution_criteria: how the market will be resolved as YES or NO
+- cutoff_time: the information cutoff date
+
+You may use available search and market-data tools to gather evidence.""",
+    """## Tool Usage Strategy
+**When to use each tool**:
+- For structured historical price, index, FX, or crypto data, openbb is the most reliable and structured option
+- For textual background, policy, people, events, or narrative evidence, search is the best starting point
+- If the question mentions a ticker, price level, percentage move, index, FX pair, or crypto symbol, prioritize openbb
+
+**Search rules**:
+- Search is capped to 2 calls total, each returning at most 3 truncated content snippets
+- Prefer named entities and concrete event descriptions over vague terms
+- If results are clearly off-topic, use source filters or change your query
+- Do not repeat the same tool with near-duplicate queries""",
+    """## Constraints
+- Never use information later than the cutoff {cutoff_time}
+- Search snippets may be noisy, incomplete, stale, or off-topic even when they rank highly. Treat each hit as provisional until the entity, timeframe, source, and quote actually match the market
+- Do not infer precise historical statistics, event mechanics, or hidden facts from weak search hits
+- If retrieval quality is poor, state that confidence is limited and avoid overclaiming
+- Keep tool interactions concise; do not use tools to restate qualitative reasoning you could express directly
+- Stay within the available reasoning-step budget and keep the tool path short""",
+    """## Output Format
+Return the final answer as JSON only with these two keys:
+- predicted_prob: a number in [0,1] representing your probability estimate for YES
+- reasoning_summary: a concise, factual summary of your reasoning
+
+**When to finalize**: If you have exhausted your evidence-gathering tools, or reached maximum reasoning steps, you MUST output JSON immediately. Do not say you need more time, more information, or more searches. Even with limited evidence, provide your best estimate.
+
+If evidence remains weak, lower confidence instead of inventing facts.""",
 ]
 
-AGENT_CODE_INTERPRETER_ENABLED_SECTION = (
-    "code_interpreter is available only because this question has an explicit numeric or interval-comparison component. "
-    "Use it only for a concrete calculation you cannot do reliably in plain text, and call it at most once."
-)
-
-AGENT_CODE_INTERPRETER_DISABLED_SECTION = (
-    "Do not use code_interpreter for this question. "
-    "This is not an explicit numeric-calculation task; reason directly from search/openbb evidence."
-)
-
 REASONINGBANK_MEMORY_PREAMBLE = (
-    "Below are some memory items that I accumulated from past interaction from the environment "
-    "that may be helpful to solve the task. You can use it when you feel it's relevant. "
-    "In each step, please first explicitly discuss if you want to use each memory item or not, and then take action."
+    "Below are memory items retrieved from past resolved forecasting questions that may be relevant to this task. "
+    "These are not direct evidence but serve as guidance for what to check or consider. "
+    "Review these items before deciding your evidence-gathering approach."
 )
 
 GENERIC_MEMORY_PREAMBLE = (
-    "You also have reusable historical memories from earlier resolved questions. "
-    "Treat them as guidance, not as direct evidence."
+    "Below are memory items from earlier resolved questions that may provide useful guidance. "
+    "Treat them as strategic hints, not as direct evidence."
 )
 
 FLEX_PRELOADED_PREAMBLE = (
@@ -73,16 +81,9 @@ FLEX_MEMORY_TOOL_PREAMBLE = (
 
 DIRECT_USER_SUFFIX = "Use only the market text above. Estimate the probability that the market resolves YES."
 AGENT_USER_SUFFIX = "Use tools as needed. When you finish, output JSON only with keys predicted_prob and reasoning_summary."
-AGENT_MEMORY_USER_SUFFIX = "The injected memories above are not evidence by themselves; use them to guide what to check."
+AGENT_MEMORY_USER_SUFFIX = "The injected memories above are hints for what to investigate, not evidence. Cross-check any memory guidance against actual retrieved evidence before relying on it."
 
-FORCED_FINALIZER_SYSTEM_PROMPT = (
-    "You are a forecasting assistant. A previous tool-using run collected evidence but did not return "
-    "the required final JSON. Using only the question and collected evidence below, return JSON only "
-    "with keys predicted_prob and reasoning_summary. Search snippets may be noisy or off-topic, so ignore "
-    "hits that do not clearly match the market entity, timeframe, and resolution criteria."
-)
-
-REASONINGBANK_SUCCESS_EXTRACTION_PROMPT = """You are an expert in web navigation. You will be given a user query, the corresponding trajectory
+REASONINGBANK_SUCCESS_EXTRACTION_PROMPT = """You are an expert in event forecasting. You will be given a user query, the corresponding trajectory
 that represents how an agent successfully accomplished the task.
 ## Guidelines
 You need to extract and summarize useful insights in the format of memory items based on the
@@ -104,7 +105,7 @@ Your output must strictly follow the Markdown format shown below:
 task>
 ```"""
 
-REASONINGBANK_FAILURE_EXTRACTION_PROMPT = """You are an expert in web navigation. You will be given a user query, the corresponding trajectory
+REASONINGBANK_FAILURE_EXTRACTION_PROMPT = """You are an expert in event forecasting. You will be given a user query, the corresponding trajectory
 that represents how an agent attempted to resolve the task but failed.
 ## Guidelines
 You need to extract and summarize useful insights in the format of memory items based on the
@@ -123,8 +124,7 @@ Your output must strictly follow the Markdown format shown below:
 # Memory Item i
 ## Title <the title of the memory item>
 ## Description <one sentence summary of the memory item>
-## Content <1-3 sentences describing the insights learned to successfully accomplishing the
-task>
+## Content <1-3 sentences describing the lessons learned from the failure>
 ```"""
 
 FLEX_SUCCESS_DISTILL_PROMPT = """You are building a FLEX experience library from a successful forecasting run.
@@ -134,15 +134,30 @@ Extract reusable experience blocks at three levels:
 3. case: a short task-shaped cue that helps retrieve this experience for similar situations.
 
 Requirements:
-- Return JSON only with keys strategy, pattern, case.
-- Each value must be an object with keys title, summary, content.
 - Focus on reusable guidance from the trajectory, not the final market answer itself.
 - Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
 - Do not use generic titles like "golden strategy" or "case note".
 - strategy should be broadly reusable and action-oriented.
 - pattern should describe what evidence to gather and in what order.
 - case should capture the shape of the task or the distinctive cue, but still avoid ids and exact dates.
-- Keep summary to one sentence and content to 2-4 short sentences."""
+- Keep summary to one sentence and content to 2-4 short sentences.
+
+## Output Format
+Your output must strictly follow the Markdown format shown below:
+# Strategy
+## Title <strategy title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the strategy>
+
+# Pattern
+## Title <pattern title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the pattern>
+
+# Case
+## Title <case title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the case>"""
 
 FLEX_FAILURE_DISTILL_PROMPT = """You are building a FLEX experience library from a failed forecasting run.
 Extract reusable warning blocks at three levels:
@@ -151,15 +166,30 @@ Extract reusable warning blocks at three levels:
 3. case: a short task-shaped cue that helps retrieve this warning for similar situations.
 
 Requirements:
-- Return JSON only with keys strategy, pattern, case.
-- Each value must be an object with keys title, summary, content.
 - Focus on reusable lessons from the trajectory, not the final market answer itself.
 - Do not copy raw JSON, predicted probabilities, market ids, exact dates, exact search queries, or long snippets from evidence.
 - Do not use generic titles like "warning strategy" or "case note".
 - strategy should state the corrective principle.
 - pattern should explain which evidence path failed or should have been prioritized instead.
 - case should capture the shape of the failure so it can be recognized later.
-- Keep summary to one sentence and content to 2-4 short sentences."""
+- Keep summary to one sentence and content to 2-4 short sentences.
+
+## Output Format
+Your output must strictly follow the Markdown format shown below:
+# Strategy
+## Title <strategy title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the corrective strategy>
+
+# Pattern
+## Title <pattern title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the failure pattern>
+
+# Case
+## Title <case title>
+## Summary <one sentence summary>
+## Content <2-4 short sentences describing the case>"""
 
 
 def forecast_system_prompt() -> str:
@@ -186,15 +216,9 @@ def build_agent_system_prompt(
     method_name: str,
     injected_memories: list[Any],
     flex_preloaded: list[FlexExperience],
-    code_interpreter_enabled: bool,
 ) -> str:
     cutoff_time = question.get("sample_time") or question["open_time"]
     parts = [section.format(cutoff_time=cutoff_time) for section in AGENT_SYSTEM_BASE_SECTIONS]
-    parts.append(
-        AGENT_CODE_INTERPRETER_ENABLED_SECTION
-        if code_interpreter_enabled
-        else AGENT_CODE_INTERPRETER_DISABLED_SECTION
-    )
     if injected_memories:
         parts.append(REASONINGBANK_MEMORY_PREAMBLE if method_name == "reasoningbank" else GENERIC_MEMORY_PREAMBLE)
         parts.append(format_memories_for_prompt(injected_memories))
@@ -211,25 +235,6 @@ def build_agent_user_prompt(question: dict[str, Any], *, injected_memories: list
     if injected_memories:
         prompt += f"\n\n{AGENT_MEMORY_USER_SUFFIX}"
     return prompt
-
-
-def build_forced_finalizer_messages(
-    question: dict[str, Any],
-    *,
-    trajectory: list[dict[str, Any]],
-) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": FORCED_FINALIZER_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"{question_block(question)}\n\n"
-                "Collected evidence:\n"
-                f"{format_trajectory_for_finalizer(trajectory)}\n\n"
-                "Return JSON only with keys predicted_prob and reasoning_summary."
-            ),
-        },
-    ]
 
 
 def build_reasoningbank_extraction_messages(
@@ -352,27 +357,8 @@ def format_flex_experiences_for_prompt(items: list[FlexExperience]) -> str:
     return "\n".join(lines)
 
 
-def format_trajectory_for_finalizer(trajectory: list[dict[str, Any]]) -> str:
-    if not trajectory:
-        return "No tool evidence was collected."
-    lines: list[str] = []
-    for step in trajectory[-12:]:
-        name = str(step.get("step") or "step")
-        payload = {key: value for key, value in step.items() if key != "step"}
-        lines.append(f"[{name}] {json.dumps(payload, ensure_ascii=False)}")
-    return "\n".join(lines)
-
-
 def _compact_text(text: str, limit: int) -> str:
     collapsed = " ".join((text or "").split())
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 3].rstrip() + "..."
-
-
-# Backward-compatible aliases while callers are migrated.
-direct_user_prompt = build_direct_user_prompt
-rag_user_prompt = build_rag_user_prompt
-agent_system_prompt = build_agent_system_prompt
-agent_user_prompt = build_agent_user_prompt
-forced_finalizer_messages = build_forced_finalizer_messages

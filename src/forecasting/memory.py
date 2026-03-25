@@ -257,40 +257,20 @@ class FlexLibrary:
         level_targets = per_level or {"strategy": 5, "pattern": 5, "case": 5}
         collected: list[FlexExperience] = []
         seen_ids: set[str] = set()
-        selected_strategies = self.retrieve(
-            query,
-            open_time=open_time,
-            top_k=level_targets.get("strategy", 5),
-            zone=zone,
-            level="strategy",
-            domain=domain,
-        )
-        strategy_question_ids = {item.source_question_id for item in selected_strategies}
-        selected_patterns = self.retrieve(
-            query,
-            open_time=open_time,
-            top_k=level_targets.get("pattern", 5),
-            zone=zone,
-            level="pattern",
-            domain=domain,
-            candidate_question_ids=strategy_question_ids or None,
-        )
-        pattern_question_ids = {item.source_question_id for item in selected_patterns}
-        selected_cases = self.retrieve(
-            query,
-            open_time=open_time,
-            top_k=level_targets.get("case", 5),
-            zone=zone,
-            level="case",
-            domain=domain,
-            candidate_question_ids=pattern_question_ids or None,
-        )
-        for group in (selected_strategies, selected_patterns, selected_cases):
-            for item in group:
-                if item.experience_id in seen_ids:
-                    continue
-                seen_ids.add(item.experience_id)
-                collected.append(item)
+        # Retrieve all three levels independently (per original FLEX paper)
+        for level in ("strategy", "pattern", "case"):
+            items = self.retrieve(
+                query,
+                open_time=open_time,
+                top_k=level_targets.get(level, 5),
+                zone=zone,
+                level=level,
+                domain=domain,
+            )
+            for item in items:
+                if item.experience_id not in seen_ids:
+                    seen_ids.add(item.experience_id)
+                    collected.append(item)
         return collected
 
     def items(self) -> list[FlexExperience]:

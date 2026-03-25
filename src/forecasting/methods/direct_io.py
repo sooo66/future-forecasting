@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
-from forecasting.methods._agentic_shared import coerce_config, run_direct_io_forecast
+from forecasting.methods._agentic import run_direct_io_forecast
+from forecasting.methods._shared import coerce_config
 
 
 @dataclass(frozen=True)
 class DirectIOConfig:
-    max_tokens: int = 300
+    max_tokens: int = 2048
     temperature: float = 0.0
 
 

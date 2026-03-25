@@ -13,14 +13,6 @@ from qwen_agent.log import logger
 from qwen_agent.tools.base import BaseTool
 from qwen_agent.utils.tokenization_qwen import tokenizer as qwen_tokenizer
 
-DEFAULT_SYSTEM_PROMPT = (
-    "你是一个用于 future forecasting 的研究 agent。\n"
-    "需要历史资料时优先使用 `search`。`search` 会自动遵守外部注入的截止时间。\n"
-    "需要行情、指数、汇率或加密货币价格时使用 `openbb`。`openbb` 也会自动遵守同一个截止时间。\n"
-    "需要计算、画图、清洗数据或编写临时代码时使用 `code_interpreter`。"
-)
-
-
 class AgentError(RuntimeError):
     """Raised when the agent cannot complete a run."""
 
@@ -106,7 +98,7 @@ class Agent:
         max_steps: int = 8,
         raise_on_tool_error: bool = False,
     ) -> None:
-        self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+        self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.raise_on_tool_error = raise_on_tool_error
         self._last_usage = _empty_usage_dict()
@@ -119,7 +111,7 @@ class Agent:
         self._apply_max_steps()
         self._assistant = _LocalAssistant(
             llm=self.llm,
-            system_message=self.system_prompt,
+            system_message=self.system_prompt or "",
             function_list=list(tools or []),
             raise_on_tool_error=raise_on_tool_error,
             tool_event_recorder=self._record_tool_event,

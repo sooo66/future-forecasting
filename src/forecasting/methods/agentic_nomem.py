@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
-from forecasting.methods._agentic_shared import coerce_config, run_agentic_forecast
-from forecasting.question_tools import ResidentCodeInterpreterTool
+from forecasting.methods._agentic import run_agentic_forecast
+from forecasting.methods._shared import coerce_config
 
 
 @dataclass(frozen=True)
@@ -28,9 +28,6 @@ class _AgenticNoMemorySession(MethodSession):
         self._runtime_ctx = runtime_ctx
         self._config = config
         self._llm = runtime_ctx.make_llm()
-        self._code_interpreter = ResidentCodeInterpreterTool(
-            work_dir=runtime_ctx.project_root / ".qwen_agent_workspace" / "forecasting" / "agentic_nomem"
-        )
 
     def run_question(self, question: QuestionRecord):
         return run_agentic_forecast(
@@ -41,7 +38,6 @@ class _AgenticNoMemorySession(MethodSession):
             method_name="agentic_nomem",
             agent_max_steps=self._config.agent_max_steps,
             search_top_k=self._config.search_top_k,
-            code_interpreter_tool=self._code_interpreter,
         )
 
     def finalize(self) -> list[MethodArtifact]:

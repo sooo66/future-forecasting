@@ -9,17 +9,18 @@ from typing import Any
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import MemoryItem, ReasoningBankRecord, ReasoningBankStore
-from forecasting.methods._agentic_shared import (
+from forecasting.methods._agentic import (
     build_memory_query,
+    run_agentic_forecast,
+)
+from forecasting.methods._shared import (
     coerce_config,
     question_cutoff_time,
-    run_agentic_forecast,
 )
 from forecasting.prompts import (
     build_reasoningbank_extraction_messages,
     format_reasoningbank_trajectory,
 )
-from forecasting.question_tools import ResidentCodeInterpreterTool
 
 
 @dataclass(frozen=True)
@@ -53,9 +54,6 @@ class _ReasoningBankSession(MethodSession):
             ),
             model_name=config.embedding_model_name,
         )
-        self._code_interpreter = ResidentCodeInterpreterTool(
-            work_dir=runtime_ctx.project_root / ".qwen_agent_workspace" / "forecasting" / "reasoningbank"
-        )
 
     def run_question(self, question: QuestionRecord):
         cutoff_time = question_cutoff_time(question)
@@ -75,7 +73,6 @@ class _ReasoningBankSession(MethodSession):
             agent_max_steps=self._config.agent_max_steps,
             search_top_k=self._config.search_top_k,
             injected_memories=memories,
-            code_interpreter_tool=self._code_interpreter,
         )
         if "error" not in result:
             self._store.queue(_build_reasoningbank_record(question, result, llm=self._llm))
@@ -132,7 +129,7 @@ def _extract_reasoningbank_items(
             trajectory_text=format_reasoningbank_trajectory(result),
             success_or_failure=success_or_failure,
         ),
-        max_tokens=700,
+        max_tokens=2048,
         temperature=0.0,
     )
     items = _parse_memory_items(raw_text)

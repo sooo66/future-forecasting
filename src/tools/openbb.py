@@ -14,7 +14,6 @@ import time
 from typing import Any, Callable, Optional
 
 from openbb import obb
-from yfinance.exceptions import YFRateLimitError
 
 
 _PROXY_ENV_KEYS = [
@@ -25,11 +24,11 @@ _PROXY_ENV_KEYS = [
     "all_proxy",
     "ALL_PROXY",
 ]
-_YFINANCE_MIN_INTERVAL_SECONDS = float(os.getenv("YFINANCE_MIN_INTERVAL_SECONDS", "1.5") or 1.5)
-_YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS", "60") or 60.0)
-_YFINANCE_CALL_LOCK = threading.Lock()
-_YFINANCE_LAST_CALL_AT = 0.0
-_YFINANCE_COOLDOWN_UNTIL = 0.0
+_TIINGO_MIN_INTERVAL_SECONDS = float(os.getenv("TIINGO_MIN_INTERVAL_SECONDS", "1.0") or 1.0)
+_TIINGO_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("TIINGO_RATE_LIMIT_COOLDOWN_SECONDS", "60") or 60.0)
+_TIINGO_CALL_LOCK = threading.Lock()
+_TIINGO_LAST_CALL_AT = 0.0
+_TIINGO_COOLDOWN_UNTIL = 0.0
 _OPENBB_RESULT_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -42,47 +41,155 @@ class OpenBBFunctionSpec:
 
 
 SAFE_OPENBB_FUNCTIONS: dict[str, OpenBBFunctionSpec] = {
+    # === Equity (Stocks) ===
     "equity.price.quote": OpenBBFunctionSpec(
         path="equity.price.quote",
-        description="股票最新报价，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="股票最新报价。provider: fmp（需 FMP_API_KEY），不支持 tiingo。",
+        default_provider="fmp",
         example_params={"symbol": "AAPL"},
     ),
     "equity.price.historical": OpenBBFunctionSpec(
         path="equity.price.historical",
-        description="股票历史价格，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="股票历史价格。provider: tiingo（需 TIINGO_API_KEY），可选 fmp/polygon。",
+        default_provider="tiingo",
         example_params={"symbol": "AAPL", "start_date": "2026-02-01", "end_date": "2026-02-10"},
     ),
     "equity.profile": OpenBBFunctionSpec(
         path="equity.profile",
-        description="股票公司简介与基本信息，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="股票公司简介与基本信息。provider: fmp（需 FMP_API_KEY）。",
+        default_provider="fmp",
         example_params={"symbol": "AAPL"},
     ),
+    "equity.ownership.institutional": OpenBBFunctionSpec(
+        path="equity.ownership.institutional",
+        description="机构持仓（主要股东、机构持有比例）。provider: fmp。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL"},
+    ),
+    "equity.fundamental.metrics": OpenBBFunctionSpec(
+        path="equity.fundamental.metrics",
+        description="估值指标（P/E、EV/EBITDA、PEG 等）。provider: fmp。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL"},
+    ),
+    "equity.fundamental.income": OpenBBFunctionSpec(
+        path="equity.fundamental.income",
+        description="损益表（收入、利润等）。provider: fmp 或 polygon。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL", "period": "annual", "limit": 5},
+    ),
+    "equity.fundamental.balance": OpenBBFunctionSpec(
+        path="equity.fundamental.balance",
+        description="资产负债表。provider: fmp 或 polygon。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL", "period": "annual", "limit": 5},
+    ),
+    "equity.fundamental.cash": OpenBBFunctionSpec(
+        path="equity.fundamental.cash",
+        description="现金流量表。provider: fmp 或 polygon。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL", "period": "annual", "limit": 5},
+    ),
+    "equity.fundamental.dividends": OpenBBFunctionSpec(
+        path="equity.fundamental.dividends",
+        description="分红历史。provider: fmp。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL", "limit": 10},
+    ),
+    "equity.fundamental.historical_splits": OpenBBFunctionSpec(
+        path="equity.fundamental.historical_splits",
+        description="股票拆分历史。provider: fmp。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL"},
+    ),
+    "equity.fundamental.historical_eps": OpenBBFunctionSpec(
+        path="equity.fundamental.historical_eps",
+        description="历史 EPS 数据。provider: fmp。",
+        default_provider="fmp",
+        example_params={"symbol": "AAPL"},
+    ),
+    # === Crypto - tiingo ===
     "crypto.price.historical": OpenBBFunctionSpec(
         path="crypto.price.historical",
-        description="加密货币历史价格，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="加密货币历史价格。provider: tiingo（需 TIINGO_API_KEY）。",
+        default_provider="tiingo",
         example_params={"symbol": "BTC-USD", "start_date": "2026-02-01", "end_date": "2026-02-10"},
     ),
+    # === Currency/Forex - tiingo ===
     "currency.price.historical": OpenBBFunctionSpec(
         path="currency.price.historical",
-        description="外汇历史价格，symbol 可写成 USD-CNY 这类格式，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="外汇历史价格，symbol 格式 USD-CNY。provider: tiingo（需 TIINGO_API_KEY）。",
+        default_provider="tiingo",
         example_params={"symbol": "USD-CNY", "start_date": "2026-02-01", "end_date": "2026-02-10"},
     ),
+    # === Index ===
     "index.available": OpenBBFunctionSpec(
         path="index.available",
-        description="可用指数列表，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="可用指数列表。provider: fmp 或 yfinance。",
+        default_provider="fmp",
         example_params={},
     ),
     "index.price.historical": OpenBBFunctionSpec(
         path="index.price.historical",
-        description="指数历史价格，默认 provider 使用 yfinance。",
-        default_provider="yfinance",
+        description="指数历史价格。provider: fmp 或 polygon。",
+        default_provider="fmp",
         example_params={"symbol": "^GSPC", "start_date": "2026-02-01", "end_date": "2026-02-10"},
+    ),
+    # === Macroeconomic - FRED / OECD ===
+    "economy.cpi": OpenBBFunctionSpec(
+        path="economy.cpi",
+        description="消费者价格指数 (CPI) 通胀数据。provider: fred（需 FRED_API_KEY）。",
+        default_provider="fred",
+        example_params={"year": 2025, "month": 1},
+    ),
+    "economy.unemployment": OpenBBFunctionSpec(
+        path="economy.unemployment",
+        description="失业率。provider: oecd。",
+        default_provider="oecd",
+        example_params={"country": "USA"},
+    ),
+    "economy.gdp.real": OpenBBFunctionSpec(
+        path="economy.gdp.real",
+        description="实际 GDP。provider: oecd 或 econdb。",
+        default_provider="oecd",
+        example_params={"country": "USA"},
+    ),
+    "economy.gdp.nominal": OpenBBFunctionSpec(
+        path="economy.gdp.nominal",
+        description="名义 GDP。provider: oecd 或 econdb。",
+        default_provider="oecd",
+        example_params={"country": "USA"},
+    ),
+    "economy.interest_rates": OpenBBFunctionSpec(
+        path="economy.interest_rates",
+        description="基准利率。provider: oecd。",
+        default_provider="oecd",
+        example_params={"country": "USA"},
+    ),
+    "economy.balance_of_payments": OpenBBFunctionSpec(
+        path="economy.balance_of_payments",
+        description="国际收支平衡表。provider: fred（需 FRED_API_KEY）。",
+        default_provider="fred",
+        example_params={},
+    ),
+    "economy.central_bank_holdings": OpenBBFunctionSpec(
+        path="economy.central_bank_holdings",
+        description="央行资产持有量。provider: federal_reserve。",
+        default_provider="federal_reserve",
+        example_params={},
+    ),
+    "economy.indicators": OpenBBFunctionSpec(
+        path="economy.indicators",
+        description="宏观经济领先/滞后指标（PMI、消费者信心等）。provider: econdb 或 imf。",
+        default_provider="econdb",
+        example_params={"name": "Composite Leading Indicator"},
+    ),
+    # === Fixed Income / Treasury ===
+    "fixedincome.government.treasury_rates": OpenBBFunctionSpec(
+        path="fixedincome.government.treasury_rates",
+        description="美国国债收益率曲线。provider: federal_reserve 或 fmp。",
+        default_provider="federal_reserve",
+        example_params={"start_date": "2026-02-01", "end_date": "2026-02-10"},
     ),
 }
 
@@ -114,7 +221,10 @@ def call_openbb_function(
     if raw_function.lower() in {"", "list", "help"}:
         return {
             "supported_functions": list_supported_openbb_functions(),
-            "notes": "当前只开放首批无需额外 API key 的 OpenBB 函数；需要密钥的 provider 先不接入。",
+            "notes": (
+                "Provider 说明：tiingo（需 TIINGO_API_KEY）用于历史价格；fmp（需 FMP_API_KEY）用于报价/基本面；"
+                "fred（需 FRED_API_KEY）用于宏观经济；oecd 用于 OECD 经济数据；federal_reserve 用于央行/国债数据。"
+            ),
         }
 
     if raw_function not in SAFE_OPENBB_FUNCTIONS:
@@ -139,7 +249,7 @@ def call_openbb_function(
     try:
         result = _invoke_with_retry(raw_function, payload, invoke=invoke)
     except Exception as exc:
-        cooldown_remaining = _yfinance_cooldown_remaining(payload)
+        cooldown_remaining = _tiingo_cooldown_remaining(payload)
         error_payload = {
             "function": raw_function,
             "params": _sanitize(payload),
@@ -155,7 +265,7 @@ def call_openbb_function(
                 return {
                     **cached_payload,
                     "cache_hit": True,
-                    "warning": "Returned cached OpenBB result after yfinance rate limit.",
+                    "warning": "Returned cached OpenBB result after provider rate limit.",
                     "stale_cache": True,
                 }
         return {
@@ -202,11 +312,11 @@ def _invoke_with_retry(
         if delay > 0:
             time.sleep(delay)
         try:
-            _guard_yfinance_request(params)
+            _guard_tiingo_request(params)
             return invoke(function, params)
         except Exception as exc:
             last_exc = exc
-            _record_yfinance_result(params, exc)
+            _record_tiingo_result(params, exc)
             if not _is_openbb_rate_limit_error(exc) or index == len(delays) - 1:
                 raise
     if last_exc is not None:
@@ -215,14 +325,13 @@ def _invoke_with_retry(
 
 
 def _is_openbb_rate_limit_error(exc: Exception) -> bool:
-    if isinstance(exc, YFRateLimitError):
-        return True
     message = str(exc).lower()
     return (
         "too many requests" in message
         or "rate limit" in message
         or "ratelimit" in message
-        or "yfinance cooldown active" in message
+        or "429" in message
+        or "tiingo" in message and "limit" in message
     )
 
 
@@ -266,43 +375,44 @@ def _make_openbb_cache_key(function: str, params: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _uses_yfinance(params: dict[str, Any]) -> bool:
-    return str(params.get("provider") or "").strip().lower() == "yfinance"
+def _uses_tiingo(params: dict[str, Any]) -> bool:
+    provider = str(params.get("provider") or "").strip().lower()
+    return provider == "tiingo"
 
 
-def _guard_yfinance_request(params: dict[str, Any]) -> None:
-    if not _uses_yfinance(params):
+def _guard_tiingo_request(params: dict[str, Any]) -> None:
+    if not _uses_tiingo(params):
         return
-    global _YFINANCE_LAST_CALL_AT
-    with _YFINANCE_CALL_LOCK:
+    global _TIINGO_LAST_CALL_AT
+    with _TIINGO_CALL_LOCK:
         now = time.monotonic()
-        if _YFINANCE_COOLDOWN_UNTIL > now:
-            remaining = _YFINANCE_COOLDOWN_UNTIL - now
-            raise RuntimeError(f"yfinance cooldown active for {remaining:.1f}s after rate limiting")
-        wait_for = (_YFINANCE_LAST_CALL_AT + _YFINANCE_MIN_INTERVAL_SECONDS) - now
+        if _TIINGO_COOLDOWN_UNTIL > now:
+            remaining = _TIINGO_COOLDOWN_UNTIL - now
+            raise RuntimeError(f"tiingo cooldown active for {remaining:.1f}s after rate limiting")
+        wait_for = (_TIINGO_LAST_CALL_AT + _TIINGO_MIN_INTERVAL_SECONDS) - now
         if wait_for > 0:
             time.sleep(wait_for)
-        _YFINANCE_LAST_CALL_AT = time.monotonic()
+        _TIINGO_LAST_CALL_AT = time.monotonic()
 
 
-def _record_yfinance_result(params: dict[str, Any], exc: Exception | None) -> None:
-    if not _uses_yfinance(params):
+def _record_tiingo_result(params: dict[str, Any], exc: Exception | None) -> None:
+    if not _uses_tiingo(params):
         return
-    global _YFINANCE_COOLDOWN_UNTIL
+    global _TIINGO_COOLDOWN_UNTIL
     if exc is None:
         return
     if _is_openbb_rate_limit_error(exc):
-        with _YFINANCE_CALL_LOCK:
-            _YFINANCE_COOLDOWN_UNTIL = max(
-                _YFINANCE_COOLDOWN_UNTIL,
-                time.monotonic() + _YFINANCE_RATE_LIMIT_COOLDOWN_SECONDS,
+        with _TIINGO_CALL_LOCK:
+            _TIINGO_COOLDOWN_UNTIL = max(
+                _TIINGO_COOLDOWN_UNTIL,
+                time.monotonic() + _TIINGO_RATE_LIMIT_COOLDOWN_SECONDS,
             )
 
 
-def _yfinance_cooldown_remaining(params: dict[str, Any]) -> int | None:
-    if not _uses_yfinance(params):
+def _tiingo_cooldown_remaining(params: dict[str, Any]) -> int | None:
+    if not _uses_tiingo(params):
         return None
-    remaining = int(max(0.0, _YFINANCE_COOLDOWN_UNTIL - time.monotonic()))
+    remaining = int(max(0.0, _TIINGO_COOLDOWN_UNTIL - time.monotonic()))
     return remaining or None
 
 
