@@ -201,7 +201,7 @@ class OpenBBTool(BaseTool):
             {
                 "function": alias,
                 "description": f"Alias for the latest historical observation from {target} before the cutoff.",
-                "default_provider": "yfinance",
+                "default_provider": "fmp",
                 "signature": "(symbol, optional start_date/end_date)",
                 "example_params": {"symbol": "AAPL"},
             }
