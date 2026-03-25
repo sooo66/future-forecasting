@@ -76,7 +76,8 @@ class FlexMemoryTool(BaseTool):
     name = "memory"
     description = (
         "Retrieve prior experiences from the evolving FLEX library. "
-        "You can filter by zone (golden or warning) and level (strategy, pattern, case)."
+        "You can filter by zone (golden or warning) and level (strategy, pattern, case). "
+        "Results are automatically limited to the current question domain when configured."
     )
     parameters = [
         {"name": "query", "type": "string", "description": "Current reasoning query or state.", "required": True},
@@ -90,10 +91,11 @@ class FlexMemoryTool(BaseTool):
         {"name": "top_k", "type": "integer", "description": "Maximum number of memories to return.", "required": False},
     ]
 
-    def __init__(self, library: Any, *, cutoff_time: str):
+    def __init__(self, library: Any, *, cutoff_time: str, domain: str | None = None):
         super().__init__()
         self._library = library
         self.cutoff_time = cutoff_time
+        self.domain = (domain or "").strip() or None
 
     def call(self, params: str | dict, **kwargs: Any) -> dict[str, Any]:
         payload = self._verify_json_format_args(params)
@@ -104,9 +106,11 @@ class FlexMemoryTool(BaseTool):
             top_k=top_k,
             zone=str(payload.get("zone") or "").strip().lower() or None,
             level=str(payload.get("level") or "").strip().lower() or None,
+            domain=self.domain,
         )
         return {
             "cutoff_time": self.cutoff_time,
+            "domain": self.domain,
             "count": len(hits),
             "hits": [item.to_tool_dict() for item in hits],
         }

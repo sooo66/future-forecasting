@@ -110,11 +110,11 @@ def _question(
     }
 
 
-def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path):
+def test_reasoningbank_session_does_not_leak_future_or_cross_domain_memory(monkeypatch, tmp_path):
     captured_memory_ids = []
     fake_llm = _FakeLLM()
     predicted_probs = {
-        "m-1": 0.1,
+        "m-1": 0.9,
         "m-2": 0.9,
         "m-3": 0.9,
     }
@@ -139,8 +139,12 @@ def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path
     )
 
     session = ReasoningBankMethod().build_session(_runtime_ctx(tmp_path, llm=fake_llm), {"agent_max_steps": 3, "top_k": 1})
-    session.run_question(_question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-02T00:00:00Z", label=1))
-    session.run_question(_question("m-2", open_time="2026-01-02T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1))
+    session.run_question(
+        _question("m-1", open_time="2026-01-01T00:00:00Z", resolve_time="2026-01-02T00:00:00Z", label=1, domain="finance")
+    )
+    session.run_question(
+        _question("m-2", open_time="2026-01-02T00:00:00Z", resolve_time="2026-01-05T00:00:00Z", label=1, domain="world")
+    )
     session.run_question(
         _question(
             "m-3",
@@ -148,11 +152,12 @@ def test_reasoningbank_session_does_not_leak_future_memory(monkeypatch, tmp_path
             sample_time="2026-01-06T00:00:00Z",
             resolve_time="2026-01-08T00:00:00Z",
             label=1,
+            domain="finance",
         )
     )
     artifacts = session.finalize()
 
-    assert captured_memory_ids == [[], [], ["m-2"]]
+    assert captured_memory_ids == [[], [], ["m-1"]]
     assert fake_llm.chat_calls == 3
     assert len(artifacts) == 1
     assert artifacts[0].filename == "reasoningbank_mem.jsonl"

@@ -24,6 +24,7 @@ def test_reasoningbank_store_only_activates_past_resolved_records():
         ReasoningBankRecord(
             record_id="rb-past",
             source_question_id="q1",
+            domain="finance",
             query="AAPL supply signal",
             trajectory=[{"step": "final", "raw_response": "past"}],
             memory_items=[MemoryItem(title="Past cue", description="usable", content="useful signal")],
@@ -39,6 +40,7 @@ def test_reasoningbank_store_only_activates_past_resolved_records():
         ReasoningBankRecord(
             record_id="rb-future",
             source_question_id="q2",
+            domain="finance",
             query="AAPL future warning",
             trajectory=[{"step": "final", "raw_response": "future"}],
             memory_items=[MemoryItem(title="Future cue", description="not yet active", content="should not leak")],
@@ -63,6 +65,7 @@ def test_reasoningbank_store_can_restrict_to_successful_memories():
         ReasoningBankRecord(
             record_id="rb-success",
             source_question_id="q-success",
+            domain="finance",
             query="AAPL signal",
             trajectory=[{"step": "final", "raw_response": "success"}],
             memory_items=[MemoryItem(title="Success cue", description="usable", content="use structured evidence")],
@@ -78,6 +81,7 @@ def test_reasoningbank_store_can_restrict_to_successful_memories():
         ReasoningBankRecord(
             record_id="rb-failure",
             source_question_id="q-failure",
+            domain="finance",
             query="AAPL warning",
             trajectory=[{"step": "final", "raw_response": "failure"}],
             memory_items=[MemoryItem(title="Failure cue", description="avoid", content="do not overfit weak trends")],
@@ -93,6 +97,51 @@ def test_reasoningbank_store_can_restrict_to_successful_memories():
     hits = store.retrieve("AAPL signal", open_time="2026-01-10T00:00:00Z", top_k=2, success_only=True)
 
     assert [item.record_id for item in hits] == ["rb-success"]
+
+
+def test_reasoningbank_store_can_filter_by_domain():
+    store = ReasoningBankStore(embedder=_FakeEmbedder(), model_name="fake-embedder")
+    store.queue(
+        ReasoningBankRecord(
+            record_id="rb-finance",
+            source_question_id="q-finance",
+            domain="finance",
+            query="AAPL signal",
+            trajectory=[{"step": "final", "raw_response": "finance"}],
+            memory_items=[MemoryItem(title="Finance cue", description="usable", content="finance only")],
+            created_at="2026-01-05T00:00:00Z",
+            source_open_time="2026-01-01T00:00:00Z",
+            source_resolved_time="2026-01-05T00:00:00Z",
+            outcome=1,
+            predicted_prob=0.9,
+            success_or_failure="success",
+        )
+    )
+    store.queue(
+        ReasoningBankRecord(
+            record_id="rb-world",
+            source_question_id="q-world",
+            domain="world",
+            query="AAPL signal",
+            trajectory=[{"step": "final", "raw_response": "world"}],
+            memory_items=[MemoryItem(title="World cue", description="usable", content="world only")],
+            created_at="2026-01-06T00:00:00Z",
+            source_open_time="2026-01-02T00:00:00Z",
+            source_resolved_time="2026-01-06T00:00:00Z",
+            outcome=1,
+            predicted_prob=0.9,
+            success_or_failure="success",
+        )
+    )
+
+    hits = store.retrieve(
+        "AAPL signal",
+        open_time="2026-01-10T00:00:00Z",
+        top_k=2,
+        domain="finance",
+    )
+
+    assert [(item.record_id, item.domain) for item in hits] == [("rb-finance", "finance")]
 
 
 def test_flex_library_merges_similar_entries_and_retrieves_hierarchical_bundle():

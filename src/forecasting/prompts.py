@@ -28,10 +28,12 @@ AGENT_SYSTEM_BASE_SECTIONS = [
     "For structured historical price, index, FX, or crypto data, openbb is usually the most reliable and structured option.",
     "For textual background, policy, people, events, or narrative evidence, search is usually the best starting point.",
     "When using search, prefer named entities and concrete event descriptions over vague terms, and use source filters when a result set is clearly off-topic.",
+    "Search snippets may be noisy, incomplete, stale, or off-topic even when they rank highly. Treat each hit as provisional until the entity, timeframe, source, and quote actually match the market.",
     "Search is capped to 2 calls total, each returning at most 3 truncated content snippets. Repeated or low-yield searches will be blocked.",
     "Do not keep calling the same tool with near-duplicate queries if the returned evidence is off-topic; switch tools, narrow the source, or finalize with lower confidence.",
+    "Do not infer precise historical statistics, event mechanics, or hidden facts from weak search hits. If retrieval is poor, say confidence is limited and avoid overclaiming.",
     "If the question mentions a ticker, price level, percentage move, index, FX pair, or crypto symbol, seriously consider openbb before additional broad search.",
-    "Aim to stay within at most 5 LLM reasoning steps and keep the tool path short.",
+    "Aim to stay within the available reasoning-step budget and keep the tool path short.",
     "Keep tool interactions concise. Do not use tools to restate qualitative reasoning you could express directly.",
     "Before each tool call, keep your discussion to one short sentence rather than a long plan.",
     "Return the final answer as JSON only with keys predicted_prob and reasoning_summary.",
@@ -76,7 +78,8 @@ AGENT_MEMORY_USER_SUFFIX = "The injected memories above are not evidence by them
 FORCED_FINALIZER_SYSTEM_PROMPT = (
     "You are a forecasting assistant. A previous tool-using run collected evidence but did not return "
     "the required final JSON. Using only the question and collected evidence below, return JSON only "
-    "with keys predicted_prob and reasoning_summary."
+    "with keys predicted_prob and reasoning_summary. Search snippets may be noisy or off-topic, so ignore "
+    "hits that do not clearly match the market entity, timeframe, and resolution criteria."
 )
 
 REASONINGBANK_SUCCESS_EXTRACTION_PROMPT = """You are an expert in web navigation. You will be given a user query, the corresponding trajectory

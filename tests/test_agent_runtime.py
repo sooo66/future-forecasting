@@ -4,6 +4,7 @@ from agent import Agent
 from forecasting.memory import FlexExperience, RetrievedMemoryItem
 from forecasting.methods._agentic_shared import _extract_agent_outputs, _normalize_final_payload, run_agentic_forecast
 from forecasting.llm import LLMUsage
+from forecasting.question_tools import FlexMemoryTool
 
 
 class _FakeAssistant:
@@ -252,6 +253,7 @@ def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkey
             memory_id="rb-1#1",
             record_id="rb-1",
             source_question_id="q-1",
+            domain="finance",
             source_resolved_time="2026-01-10T00:00:00Z",
             success_or_failure="success",
             title="Memory title",
@@ -290,6 +292,7 @@ def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkey
 
     assert captured["cuttime"] == "2026-01-27T00:00:00Z"
     assert "2026-01-27T00:00:00Z" in captured["system_prompt"]
+    assert "Search snippets may be noisy, incomplete, stale, or off-topic" in captured["system_prompt"]
     assert result["cutoff_time"] == "2026-01-27T00:00:00Z"
     assert result["injected_memories"][0]["memory_id"] == "rb-1#1"
     assert result["flex_preloaded"][0]["experience_id"] == "flex-1"
@@ -364,3 +367,38 @@ def test_extract_agent_outputs_keeps_memory_hit_metadata_in_trajectory():
     assert hit["experience_id"] == "flex-1"
     assert hit["source_question_id"] == "q-1"
     assert hit["domain"] == "finance"
+
+
+def test_flex_memory_tool_enforces_current_domain():
+    captured = {}
+
+    class _CaptureLibrary:
+        def retrieve(self, query, **kwargs):
+            captured["query"] = query
+            captured["kwargs"] = dict(kwargs)
+            return [
+                FlexExperience(
+                    experience_id="flex-1",
+                    source_question_id="q-1",
+                    domain="finance",
+                    zone="golden",
+                    level="strategy",
+                    title="Strategy title",
+                    summary="Summary text",
+                    content="Content text",
+                    created_at="2026-01-12T00:00:00Z",
+                    source_open_time="2026-01-01T00:00:00Z",
+                    source_resolved_time="2026-01-12T00:00:00Z",
+                    outcome=1,
+                    correctness=True,
+                )
+            ]
+
+    tool = FlexMemoryTool(_CaptureLibrary(), cutoff_time="2026-01-27T00:00:00Z", domain="finance")
+
+    payload = tool.call('{"query":"AAPL setup","zone":"golden","level":"strategy","top_k":3}')
+
+    assert captured["query"] == "AAPL setup"
+    assert captured["kwargs"]["domain"] == "finance"
+    assert payload["domain"] == "finance"
+    assert payload["hits"][0]["domain"] == "finance"

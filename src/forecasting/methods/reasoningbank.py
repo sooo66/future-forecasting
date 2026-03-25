@@ -24,10 +24,11 @@ from forecasting.question_tools import ResidentCodeInterpreterTool
 
 @dataclass(frozen=True)
 class ReasoningBankConfig:
-    agent_max_steps: int = 5
+    agent_max_steps: int = 8
     top_k: int = 1
     search_top_k: int = 3
     success_only: bool = True
+    domain_match: bool = True
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL
     embedding_device: str | None = None
     artifact_filename: str = "reasoningbank_mem.jsonl"
@@ -63,6 +64,7 @@ class _ReasoningBankSession(MethodSession):
             open_time=cutoff_time,
             top_k=self._config.top_k,
             success_only=self._config.success_only,
+            domain=question["domain"] if self._config.domain_match else None,
         )
         result = run_agentic_forecast(
             question,
@@ -102,6 +104,7 @@ def _build_reasoningbank_record(
     return ReasoningBankRecord(
         record_id=f"reasoningbank-{question['market_id']}",
         source_question_id=question["market_id"],
+        domain=question["domain"],
         query=build_memory_query(question),
         trajectory=list(result.get("trajectory") or []),
         memory_items=memory_items[:3],

@@ -23,16 +23,23 @@ DEFAULT_METHOD_CONFIGS = {
         "search_content_chars": 1024,
         "rag_max_per_source_type": 10,
     },
-    "agentic_nomem": {"agent_max_steps": 5, "search_top_k": 3},
-    "reasoningbank": {"agent_max_steps": 5, "top_k": 1, "search_top_k": 3, "success_only": True},
+    "agentic_nomem": {"agent_max_steps": 8, "search_top_k": 3},
+    "reasoningbank": {
+        "agent_max_steps": 8,
+        "top_k": 1,
+        "search_top_k": 3,
+        "success_only": True,
+        "domain_match": True,
+    },
     "flex": {
-        "agent_max_steps": 5,
+        "agent_max_steps": 8,
         "search_top_k": 3,
         "strategy_top_k": 3,
         "pattern_top_k": 3,
         "case_top_k": 3,
         "preload_zone": "golden",
         "preload_domain_match": True,
+        "memory_tool_domain_match": True,
     },
 }
 
