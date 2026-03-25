@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
-from forecasting.methods._agentic_shared import coerce_config, run_naive_rag_forecast
+from forecasting.methods._agentic import run_naive_rag_forecast
+from forecasting.methods._shared import coerce_config
 
 
 @dataclass(frozen=True)
@@ -14,7 +15,7 @@ class NaiveRagConfig:
     search_top_k: int = 3
     search_content_chars: int = 512
     rag_max_per_source_type: int = 2
-    max_tokens: int = 350
+    max_tokens: int = 2048
     temperature: float = 0.0
 
 

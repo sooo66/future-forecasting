@@ -72,7 +72,7 @@ class OpenAIChatModel:
             config["api_key"] = self.api_key
         config["generate_cfg"] = {
             "max_input_tokens": 32000,
-            "max_tokens": 1200,
+            "max_tokens": 2048,
             "temperature": 0.0,
         }
         return config
@@ -81,7 +81,7 @@ class OpenAIChatModel:
         self,
         messages: list[dict[str, str]],
         *,
-        max_tokens: int = 500,
+        max_tokens: int = 2048,
         temperature: float = 0.0,
     ) -> tuple[str, LLMUsage]:
         request = {
@@ -117,7 +117,7 @@ class OpenAIChatModel:
         self,
         messages: list[dict[str, str]],
         *,
-        max_tokens: int = 500,
+        max_tokens: int = 2048,
         temperature: float = 0.0,
     ) -> tuple[dict[str, Any], str, LLMUsage]:
         content, usage = self.chat(messages, max_tokens=max_tokens, temperature=temperature)

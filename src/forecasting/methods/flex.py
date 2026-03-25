@@ -10,14 +10,16 @@ from typing import Any
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
 from forecasting.memory import FlexExperience, FlexLibrary
-from forecasting.methods._agentic_shared import (
+from forecasting.methods._agentic import (
     build_memory_query,
-    coerce_config,
-    question_cutoff_time,
     run_agentic_forecast,
 )
+from forecasting.methods._shared import (
+    coerce_config,
+    question_cutoff_time,
+)
 from forecasting.prompts import build_flex_distill_messages
-from forecasting.question_tools import FlexMemoryTool, ResidentCodeInterpreterTool
+from forecasting.question_tools import FlexMemoryTool
 
 
 @dataclass(frozen=True)
@@ -56,9 +58,6 @@ class _FlexSession(MethodSession):
             model_name=config.embedding_model_name,
             merge_similarity_threshold=config.merge_similarity_threshold,
         )
-        self._code_interpreter = ResidentCodeInterpreterTool(
-            work_dir=runtime_ctx.project_root / ".qwen_agent_workspace" / "forecasting" / "flex"
-        )
 
     def run_question(self, question: QuestionRecord):
         cutoff_time = question_cutoff_time(question)
@@ -87,7 +86,6 @@ class _FlexSession(MethodSession):
                 domain=question["domain"] if self._config.memory_tool_domain_match else None,
             ),
             flex_preloaded=preloaded,
-            code_interpreter_tool=self._code_interpreter,
         )
         if "error" not in result:
             self._library.queue_many(_build_flex_experiences(question, result, llm=self._llm))
@@ -114,7 +112,7 @@ def _build_flex_experiences(
     payload = _distill_flex(question, result, correctness=correctness, llm=llm)
     if not payload:
         payload = _default_flex_distillation(question, result, correctness=correctness)
-    payload = _sanitize_flex_payload(payload, question=question, correctness=correctness, result=result)
+    payload = _fill_default_flex_blocks(payload, question=question, correctness=correctness, result=result)
     items: list[FlexExperience] = []
     for level in ["strategy", "pattern", "case"]:
         block = payload.get(level) or {}
@@ -154,8 +152,44 @@ def _distill_flex(
         reasoning_summary=_clean_flex_text(str(result.get("reasoning_summary") or "")),
         trajectory_highlights=_format_flex_trajectory(result.get("trajectory") or []),
     )
-    payload, _raw, _usage = llm.chat_json(messages, max_tokens=500, temperature=0.0)
-    return payload
+    text, _usage = llm.chat(messages, max_tokens=2048, temperature=0.0)
+    return _parse_flex_markdown(text or "")
+
+
+def _parse_flex_markdown(text: str) -> dict[str, Any]:
+    blocks = re.split(r"\n(?=# [Ss]trategy\b|# [Pp]attern\b|# [Cc]ase\b)", text or "")
+    parsed: dict[str, dict[str, str]] = {}
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        if block.startswith("# strategy") or block.startswith("# Strategy"):
+            level = "strategy"
+        elif block.startswith("# pattern") or block.startswith("# Pattern"):
+            level = "pattern"
+        elif block.startswith("# case") or block.startswith("# Case"):
+            level = "case"
+        else:
+            continue
+        title = _match_flex_section(block, "Title")
+        summary = _match_flex_section(block, "Summary")
+        content = _match_flex_section(block, "Content")
+        parsed[level] = {
+            "title": title,
+            "summary": summary,
+            "content": content,
+        }
+    return parsed
+
+
+def _match_flex_section(block: str, heading: str) -> str:
+    pattern = rf"## {heading}\s*(.*?)(?=\n## |\n#|\Z)"
+    match = re.search(pattern, block, flags=re.DOTALL)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    value = value.strip("`")
+    return " ".join(value.split())
 
 
 def _default_flex_distillation(
@@ -198,7 +232,7 @@ def _default_content(result: dict[str, Any], zone: str) -> str:
     return "Preserve this warning so similar questions avoid repeating the same mistake."
 
 
-def _sanitize_flex_payload(
+def _fill_default_flex_blocks(
     payload: dict[str, Any],
     *,
     question: QuestionRecord,

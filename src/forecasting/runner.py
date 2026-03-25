@@ -14,7 +14,7 @@ from forecasting.contracts import ForecastResult, MethodArtifact, MethodRuntimeC
 from forecasting.datasets import load_fixed_question_subset
 from forecasting.evaluation import render_experiment_summary, summarize_results
 from forecasting.llm import OpenAIChatModel
-from forecasting.methods._agentic_shared import build_failed_result, serialize_config
+from forecasting.methods._shared import build_failed_result, serialize_config
 from forecasting.registry import get_method
 from tools.search_clients import build_search_client, resolve_search_backend
 
