@@ -12,7 +12,7 @@ from forecasting.question_tools import ResidentCodeInterpreterTool
 
 @dataclass(frozen=True)
 class AgenticNoMemoryConfig:
-    agent_max_steps: int = 5
+    agent_max_steps: int = 8
     search_top_k: int = 3
 
 

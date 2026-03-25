@@ -22,13 +22,14 @@ from forecasting.question_tools import FlexMemoryTool, ResidentCodeInterpreterTo
 
 @dataclass(frozen=True)
 class FlexConfig:
-    agent_max_steps: int = 5
+    agent_max_steps: int = 8
     search_top_k: int = 3
     strategy_top_k: int = 5
     pattern_top_k: int = 5
     case_top_k: int = 5
     preload_zone: str = "golden"
     preload_domain_match: bool = True
+    memory_tool_domain_match: bool = True
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL
     embedding_device: str | None = None
     merge_similarity_threshold: float = 0.92
@@ -80,7 +81,11 @@ class _FlexSession(MethodSession):
             method_name="flex",
             agent_max_steps=self._config.agent_max_steps,
             search_top_k=self._config.search_top_k,
-            flex_memory_tool=FlexMemoryTool(self._library, cutoff_time=cutoff_time),
+            flex_memory_tool=FlexMemoryTool(
+                self._library,
+                cutoff_time=cutoff_time,
+                domain=question["domain"] if self._config.memory_tool_domain_match else None,
+            ),
             flex_preloaded=preloaded,
             code_interpreter_tool=self._code_interpreter,
         )

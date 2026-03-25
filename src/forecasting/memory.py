@@ -27,6 +27,7 @@ class RetrievedMemoryItem:
     memory_id: str
     record_id: str
     source_question_id: str
+    domain: str
     source_resolved_time: str
     success_or_failure: str
     title: str
@@ -41,6 +42,7 @@ class RetrievedMemoryItem:
 class ReasoningBankRecord:
     record_id: str
     source_question_id: str
+    domain: str
     query: str
     trajectory: list[dict[str, Any]]
     memory_items: list[MemoryItem]
@@ -125,12 +127,14 @@ class ReasoningBankStore:
         open_time: str,
         top_k: int = 1,
         success_only: bool = False,
+        domain: str | None = None,
     ) -> list[RetrievedMemoryItem]:
         self.activate_until(open_time)
         candidates = [
             record
             for record in self._active_records
             if not success_only or record.success_or_failure == "success"
+            if not domain or record.domain == domain
         ]
         if not candidates:
             return []
@@ -148,6 +152,7 @@ class ReasoningBankStore:
                         memory_id=f"{record.record_id}#{item_index}",
                         record_id=record.record_id,
                         source_question_id=record.source_question_id,
+                        domain=record.domain,
                         source_resolved_time=record.source_resolved_time,
                         success_or_failure=record.success_or_failure,
                         title=item.title,
