@@ -24,7 +24,12 @@ DEFAULT_METHOD_CONFIGS = {
         "rag_max_per_source_type": 10,
     },
     "agentic_nomem": {"agent_max_steps": 5, "search_top_k": 3},
-    "reasoningbank": {"agent_max_steps": 5, "top_k": 1, "search_top_k": 3, "success_only": True},
+    "reasoningbank": {
+        "agent_max_steps": 5,
+        "top_k": 1,
+        "search_top_k": 3,
+        "success_only": True,
+    },
     "flex": {
         "agent_max_steps": 5,
         "search_top_k": 3,
@@ -87,4 +92,20 @@ def build_smoke_test_100_gemini() -> ExperimentSpec:
         "smoke_test_100_gemini",
         method_ids=["reasoningbank"],
         dataset_file="data/questions/subsets/smoke_test_100.json",
+    )
+
+
+def build_smoke_test_30_gemini() -> ExperimentSpec:
+    return _build_experiment(
+        "smoke_test_30_gemini",
+        method_ids=["reasoningbank", "flex"],
+        dataset_file="data/questions/subsets/smoke_test_30.json",
+    )
+
+
+def build_smoke_test_30_qwen() -> ExperimentSpec:
+    return _build_experiment(
+        "smoke_test_30_qwen",
+        method_ids=["reasoningbank", "flex"],
+        dataset_file="data/questions/subsets/smoke_test_30.json",
     )
