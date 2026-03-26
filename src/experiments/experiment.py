@@ -34,9 +34,9 @@ DEFAULT_METHOD_CONFIGS = {
     "flex": {
         "agent_max_steps": 8,
         "search_top_k": 3,
-        "strategy_top_k": 3,
-        "pattern_top_k": 3,
-        "case_top_k": 3,
+        "strategy_top_k": 5,
+        "pattern_top_k": 5,
+        "case_top_k": 5,
         "preload_zone": "golden",
         "preload_domain_match": True,
         "memory_tool_domain_match": True,
@@ -110,4 +110,12 @@ def build_smoke_test_30_qwen() -> ExperimentSpec:
         "smoke_test_30_qwen",
         method_ids=["reasoningbank", "flex"],
         dataset_file="data/questions/subsets/smoke_test_30.json",
+    )
+
+
+def build_smoke_test_100_mem() -> ExperimentSpec:
+    return _build_experiment(
+        "smoke_test_100_mem",
+        method_ids=["reasoningbank", "flex"],
+        dataset_file="data/questions/subsets/smoke_test_100.json",
     )
