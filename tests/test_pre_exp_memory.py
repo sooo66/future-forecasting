@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from forecasting.memory import FlexExperience, FlexLibrary, MemoryItem, ReasoningBankRecord, ReasoningBankStore
+from forecasting.memory import FlexExperience, FlexLibrary, MemoryItem, ReasoningBankStore
 
 
 class _FakeEmbedder:
@@ -18,130 +18,63 @@ class _FakeEmbedder:
         return vectors
 
 
-def test_reasoningbank_store_only_activates_past_resolved_records():
+def test_reasoningbank_store_flat_item_add_and_retrieve():
+    """Per the paper: simple addition of items, retrieval by cosine similarity on embedding."""
     store = ReasoningBankStore(embedder=_FakeEmbedder(), model_name="fake-embedder")
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-past",
-            source_question_id="q1",
-            domain="finance",
-            query="AAPL supply signal",
-            trajectory=[{"step": "final", "raw_response": "past"}],
-            memory_items=[MemoryItem(title="Past cue", description="usable", content="useful signal")],
-            created_at="2026-01-05T00:00:00Z",
-            source_open_time="2026-01-01T00:00:00Z",
-            source_resolved_time="2026-01-05T00:00:00Z",
-            outcome=1,
-            predicted_prob=0.9,
-            success_or_failure="success",
-        )
-    )
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-future",
-            source_question_id="q2",
-            domain="finance",
-            query="AAPL future warning",
-            trajectory=[{"step": "final", "raw_response": "future"}],
-            memory_items=[MemoryItem(title="Future cue", description="not yet active", content="should not leak")],
-            created_at="2026-02-05T00:00:00Z",
-            source_open_time="2026-02-01T00:00:00Z",
-            source_resolved_time="2026-02-05T00:00:00Z",
-            outcome=0,
-            predicted_prob=0.1,
-            success_or_failure="failure",
-        )
-    )
 
-    hits = store.retrieve("AAPL signal", open_time="2026-01-20T00:00:00Z", top_k=1)
+    # Add items from two different "experiences"
+    store.add_items([
+        MemoryItem(title="AAPL signal", description="structured", content="use structured evidence first"),
+    ])
+    store.add_items([
+        MemoryItem(title="Avoid weak", description="warning", content="do not overfit weak trends"),
+    ])
 
-    assert [(item.record_id, item.title) for item in hits] == [("rb-past", "Past cue")]
-    assert hits[0].memory_id == "rb-past#1"
+    # Retrieve top-1 matching items
+    hits = store.retrieve("AAPL structured signal", top_k=1)
+
+    assert len(hits) == 1
+    assert hits[0].title == "AAPL signal"
+    assert hits[0].content == "use structured evidence first"
 
 
-def test_reasoningbank_store_can_restrict_to_successful_memories():
+def test_reasoningbank_store_returns_top_k_items():
+    """Retrieve top_k most similar items, per the paper's top_k design."""
     store = ReasoningBankStore(embedder=_FakeEmbedder(), model_name="fake-embedder")
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-success",
-            source_question_id="q-success",
-            domain="finance",
-            query="AAPL signal",
-            trajectory=[{"step": "final", "raw_response": "success"}],
-            memory_items=[MemoryItem(title="Success cue", description="usable", content="use structured evidence")],
-            created_at="2026-01-05T00:00:00Z",
-            source_open_time="2026-01-01T00:00:00Z",
-            source_resolved_time="2026-01-05T00:00:00Z",
-            outcome=1,
-            predicted_prob=0.9,
-            success_or_failure="success",
-        )
-    )
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-failure",
-            source_question_id="q-failure",
-            domain="finance",
-            query="AAPL warning",
-            trajectory=[{"step": "final", "raw_response": "failure"}],
-            memory_items=[MemoryItem(title="Failure cue", description="avoid", content="do not overfit weak trends")],
-            created_at="2026-01-06T00:00:00Z",
-            source_open_time="2026-01-02T00:00:00Z",
-            source_resolved_time="2026-01-06T00:00:00Z",
-            outcome=0,
-            predicted_prob=0.1,
-            success_or_failure="failure",
-        )
-    )
 
-    hits = store.retrieve("AAPL signal", open_time="2026-01-10T00:00:00Z", top_k=2, success_only=True)
+    store.add_items([
+        MemoryItem(title="AAPL cue", description="finance", content="AAPL financial signal"),
+    ])
+    store.add_items([
+        MemoryItem(title="World cue", description="world", content="World news signal"),
+    ])
 
-    assert [item.record_id for item in hits] == ["rb-success"]
+    hits = store.retrieve("AAPL stock signal", top_k=2)
+
+    assert len(hits) == 2
+    assert hits[0].title == "AAPL cue"
+    assert hits[1].title == "World cue"
 
 
-def test_reasoningbank_store_can_filter_by_domain():
+def test_reasoningbank_store_returns_empty_when_no_items():
+    """Empty store returns empty list."""
     store = ReasoningBankStore(embedder=_FakeEmbedder(), model_name="fake-embedder")
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-finance",
-            source_question_id="q-finance",
-            domain="finance",
-            query="AAPL signal",
-            trajectory=[{"step": "final", "raw_response": "finance"}],
-            memory_items=[MemoryItem(title="Finance cue", description="usable", content="finance only")],
-            created_at="2026-01-05T00:00:00Z",
-            source_open_time="2026-01-01T00:00:00Z",
-            source_resolved_time="2026-01-05T00:00:00Z",
-            outcome=1,
-            predicted_prob=0.9,
-            success_or_failure="success",
-        )
-    )
-    store.queue(
-        ReasoningBankRecord(
-            record_id="rb-world",
-            source_question_id="q-world",
-            domain="world",
-            query="AAPL signal",
-            trajectory=[{"step": "final", "raw_response": "world"}],
-            memory_items=[MemoryItem(title="World cue", description="usable", content="world only")],
-            created_at="2026-01-06T00:00:00Z",
-            source_open_time="2026-01-02T00:00:00Z",
-            source_resolved_time="2026-01-06T00:00:00Z",
-            outcome=1,
-            predicted_prob=0.9,
-            success_or_failure="success",
-        )
-    )
+    hits = store.retrieve("AAPL signal", top_k=1)
+    assert hits == []
 
-    hits = store.retrieve(
-        "AAPL signal",
-        open_time="2026-01-10T00:00:00Z",
-        top_k=2,
-        domain="finance",
-    )
 
-    assert [(item.record_id, item.domain) for item in hits] == [("rb-finance", "finance")]
+def test_reasoningbank_store_artifact_rows():
+    """artifact_rows exports all items with their embeddings."""
+    store = ReasoningBankStore(embedder=_FakeEmbedder(), model_name="test-model")
+    store.add_items([
+        MemoryItem(title="Test title", description="test desc", content="test content"),
+    ])
+
+    rows = store.artifact_rows()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Test title"
+    assert rows[0]["embedding_model_name"] == "test-model"
+    assert len(rows[0]["embedding"]) > 0
 
 
 def test_flex_library_merges_similar_entries_and_retrieves_hierarchical_bundle():

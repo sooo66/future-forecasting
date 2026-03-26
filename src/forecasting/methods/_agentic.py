@@ -119,6 +119,7 @@ def run_agentic_forecast(
     project_root: Path,
     method_name: str,
     agent_max_steps: int,
+    max_tokens: int = 2048,
     search_top_k: int = DEFAULT_SEARCH_TOP_K,
     injected_memories: list[Any] | None = None,
     flex_memory_tool: Any | None = None,
@@ -136,8 +137,10 @@ def run_agentic_forecast(
     ]
     if flex_memory_tool is not None:
         tools.append(flex_memory_tool)
+    agent_config = llm.to_agent_config()
+    agent_config["generate_cfg"]["max_tokens"] = max_tokens
     agent = Agent(
-        llm=llm.to_agent_config(),
+        llm=agent_config,
         tools=tools,
         system_prompt=build_agent_system_prompt(
             question,

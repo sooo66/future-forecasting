@@ -26,6 +26,7 @@ DEFAULT_METHOD_CONFIGS = {
     "agentic_nomem": {"agent_max_steps": 8, "search_top_k": 3},
     "reasoningbank": {
         "agent_max_steps": 8,
+        "max_tokens": 2048,
         "top_k": 1,
         "search_top_k": 3,
         "success_only": True,
@@ -33,6 +34,7 @@ DEFAULT_METHOD_CONFIGS = {
     },
     "flex": {
         "agent_max_steps": 8,
+        "max_tokens": 2048,
         "search_top_k": 3,
         "strategy_top_k": 5,
         "pattern_top_k": 5,

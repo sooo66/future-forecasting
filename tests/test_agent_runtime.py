@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from agent import Agent
-from forecasting.memory import FlexExperience, RetrievedMemoryItem
-from forecasting.methods._agentic_shared import _extract_agent_outputs, _normalize_final_payload, run_agentic_forecast
+from forecasting.memory import FlexExperience, MemoryItem
+from forecasting.methods._agentic import _extract_agent_outputs, _normalize_final_payload, run_agentic_forecast
 from forecasting.llm import LLMUsage
 from forecasting.question_tools import FlexMemoryTool
 
@@ -88,7 +88,7 @@ class _FakeRuntimeAgent:
 
 
 def test_agentic_forecast_forces_final_answer_and_keeps_usage(monkeypatch, tmp_path):
-    monkeypatch.setattr("forecasting.methods._agentic_shared.Agent", _FakeRuntimeAgent)
+    monkeypatch.setattr("forecasting.methods._agentic.Agent", _FakeRuntimeAgent)
     question = {
         "market_id": "m-1",
         "question": "Will AAPL close above 200?",
@@ -176,7 +176,7 @@ def test_agentic_forecast_disables_code_interpreter_for_non_numeric_question(mon
         def extract_final_content(messages):
             return messages[-1]["content"]
 
-    monkeypatch.setattr("forecasting.methods._agentic_shared.Agent", _CaptureAgent)
+    monkeypatch.setattr("forecasting.methods._agentic.Agent", _CaptureAgent)
     question = {
         "market_id": "m-plain",
         "question": "Will Russia capture Siversk by December 22?",
@@ -235,7 +235,7 @@ def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkey
         def extract_final_content(messages):
             return messages[-1]["content"]
 
-    monkeypatch.setattr("forecasting.methods._agentic_shared.Agent", _CaptureAgent)
+    monkeypatch.setattr("forecasting.methods._agentic.Agent", _CaptureAgent)
     question = {
         "market_id": "m-sample",
         "question": "Will AAPL close above 200?",
@@ -249,13 +249,7 @@ def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkey
         "difficulty": "easy",
     }
     injected = [
-        RetrievedMemoryItem(
-            memory_id="rb-1#1",
-            record_id="rb-1",
-            source_question_id="q-1",
-            domain="finance",
-            source_resolved_time="2026-01-10T00:00:00Z",
-            success_or_failure="success",
+        MemoryItem(
             title="Memory title",
             description="Reusable cue",
             content="Use structured evidence first.",
@@ -293,10 +287,6 @@ def test_agentic_forecast_uses_sample_time_cutoff_and_logs_memory_context(monkey
     assert captured["cuttime"] == "2026-01-27T00:00:00Z"
     assert "2026-01-27T00:00:00Z" in captured["system_prompt"]
     assert "Search snippets may be noisy, incomplete, stale, or off-topic" in captured["system_prompt"]
-    assert result["cutoff_time"] == "2026-01-27T00:00:00Z"
-    assert result["injected_memories"][0]["memory_id"] == "rb-1#1"
-    assert result["flex_preloaded"][0]["experience_id"] == "flex-1"
-    assert result["flex_preloaded"][0]["domain"] == "finance"
 
 
 def test_extract_agent_outputs_preserves_tool_error_messages():

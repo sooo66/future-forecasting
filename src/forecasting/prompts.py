@@ -338,11 +338,11 @@ def format_docs_for_prompt(hits: list[dict[str, Any]], *, content_chars: int) ->
 
 
 def format_memories_for_prompt(memories: list[Any]) -> str:
+    """Format memory items for the agent prompt — per the paper, title + content only."""
     lines: list[str] = []
     for index, item in enumerate(memories, start=1):
         lines.append(f"# Memory Item {index}")
         lines.append(f"## Title {getattr(item, 'title', '')}")
-        lines.append(f"## Description {getattr(item, 'description', '')}")
         lines.append(f"## Content {_compact_text(str(getattr(item, 'content', '')), 360)}")
     return "\n".join(lines)
 
