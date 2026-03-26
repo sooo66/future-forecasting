@@ -25,6 +25,7 @@ from forecasting.question_tools import FlexMemoryTool
 @dataclass(frozen=True)
 class FlexConfig:
     agent_max_steps: int = 8
+    max_tokens: int = 2048
     search_top_k: int = 3
     strategy_top_k: int = 5
     pattern_top_k: int = 5
@@ -79,6 +80,7 @@ class _FlexSession(MethodSession):
             project_root=self._runtime_ctx.project_root,
             method_name="flex",
             agent_max_steps=self._config.agent_max_steps,
+            max_tokens=self._config.max_tokens,
             search_top_k=self._config.search_top_k,
             flex_memory_tool=FlexMemoryTool(
                 self._library,

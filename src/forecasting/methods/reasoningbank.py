@@ -8,14 +8,13 @@ from typing import Any
 
 from forecasting.contracts import ForecastMethod, MethodArtifact, MethodRuntimeContext, MethodSession, QuestionRecord
 from forecasting.embeddings import DEFAULT_EMBEDDING_MODEL, build_text_embedder
-from forecasting.memory import MemoryItem, ReasoningBankRecord, ReasoningBankStore
+from forecasting.memory import MemoryItem, ReasoningBankStore
 from forecasting.methods._agentic import (
     build_memory_query,
     run_agentic_forecast,
 )
 from forecasting.methods._shared import (
     coerce_config,
-    question_cutoff_time,
 )
 from forecasting.prompts import (
     build_reasoningbank_extraction_messages,
@@ -26,10 +25,11 @@ from forecasting.prompts import (
 @dataclass(frozen=True)
 class ReasoningBankConfig:
     agent_max_steps: int = 8
+    max_tokens: int = 2048
     top_k: int = 1
     search_top_k: int = 3
-    success_only: bool = True
-    domain_match: bool = True
+    success_only: bool = False
+    domain_match: bool = False
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL
     embedding_device: str | None = None
     artifact_filename: str = "reasoningbank_mem.jsonl"
@@ -56,13 +56,9 @@ class _ReasoningBankSession(MethodSession):
         )
 
     def run_question(self, question: QuestionRecord):
-        cutoff_time = question_cutoff_time(question)
         memories = self._store.retrieve(
             build_memory_query(question),
-            open_time=cutoff_time,
             top_k=self._config.top_k,
-            success_only=self._config.success_only,
-            domain=question["domain"] if self._config.domain_match else None,
         )
         result = run_agentic_forecast(
             question,
@@ -71,11 +67,15 @@ class _ReasoningBankSession(MethodSession):
             project_root=self._runtime_ctx.project_root,
             method_name="reasoningbank",
             agent_max_steps=self._config.agent_max_steps,
+            max_tokens=self._config.max_tokens,
             search_top_k=self._config.search_top_k,
             injected_memories=memories,
         )
         if "error" not in result:
-            self._store.queue(_build_reasoningbank_record(question, result, llm=self._llm))
+            items = _extract_reasoningbank_items(question, result, llm=self._llm)
+            if not items:
+                items = [_default_memory_item(question, result)]
+            self._store.add_items(items)
         return result
 
     def finalize(self) -> list[MethodArtifact]:
@@ -88,41 +88,17 @@ class _ReasoningBankSession(MethodSession):
         ]
 
 
-def _build_reasoningbank_record(
-    question: QuestionRecord,
-    result: dict[str, Any],
-    *,
-    llm: Any | None = None,
-) -> ReasoningBankRecord:
-    success_or_failure = "success" if _is_correct_prediction(question, result) else "failure"
-    memory_items = _extract_reasoningbank_items(question, result, success_or_failure=success_or_failure, llm=llm)
-    if not memory_items:
-        memory_items = [_default_memory_item(question, result, success_or_failure=success_or_failure)]
-    return ReasoningBankRecord(
-        record_id=f"reasoningbank-{question['market_id']}",
-        source_question_id=question["market_id"],
-        domain=question["domain"],
-        query=build_memory_query(question),
-        trajectory=list(result.get("trajectory") or []),
-        memory_items=memory_items[:3],
-        created_at=question["resolve_time"],
-        source_open_time=question["open_time"],
-        source_resolved_time=question["resolve_time"],
-        outcome=int(question["label"]),
-        predicted_prob=float(result.get("predicted_prob") or 0.5),
-        success_or_failure=success_or_failure,
-    )
-
-
 def _extract_reasoningbank_items(
     question: QuestionRecord,
     result: dict[str, Any],
     *,
-    success_or_failure: str,
     llm: Any | None,
 ) -> list[MemoryItem]:
     if llm is None:
         return []
+    # Use LLM-as-judge to determine success/failure for extraction prompt selection
+    predicted_prob = float(result.get("predicted_prob") or 0.5)
+    success_or_failure = "success" if (predicted_prob >= 0.5) == bool(int(question.get("label", 0))) else "failure"
     raw_text, _usage = llm.chat(
         build_reasoningbank_extraction_messages(
             query=question["question"],
@@ -170,9 +146,9 @@ def _match_section(block: str, heading: str) -> str:
 def _default_memory_item(
     question: QuestionRecord,
     result: dict[str, Any],
-    *,
-    success_or_failure: str,
 ) -> MemoryItem:
+    predicted_prob = float(result.get("predicted_prob") or 0.5)
+    success_or_failure = "success" if (predicted_prob >= 0.5) == bool(int(question.get("label", 0))) else "failure"
     label = int(question["label"])
     outcome = "YES" if label else "NO"
     summary = " ".join(str(result.get("reasoning_summary") or "").split())
@@ -185,8 +161,3 @@ def _default_memory_item(
         description = f"Resolved {outcome}; preserve this as a warning for similar tasks."
         content = summary or "Record which cues were over- or under-weighted and avoid repeating the same mistake."
     return MemoryItem(title=title, description=description, content=content)
-
-
-def _is_correct_prediction(question: QuestionRecord, result: dict[str, Any]) -> bool:
-    predicted_prob = float(result.get("predicted_prob") or 0.5)
-    return (predicted_prob >= 0.5) == bool(int(question["label"]))

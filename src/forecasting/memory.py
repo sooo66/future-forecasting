@@ -22,43 +22,6 @@ class MemoryItem:
         return asdict(self)
 
 
-@dataclass(frozen=True)
-class RetrievedMemoryItem:
-    memory_id: str
-    record_id: str
-    source_question_id: str
-    domain: str
-    source_resolved_time: str
-    success_or_failure: str
-    title: str
-    description: str
-    content: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class ReasoningBankRecord:
-    record_id: str
-    source_question_id: str
-    domain: str
-    query: str
-    trajectory: list[dict[str, Any]]
-    memory_items: list[MemoryItem]
-    created_at: str
-    source_open_time: str
-    source_resolved_time: str
-    outcome: int
-    predicted_prob: float
-    success_or_failure: str
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["memory_items"] = [item.to_dict() for item in self.memory_items]
-        return payload
-
-
 @dataclass
 class FlexExperience:
     experience_id: str
@@ -97,94 +60,51 @@ class FlexExperience:
 
 
 class ReasoningBankStore:
+    """Simplified flat pool of ReasoningBank memory items, per the paper's design."""
+
     def __init__(self, *, embedder: TextEmbedder, model_name: str) -> None:
         self._embedder = embedder
         self._model_name = model_name
-        self._active_records: list[ReasoningBankRecord] = []
-        self._pending_records: list[tuple[str, ReasoningBankRecord]] = []
-        self._embedding_cache: dict[str, list[float]] = {}
+        self._items: list[MemoryItem] = []
+        self._embeddings: list[list[float]] = []
 
-    def queue(self, record: ReasoningBankRecord) -> None:
-        self._pending_records.append((record.source_resolved_time, record))
-        self._pending_records.sort(key=lambda pair: (pair[0], pair[1].record_id))
+    def add_items(self, items: list[MemoryItem]) -> None:
+        """Simple addition operation: add items directly to the pool with their embeddings."""
+        for item in items:
+            emb_text = _reasoningbank_embedding_text(item)
+            emb = self._embedder.embed_texts([emb_text])[0]
+            self._items.append(item)
+            self._embeddings.append(emb)
 
-    def activate_until(self, open_time: str) -> None:
-        to_activate: list[ReasoningBankRecord] = []
-        while self._pending_records and self._pending_records[0][0] <= open_time:
-            _, record = self._pending_records.pop(0)
-            self._active_records.append(record)
-            to_activate.append(record)
-        if not to_activate:
-            return
-        embeddings = self._embedder.embed_texts([record.query for record in to_activate])
-        for record, embedding in zip(to_activate, embeddings):
-            self._embedding_cache[record.record_id] = embedding
-
-    def retrieve(
-        self,
-        query: str,
-        *,
-        open_time: str,
-        top_k: int = 1,
-        success_only: bool = False,
-        domain: str | None = None,
-    ) -> list[RetrievedMemoryItem]:
-        self.activate_until(open_time)
-        candidates = [
-            record
-            for record in self._active_records
-            if not success_only or record.success_or_failure == "success"
-            if not domain or record.domain == domain
-        ]
-        if not candidates:
+    def retrieve(self, query: str, top_k: int = 1) -> list[MemoryItem]:
+        """Retrieve top_k most similar memory items by cosine similarity on embedding."""
+        if not self._items:
             return []
-        query_embedding = self._embedder.embed_texts([query])[0]
-        scored: list[tuple[float, ReasoningBankRecord]] = []
-        for record in candidates:
-            score = _cosine_similarity(query_embedding, self._embedding_cache[record.record_id])
-            scored.append((score, record))
-        scored.sort(key=lambda pair: (pair[0], pair[1].source_resolved_time, pair[1].record_id), reverse=True)
-        retrieved: list[RetrievedMemoryItem] = []
-        for _score, record in scored[: max(1, top_k)]:
-            for item_index, item in enumerate(record.memory_items, start=1):
-                retrieved.append(
-                    RetrievedMemoryItem(
-                        memory_id=f"{record.record_id}#{item_index}",
-                        record_id=record.record_id,
-                        source_question_id=record.source_question_id,
-                        domain=record.domain,
-                        source_resolved_time=record.source_resolved_time,
-                        success_or_failure=record.success_or_failure,
-                        title=item.title,
-                        description=item.description,
-                        content=item.content,
-                    )
-                )
-        return retrieved
+        query_emb = self._embedder.embed_texts([query])[0]
+        scored = [
+            (i, _cosine_similarity(query_emb, emb))
+            for i, emb in enumerate(self._embeddings)
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [self._items[i] for i, _ in scored[: max(1, top_k)]]
 
-    def records(self) -> list[ReasoningBankRecord]:
-        return list(self._active_records)
-
-    def flush_all(self) -> list[ReasoningBankRecord]:
-        if self._pending_records:
-            self.activate_until("9999-12-31T23:59:59Z")
-        return self.records()
+    def items(self) -> list[MemoryItem]:
+        return list(self._items)
 
     def artifact_rows(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for record in self.flush_all():
-            payload = record.to_dict()
-            payload["embedding_model_name"] = self._model_name
-            payload["query_embedding"] = self._embedding_cache.get(record.record_id, [])
-            rows.append(payload)
-        return rows
+        return [
+            {
+                **item.to_dict(),
+                "embedding_model_name": self._model_name,
+                "embedding": emb,
+            }
+            for item, emb in zip(self._items, self._embeddings)
+        ]
 
-    def embeddings_payload(self) -> dict[str, Any]:
-        ordered = sorted(self._embedding_cache.items())
-        return {
-            "model_name": self._model_name,
-            "records": [{"record_id": record_id, "embedding": embedding} for record_id, embedding in ordered],
-        }
+
+def _reasoningbank_embedding_text(item: MemoryItem) -> str:
+    """Build the text used for embedding a memory item (title + content)."""
+    return f"{item.title} {item.content}"
 
 
 class FlexLibrary:
