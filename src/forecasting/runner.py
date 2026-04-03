@@ -249,7 +249,7 @@ def _run_method(
                 result = session.run_question(question)
             except Exception as exc:
                 LOGGER.exception("%s failed for market_id=%s", method_id, market_id)
-                result = build_failed_result(question, method_id, str(exc))
+                result = build_failed_result(question, str(exc))
             results.append(result)
             _append_jsonl_row(path, result)
             progress.set_postfix_str(market_id, refresh=False)

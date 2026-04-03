@@ -63,7 +63,7 @@ def summarize_results(results: list[ForecastResult]) -> dict[str, Any]:
     return {
         "display_name": method_names[0] if method_names and len(set(method_names)) == 1 else None,
         "count": len(results),
-        "accuracy": mean(item["accuracy"] for item in results) if results else 0.0,
+        "accuracy": mean(int((float(item["predicted_prob"]) >= 0.5) == bool(int(item["label"]))) for item in results) if results else 0.0,
         "brier_score": mean(item["brier_score"] for item in results) if results else 0.0,
         "ece_10": ece_10,
         "avg_latency_sec": mean(item["latency_sec"] for item in results) if results else 0.0,
